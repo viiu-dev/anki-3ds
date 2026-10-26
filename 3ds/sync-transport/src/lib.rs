@@ -702,8 +702,23 @@ impl NativeSyncClient {
 #[async_trait]
 impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
     fn new_download_file(&self, target: &Path) -> anki::prelude::Result<tempfile::NamedTempFile> {
-        Ok(storage::tempfile(target.parent().unwrap(), ".download-")
-            .map_err(|error| storage::file_error("create collection download", target, error))?)
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let file = storage::tempfile(parent, ".download-").map_err(|error| {
+            tracing::debug!(
+                target: "anki_3ds_sync_transport",
+                parent = %parent.display(),
+                cwd = ?std::env::current_dir(),
+                %error,
+                "full download temp creation failed"
+            );
+            storage::file_error("create collection download", target, error)
+        })?;
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            path = %file.path().display(),
+            "full download temp created"
+        );
+        Ok(file)
     }
 
     async fn upload_file(
@@ -714,7 +729,8 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
         >,
     ) -> HttpResult<SyncResponse<UploadResponse>> {
         use anki::sync::request::IntoSyncRequest;
-        let compressed = storage::tempfile(path.parent().unwrap(), ".sync-").map_err(io_http)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let compressed = storage::tempfile(parent, ".sync-").map_err(io_http)?;
         let mut encoder = zstd::Encoder::new(compressed.as_file(), 0).map_err(io_http)?;
         let mut input = std::fs::File::open(path).map_err(io_http)?;
         copy_with_cancel(&mut input, &mut encoder, &self.cancel).map_err(|e| self.file_error(e))?;
@@ -723,6 +739,12 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             .map_err(io_http)?
             .sync_all()
             .map_err(io_http)?;
+        let compressed = compressed.into_temp_path();
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            path = %compressed.display(),
+            "full upload scratch ready"
+        );
         let header = self.file_header(
             EmptyInput::default()
                 .try_into_sync_request()
@@ -734,7 +756,7 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
                 endpoint.path(),
                 &header,
                 &[],
-                Some(compressed.path()),
+                Some(compressed.as_ref()),
                 None,
                 Some(progress),
             )
@@ -753,7 +775,31 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             anki::sync::collection::progress::FullSyncProgress,
         >,
     ) -> HttpResult<()> {
-        let compressed = storage::tempfile(path.parent().unwrap(), ".sync-").map_err(io_http)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            target = %path.display(),
+            parent = %parent.display(),
+            cwd = ?std::env::current_dir(),
+            "full download start"
+        );
+        let compressed = storage::tempfile(parent, ".sync-").map_err(|error| {
+            tracing::debug!(
+                target: "anki_3ds_sync_transport",
+                parent = %parent.display(),
+                %error,
+                "full download scratch creation failed"
+            );
+            io_http(error)
+        })?;
+        // Close the Rust handle before the native codec opens the same path, so
+        // the two layers never hold competing handles while transferring.
+        let compressed = compressed.into_temp_path();
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            path = %compressed.display(),
+            "full download scratch created"
+        );
         let body = zstd::encode_all(&request.data[..], 0).map_err(io_http)?;
         let header = self.file_header(request)?;
         let endpoint = SyncMethod::Download.as_sync_endpoint(&self.endpoint);
@@ -763,16 +809,36 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
                 &header,
                 &body,
                 None,
-                Some(compressed.path()),
+                Some(compressed.as_ref()),
                 Some(progress),
             )
             .map_err(|e| self.transport_error(e))?;
         self.check_file_response(response)?;
-        let mut input = std::fs::File::open(compressed.path()).map_err(io_http)?;
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            "full download transfer complete"
+        );
+        let mut input = std::fs::File::open(&*compressed).map_err(|error| {
+            tracing::debug!(
+                target: "anki_3ds_sync_transport",
+                path = %compressed.display(),
+                %error,
+                "full download scratch open failed"
+            );
+            io_http(error)
+        })?;
         let mut magic = [0; 4];
         input.read_exact(&mut magic).map_err(io_http)?;
         input.seek(SeekFrom::Start(0)).map_err(io_http)?;
-        let mut output = std::fs::File::create(path).map_err(io_http)?;
+        let mut output = std::fs::File::create(path).map_err(|error| {
+            tracing::debug!(
+                target: "anki_3ds_sync_transport",
+                path = %path.display(),
+                %error,
+                "full download output create failed"
+            );
+            io_http(error)
+        })?;
         let limit = *anki::sync::request::MAXIMUM_SYNC_PAYLOAD_BYTES_UNCOMPRESSED;
         let bytes = if magic == [0x28, 0xb5, 0x2f, 0xfd] {
             let mut decoder = zstd::Decoder::new(input).map_err(io_http)?;
@@ -790,6 +856,11 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             ));
         }
         output.sync_all().map_err(io_http)?;
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            bytes,
+            "full download output written"
+        );
         Ok(())
     }
 
@@ -804,7 +875,25 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
         // Horizon cannot rename an open download. Close its file handle while
         // retaining the temporary path until replacement or recovery completes.
         let path = file.into_temp_path();
-        storage::replace(&path, target).map_err(Into::into)
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            source = %path.display(),
+            target = %target.display(),
+            "full download replace start"
+        );
+        storage::replace(&path, target).map_err(|error| {
+            tracing::debug!(
+                target: "anki_3ds_sync_transport",
+                %error,
+                "full download replace failed"
+            );
+            anki::error::AnkiError::from(error)
+        })?;
+        tracing::debug!(
+            target: "anki_3ds_sync_transport",
+            "full download installed"
+        );
+        Ok(())
     }
 }
 

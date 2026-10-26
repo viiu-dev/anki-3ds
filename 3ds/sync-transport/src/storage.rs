@@ -11,6 +11,22 @@ use std::io::{
 };
 use std::path::Path;
 
+/// Make a device-qualified path relative to the current directory.
+///
+/// `tempfile::TempPath` resolves a path it considers relative against
+/// `getcwd()`. Horizon paths such as `sdmc:/3ds/anki-3ds/file` are not absolute
+/// to Rust, but `getcwd()` returns a device-qualified path on the console.
+/// Passing the path relative to that directory makes `TempPath` reconstruct the
+/// original path instead of producing an embedded colon that libctru rejects
+/// with `EINVAL`.
+#[cfg(any(test, target_os = "horizon"))]
+fn cleanup_path(path: std::path::PathBuf, cwd: Option<&Path>) -> std::path::PathBuf {
+    cwd.and_then(|cwd| path.strip_prefix(cwd).ok())
+        .map(Path::to_path_buf)
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(path)
+}
+
 /// Preserve Horizon's device-qualified path; tempfile otherwise prepends `/`.
 pub fn tempfile(parent: &Path, prefix: &str) -> io::Result<tempfile::NamedTempFile> {
     #[cfg(not(target_os = "horizon"))]
@@ -38,10 +54,18 @@ pub fn tempfile(parent: &Path, prefix: &str) -> io::Result<tempfile::NamedTempFi
                 .open(&path)
             {
                 Ok(file) => {
-                    return Ok(tempfile::NamedTempFile::from_parts(
-                        file,
-                        tempfile::TempPath::from_path(path),
-                    ))
+                    let cleanup =
+                        cleanup_path(path.clone(), std::env::current_dir().ok().as_deref());
+                    match tempfile::TempPath::try_from_path(cleanup) {
+                        Ok(cleanup) => {
+                            return Ok(tempfile::NamedTempFile::from_parts(file, cleanup));
+                        }
+                        Err(error) => {
+                            drop(file);
+                            let _ = fs::remove_file(&path);
+                            return Err(error);
+                        }
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -55,12 +79,15 @@ pub fn tempfile(parent: &Path, prefix: &str) -> io::Result<tempfile::NamedTempFi
 }
 
 pub fn file_error(action: &str, path: &Path, error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{action} {}: {error}", path.display()))
+    io::Error::new(
+        error.kind(),
+        format!("{action} {}: {error}", path.display()),
+    )
 }
 
 fn copy_flush(source: &Path, destination: &Path) -> io::Result<()> {
-    let mut input = File::open(source)
-        .map_err(|error| file_error("read sync file", source, error))?;
+    let mut input =
+        File::open(source).map_err(|error| file_error("read sync file", source, error))?;
     let mut output = File::create(destination)
         .map_err(|error| file_error("create sync file", destination, error))?;
     io::copy(&mut input, &mut output)?;
@@ -174,5 +201,19 @@ mod tests {
         assert!(replace(&dir.path().join("missing-download"), &target).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old committed collection");
         assert!(!target.with_extension("replace-pending").exists());
+    }
+    #[test]
+    fn device_path_is_reconstructed_after_cleanup_path() {
+        let path = std::path::PathBuf::from("sdmc:/3ds/anki-3ds/.download-1");
+        let cwd = Path::new("sdmc:/3ds");
+        let relative = cleanup_path(path.clone(), Some(cwd));
+        assert_eq!(relative, Path::new("anki-3ds/.download-1"));
+        assert_eq!(cwd.join(relative), path);
+    }
+    #[test]
+    fn cleanup_path_falls_back_without_a_matching_cwd() {
+        let path = std::path::PathBuf::from("sdmc:/3ds/anki-3ds/.download-1");
+        assert_eq!(cleanup_path(path.clone(), Some(Path::new("/"))), path);
+        assert_eq!(cleanup_path(path.clone(), None), path);
     }
 }

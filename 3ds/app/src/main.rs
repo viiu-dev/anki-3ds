@@ -132,7 +132,6 @@ enum Screen {
         download_ok: bool,
         download: bool,
         confirmed: bool,
-        chosen: bool,
     },
     Question {
         card: OfferedCard,
@@ -431,7 +430,17 @@ fn main() {
     i18n::init();
     let startup_error = assets::prepare()
         .map_err(|e| e.to_string())
-        .and_then(|_| clock::configure(false, &apt, &mut hid, None))
+        .and_then(|_| {
+            // `tempfile` resolves Rust-relative Horizon paths against the
+            // current directory. Some launchers, including Azahar, leave it at
+            // "/", so anchor it at the app directory before sync scratch files
+            // are created. All application paths are device-qualified.
+            #[cfg(target_os = "horizon")]
+            if let Err(error) = std::env::set_current_dir("sdmc:/3ds/anki-3ds") {
+                event(&format!("CWD_SWITCH_ERROR {error}"));
+            }
+            clock::configure(false, &apt, &mut hid, None)
+        })
         .err();
     let started = Instant::now();
     let progress = std::sync::Arc::new(std::sync::Mutex::new(
@@ -491,6 +500,11 @@ fn main() {
         started.elapsed().as_millis(),
         anki_3ds_sqlite_vfs::heap_used()
     ));
+    tracing::debug!(
+        target: "anki_3ds_sync_transport",
+        cwd = ?std::env::current_dir(),
+        "startup working directory"
+    );
     let mut collapsed = HashSet::new();
     let mut decks = Vec::new();
     collect_deck_items(&root, &collapsed, &mut decks);
@@ -585,9 +599,8 @@ fn main() {
                     Screen::SyncChoice {
                         upload_ok,
                         download_ok,
-                        download: !upload_ok,
+                        download: download_ok,
                         confirmed: false,
-                        chosen: upload_ok != download_ok,
                     }
                 }
                 Err(error) => Screen::Info {
@@ -631,7 +644,21 @@ fn main() {
                 review_scroll = (review_scroll + delta).clamp(0.0, review_max_scroll);
             }
         }
-        let repeat = if down.intersects(KeyPad::UP | KeyPad::DOWN | KeyPad::LEFT | KeyPad::RIGHT) {
+        let directional_down = down.intersects(
+            KeyPad::UP
+                | KeyPad::DOWN
+                | KeyPad::LEFT
+                | KeyPad::RIGHT
+                | KeyPad::CPAD_UP
+                | KeyPad::CPAD_DOWN
+                | KeyPad::CPAD_LEFT
+                | KeyPad::CPAD_RIGHT
+                | KeyPad::CSTICK_UP
+                | KeyPad::CSTICK_DOWN
+                | KeyPad::CSTICK_LEFT
+                | KeyPad::CSTICK_RIGHT,
+        );
+        let repeat = if directional_down {
             repeat_at = Instant::now() + Duration::from_millis(300);
             down
         } else if Instant::now() >= repeat_at {
@@ -669,13 +696,13 @@ fn main() {
             // Review scrolling is pixel-based and handled above from the held
             // key state. Do not also emit line-stepping actions here.
             Action::None
-        } else if repeat.contains(KeyPad::DOWN) {
+        } else if repeat.intersects(KeyPad::DOWN | KeyPad::CPAD_DOWN | KeyPad::CSTICK_DOWN) {
             Action::Down
-        } else if repeat.contains(KeyPad::UP) {
+        } else if repeat.intersects(KeyPad::UP | KeyPad::CPAD_UP | KeyPad::CSTICK_UP) {
             Action::Up
-        } else if repeat.contains(KeyPad::LEFT) {
+        } else if repeat.intersects(KeyPad::LEFT | KeyPad::CPAD_LEFT | KeyPad::CSTICK_LEFT) {
             Action::Left
-        } else if repeat.contains(KeyPad::RIGHT) {
+        } else if repeat.intersects(KeyPad::RIGHT | KeyPad::CPAD_RIGHT | KeyPad::CSTICK_RIGHT) {
             Action::Right
         } else {
             Action::None
@@ -689,6 +716,20 @@ fn main() {
             let y = y as f32;
             action = match &mut screen {
                 Screen::SyncWait if y >= 194.0 => Action::Back,
+                Screen::SyncChoice {
+                    upload_ok,
+                    download_ok,
+                    download,
+                    confirmed,
+                } if (64.0..92.0).contains(&y) => {
+                    let direction = x >= 160.0;
+                    if (if direction { *download_ok } else { *upload_ok }) && *download != direction
+                    {
+                        *download = direction;
+                        *confirmed = false;
+                    }
+                    Action::None
+                }
                 Screen::SyncChoice { .. } if y >= 194.0 => {
                     if x < 160.0 {
                         Action::Primary
@@ -950,7 +991,6 @@ fn main() {
                 download_ok,
                 download,
                 confirmed,
-                chosen,
             } = &mut screen
             {
                 match action {
@@ -961,13 +1001,10 @@ fn main() {
                         let direction = matches!(action, Action::Down | Action::Right);
                         if if direction { *download_ok } else { *upload_ok } {
                             *download = direction;
-                            *chosen = true;
                             *confirmed = false;
                         }
                     }
-                    Action::Primary
-                        if *chosen && (if *download { *download_ok } else { *upload_ok }) =>
-                    {
+                    Action::Primary if if *download { *download_ok } else { *upload_ok } => {
                         if *confirmed {
                             full_mode = Some(if *download {
                                 sync::Mode::Download
@@ -1588,13 +1625,22 @@ fn main() {
                 download_ok,
                 download,
                 confirmed,
-                chosen,
             } => {
                 header(400.0, tr("Full sync"));
+                let selected = if *download {
+                    tr("Download (replaces local)")
+                } else {
+                    tr("Upload (replaces remote)")
+                };
+                let instruction = if *confirmed {
+                    tr("Press A to confirm replacement.")
+                } else {
+                    tr("UP/DOWN or touch selects. A continues. B cancels.")
+                };
                 let text=i18n::format("Full sync replaces one collection.\nUpload allowed: {0}\nDownload allowed: {1}\nSelected: {2}\n{3}",&[
                     tr(if *upload_ok {"Yes"} else {"No"}),tr(if *download_ok {"Yes"} else {"No"}),
-                    if !*chosen {tr("Choose upload or download")} else if *download {tr("Download (replaces local)")} else {tr("Upload (replaces remote)")},
-                    if *confirmed {tr("Press A to confirm replacement.")} else {tr("UP/DOWN selects. A continues. B cancels.")},
+                    selected,
+                    instruction,
                 ]);
                 top_layout.draw(&text, 360.0, 200.0, 60.0, 8, 0);
             }
@@ -1711,9 +1757,48 @@ fn main() {
                 );
                 button(60.0, 194.0, 200.0, tr("Cancel [B]"), None, 6);
             }
-            Screen::SyncChoice { .. } => {
-                header(320.0, tr("Confirm replacement"));
-                button(12.0, 194.0, 140.0, tr("Continue [A]"), None, 0);
+            Screen::SyncChoice {
+                upload_ok,
+                download_ok,
+                download,
+                confirmed,
+            } => {
+                header(
+                    320.0,
+                    if *confirmed {
+                        tr("Confirm replacement")
+                    } else {
+                        tr("Full sync")
+                    },
+                );
+                button(
+                    12.0,
+                    64.0,
+                    140.0,
+                    tr("Upload"),
+                    None,
+                    if *upload_ok && !*download { 0 } else { 6 },
+                );
+                button(
+                    168.0,
+                    64.0,
+                    140.0,
+                    tr("Download"),
+                    None,
+                    if *download_ok && *download { 0 } else { 6 },
+                );
+                button(
+                    12.0,
+                    194.0,
+                    140.0,
+                    if *confirmed {
+                        tr("Confirm [A]")
+                    } else {
+                        tr("Continue [A]")
+                    },
+                    None,
+                    0,
+                );
                 button(168.0, 194.0, 140.0, tr("Cancel [B]"), None, 6);
             }
             Screen::Decks => {
@@ -1930,7 +2015,10 @@ fn main() {
                 Ui::draw_text_centered(160.0, 120.0, 0.50, COLOR_TEXT_DARK, tr("START: Exit"));
             }
         }
-        if !matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+        if !matches!(
+            screen,
+            Screen::Question { .. } | Screen::Answer { .. } | Screen::SyncChoice { .. }
+        ) {
             footer(if clock::is_known() {
                 tr("Menu [SELECT]                      Options")
             } else {
