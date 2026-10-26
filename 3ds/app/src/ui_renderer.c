@@ -3,6 +3,7 @@
 
 #include "ui_renderer.h"
 #include <3ds.h>
+#include <3ds/services/cfgu.h>
 #include <citro2d.h>
 #include <citro3d.h>
 #include <math.h>
@@ -14,7 +15,24 @@ static C3D_RenderTarget* s_top_target = NULL;
 static C3D_RenderTarget* s_bottom_target = NULL;
 static C2D_TextBuf s_text_buf = NULL;
 static C2D_TextBuf s_measure_buf = NULL;
+static C2D_Font s_card_font = NULL;
+static bool s_card_font_checked = false;
 static bool s_initialized = false;
+
+static void ensure_card_font(void) {
+    if (s_card_font_checked) return;
+    s_card_font_checked = true;
+    // JPN/USA/EUR/AUS share the standard font, which includes kana and kanji.
+    // C2D_FontLoadSystem returns NULL for the console's own region because the
+    // default font is already the right one; on CHN/KOR/TWN consoles it loads
+    // that shared standard font instead of the regional one. It checks the
+    // region through CFGU, so the service must be active while loading.
+    Result initialized = cfguInit();
+    s_card_font = C2D_FontLoadSystem(CFG_REGION_JPN);
+    if (R_SUCCEEDED(initialized)) {
+        cfguExit();
+    }
+}
 
 bool ui_init(void) {
     if (s_initialized) return true;
@@ -30,8 +48,12 @@ bool ui_init(void) {
 
     s_top_target = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     s_bottom_target = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
-    s_text_buf = C2D_TextBufNew(4096);
-    s_measure_buf = C2D_TextBufNew(1024);
+    // These counts are glyphs, not bytes. Full-screen cards only draw the
+    // visible lines, so 8192 leaves ample headroom without reserving a large
+    // block of the Old 3DS linear heap.
+    s_text_buf = C2D_TextBufNew(8192);
+    s_measure_buf = C2D_TextBufNew(2048);
+    ensure_card_font();
 
     s_initialized = true;
     return true;
@@ -48,6 +70,11 @@ void ui_fini(void) {
         C2D_TextBufDelete(s_measure_buf);
         s_measure_buf = NULL;
     }
+    if (s_card_font) {
+        C2D_FontFree(s_card_font);
+        s_card_font = NULL;
+    }
+    s_card_font_checked = false;
 
     C2D_Fini();
     C3D_Fini();
@@ -115,6 +142,42 @@ float ui_get_text_width(float scale, const char* str) {
     return w;
 }
 
+void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic) {
+    if (!str || !str[0] || !s_text_buf) return;
+    ensure_card_font();
+    C2D_Text text;
+    if (s_card_font) {
+        C2D_TextFontParse(&text, s_card_font, s_text_buf, str);
+    } else {
+        C2D_TextParse(&text, s_text_buf, str);
+    }
+    C2D_TextOptimize(&text);
+    C2D_DrawText(&text, C2D_WithColor, x, y, 0.6f, scale, scale, color);
+    if (bold) {
+        C2D_DrawText(&text, C2D_WithColor, x + 0.7f, y, 0.6f, scale, scale, color);
+    }
+    if (italic) {
+        // Citro2D's system font has no italic face. A faint offset keeps the
+        // emphasis visible without loading another font into memory.
+        C2D_DrawText(&text, C2D_WithColor, x + 0.9f, y + 0.4f, 0.6f, scale, scale, (color & 0x00ffffff) | 0xb0000000);
+    }
+}
+
+float ui_get_card_text_width(float scale, const char* str) {
+    if (!str || !str[0] || !s_measure_buf) return 0.0f;
+    ensure_card_font();
+    C2D_TextBufClear(s_measure_buf);
+    C2D_Text text;
+    if (s_card_font) {
+        C2D_TextFontParse(&text, s_card_font, s_measure_buf, str);
+    } else {
+        C2D_TextParse(&text, s_measure_buf, str);
+    }
+    float w = 0.0f, h = 0.0f;
+    C2D_TextGetDimensions(&text, scale, scale, &w, &h);
+    return w;
+}
+
 void ui_draw_text_centered(float x_center, float y, float scale, uint32_t color, const char* str) {
     float w = ui_get_text_width(scale, str);
     ui_draw_text(x_center - (w / 2.0f), y, scale, color, str);
@@ -125,21 +188,7 @@ void ui_draw_text_right(float x_right, float y, float scale, uint32_t color, con
     ui_draw_text(x_right - w, y, scale, color, str);
 }
 
-void ui_draw_status_bar(float screen_w, const char* title) {
-    ui_draw_rect_gradient(0, 0, screen_w, 18, C2D_RGBA(248, 248, 246, 255), C2D_RGBA(236, 236, 232, 255));
-    ui_draw_line(0, 18, screen_w, 18, 1.0f, C2D_RGBA(210, 210, 204, 255));
-
-    float sig_x = 6.0f;
-    float sig_y = 13.0f;
-    uint32_t sig_clr = C2D_RGBA(90, 110, 130, 0);
-    ui_draw_rect(sig_x, sig_y - 3, 2, 3, sig_clr);
-    ui_draw_rect(sig_x + 3, sig_y - 6, 2, 6, sig_clr);
-    ui_draw_rect(sig_x + 6, sig_y - 9, 2, 9, sig_clr);
-
-    if (title && title[0]) {
-        ui_draw_text(sig_x + 12.0f, 2.0f, 0.45f, C2D_RGBA(40, 40, 40, 255), title);
-    }
-
+static void draw_clock_battery(float x_right, float y, float scale) {
     extern time_t __real_time(time_t *);
     time_t raw_time = __real_time(NULL);
     struct tm* ti = gmtime(&raw_time);
@@ -159,25 +208,39 @@ void ui_draw_status_bar(float screen_w, const char* title) {
         last_poll = raw_time;
     }
 
-    float rx = screen_w - 6.0f;
-
-    float batt_w = 18.0f;
-    float batt_h = 9.0f;
-    float batt_x = rx - batt_w;
-    float batt_y = 5.0f;
+    float batt_w = 16.0f;
+    float batt_h = 8.0f;
+    float batt_x = x_right - batt_w;
+    float batt_y = y + 1.0f;
     ui_draw_rect(batt_x, batt_y, batt_w, batt_h, C2D_RGBA(120, 120, 120, 255));
     ui_draw_rect(batt_x + 1, batt_y + 1, batt_w - 2, batt_h - 2, C2D_RGBA(250, 250, 250, 255));
-    ui_draw_rect(batt_x + batt_w, batt_y + 2, 2, 5, C2D_RGBA(120, 120, 120, 255));
+    ui_draw_rect(batt_x + batt_w, batt_y + 2, 2, 4, C2D_RGBA(120, 120, 120, 255));
 
     int bars = (int)batt;
     if (bars > 4) bars = 4;
     uint32_t fill_clr = (bars <= 1) ? C2D_RGBA(220, 50, 40, 255) : C2D_RGBA(60, 160, 60, 255);
     for (int b = 0; b < bars; b++) {
-        ui_draw_rect(batt_x + 2 + b * 3.5f, batt_y + 2, 2.5f, batt_h - 4, fill_clr);
+        ui_draw_rect(batt_x + 2 + b * 3.0f, batt_y + 2, 2.2f, batt_h - 4, fill_clr);
     }
 
-    rx = batt_x - 6.0f;
-    ui_draw_text_right(rx, 2.0f, 0.45f, C2D_RGBA(40, 40, 40, 255), time_str);
+    ui_draw_text_right(batt_x - 5.0f, y, scale, C2D_RGBA(70, 75, 82, 255), time_str);
+}
+
+void ui_draw_status_compact(float x_right, float y, float scale) {
+    draw_clock_battery(x_right, y, scale);
+}
+
+void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, float max_scroll) {
+    if (max_scroll <= 0.0f || h <= 0.0f) return;
+    float ratio = scroll / max_scroll;
+    if (ratio < 0.0f) ratio = 0.0f;
+    if (ratio > 1.0f) ratio = 1.0f;
+    float thumb_h = h * (h / (h + max_scroll));
+    if (thumb_h < 22.0f) thumb_h = 22.0f;
+    if (thumb_h > h) thumb_h = h;
+    float thumb_y = y + (h - thumb_h) * ratio;
+    ui_draw_rect(x, y, w, h, C2D_RGBA(80, 85, 90, 16));
+    ui_draw_rect(x, thumb_y, w, thumb_h, C2D_RGBA(95, 100, 108, 110));
 }
 
 void ui_draw_beveled_panel(float x, float y, float w, float h, float radius, uint32_t bg_color, uint32_t border_color) {

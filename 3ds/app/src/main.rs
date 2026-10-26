@@ -224,7 +224,9 @@ fn wrap_text(text: &str, width: f32, scale: f32) -> Vec<String> {
             for ch in word.chars() {
                 let mut candidate = line.clone();
                 candidate.push(ch);
-                if Ui::get_text_width(scale, &review_text::plain(&candidate)) > width && !line.is_empty() {
+                if Ui::get_text_width(scale, &review_text::plain(&candidate)) > width
+                    && !line.is_empty()
+                {
                     lines.push(std::mem::take(&mut line));
                 }
                 line.push(ch);
@@ -254,14 +256,21 @@ impl TextLayout {
         if self.text != text || self.width != width || self.lines.is_empty() {
             self.lines = wrap_text(text, width, 0.55);
             let mut depth = 0usize;
-            self.emphasis = self.lines.iter().map(|line| {
-                let initial = depth;
-                for ch in line.chars() {
-                    if ch == review_text::CLOZE_START { depth += 1; }
-                    else if ch == review_text::CLOZE_END { depth = depth.saturating_sub(1); }
-                }
-                initial
-            }).collect();
+            self.emphasis = self
+                .lines
+                .iter()
+                .map(|line| {
+                    let initial = depth;
+                    for ch in line.chars() {
+                        if ch == review_text::CLOZE_START {
+                            depth += 1;
+                        } else if ch == review_text::CLOZE_END {
+                            depth = depth.saturating_sub(1);
+                        }
+                    }
+                    initial
+                })
+                .collect();
             self.text = text.to_owned();
             self.width = width;
         }
@@ -274,14 +283,23 @@ impl TextLayout {
             for ch in line.chars().chain(std::iter::once('\0')) {
                 if matches!(ch, review_text::CLOZE_START | review_text::CLOZE_END | '\0') {
                     if index >= start {
-                        let color = if emphasis > 0 { COLOR_COUNT_NEW } else { COLOR_TEXT_DARK };
+                        let color = if emphasis > 0 {
+                            COLOR_COUNT_NEW
+                        } else {
+                            COLOR_TEXT_DARK
+                        };
                         Ui::draw_text(x, y + (index - start) as f32 * 19.0, 0.55, color, &run);
                     }
                     x += Ui::get_text_width(0.55, &run);
                     run.clear();
-                    if ch == review_text::CLOZE_START { emphasis += 1; }
-                    else if ch == review_text::CLOZE_END { emphasis = emphasis.saturating_sub(1); }
-                } else { run.push(ch); }
+                    if ch == review_text::CLOZE_START {
+                        emphasis += 1;
+                    } else if ch == review_text::CLOZE_END {
+                        emphasis = emphasis.saturating_sub(1);
+                    }
+                } else {
+                    run.push(ch);
+                }
             }
         }
         if max > 0 {
@@ -322,6 +340,16 @@ fn counts(new: u32, learn: u32, review: u32, y: f32) {
         Ui::draw_text_centered(x, y + 17.0, 0.43, COLOR_TEXT_MUTED, label);
     }
 }
+fn counts_compact(new: u32, learn: u32, review: u32, y: f32) {
+    for (x, label, value, color) in [
+        (70.0, tr("New"), new, COLOR_COUNT_NEW),
+        (160.0, tr("Learning"), learn, COLOR_COUNT_LEARN),
+        (250.0, tr("Review"), review, COLOR_COUNT_DUE),
+    ] {
+        Ui::draw_text_centered(x, y, 0.54, color, &value.to_string());
+        Ui::draw_text_centered(x, y + 17.0, 0.37, COLOR_TEXT_MUTED, label);
+    }
+}
 fn button(x: f32, y: f32, w: f32, label: &str, hint: Option<&str>, style: i32) {
     Ui::draw_button(
         x,
@@ -355,7 +383,7 @@ fn row(y: f32, label: &str, selected: bool) {
         &Ui::ellipsize(label, 0.52, 282.0),
     );
 }
-const MENU: [&str; 13] = [
+const MENU: [&str; 14] = [
     "Add note",
     "Edit note",
     "Browse",
@@ -368,8 +396,10 @@ const MENU: [&str; 13] = [
     "Log out",
     "Update clock",
     "Language",
+    "Font scale",
     "Exit",
 ];
+const FONT_SCALE_MENU_INDEX: usize = 12;
 
 fn main() {
     let apt = Apt::new().expect("APT initialization");
@@ -467,10 +497,12 @@ fn main() {
     let mut selected = 0usize;
     let mut scroll_pos = 0usize;
     let mut card_scroll = 0usize;
+    let mut review_scroll = 0.0f32;
+    let mut review_max_scroll = 0.0f32;
+    let mut last_review_card: Option<(i64, bool)> = None;
     let mut top_layout = TextLayout::default();
-    let mut bottom_layout = TextLayout::default();
+    let mut top_card = RichTextLayout::default();
     let mut top_max = 0usize;
-    let mut bottom_max = 0usize;
     let mut last_empty_poll = Instant::now();
     let mut repeat_at = Instant::now();
     #[cfg(feature = "emulator")]
@@ -486,7 +518,6 @@ fn main() {
     let mut script_step = 0;
     let mut script_cooldown = 120;
     let mut last_state = String::new();
-    let mut touch_drag: Option<(i32, f32, usize)> = None;
     let trace_touch = fs::metadata("sdmc:/3ds/anki-3ds/trace-touch").is_ok();
 
     while apt.main_loop() {
@@ -573,6 +604,33 @@ fn main() {
         hid.scan_input();
         let down = hid.keys_down();
         let held = hid.keys_held();
+        if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+            let factor = i18n::font_scale_factor();
+            let mut delta = 0.0f32;
+            if held.intersects(KeyPad::DPAD_DOWN | KeyPad::CSTICK_DOWN) {
+                delta += 5.5 * factor;
+            }
+            if held.intersects(KeyPad::DPAD_UP | KeyPad::CSTICK_UP) {
+                delta -= 5.5 * factor;
+            }
+            let (_, pad_y) = hid.circlepad_position();
+            if pad_y.abs() > 24 {
+                delta -= (f32::from(pad_y) / 156.0) * 9.0 * factor;
+            } else if held.contains(KeyPad::CPAD_DOWN) {
+                delta += 5.5 * factor;
+            } else if held.contains(KeyPad::CPAD_UP) {
+                delta -= 5.5 * factor;
+            }
+            if held.intersects(KeyPad::L | KeyPad::ZL) {
+                delta -= 9.0 * factor;
+            }
+            if held.intersects(KeyPad::R | KeyPad::ZR) {
+                delta += 9.0 * factor;
+            }
+            if delta != 0.0 {
+                review_scroll = (review_scroll + delta).clamp(0.0, review_max_scroll);
+            }
+        }
         let repeat = if down.intersects(KeyPad::UP | KeyPad::DOWN | KeyPad::LEFT | KeyPad::RIGHT) {
             repeat_at = Instant::now() + Duration::from_millis(300);
             down
@@ -600,10 +658,17 @@ fn main() {
             Action::Rate(0)
         } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::X) {
             Action::Rate(1)
-        } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::R) {
+        } else if matches!(screen, Screen::Answer { .. })
+            && down.contains(KeyPad::R)
+            && review_max_scroll <= 0.0
+        {
             Action::Rate(3)
         } else if down.contains(KeyPad::A) {
             Action::Primary
+        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+            // Review scrolling is pixel-based and handled above from the held
+            // key state. Do not also emit line-stepping actions here.
+            Action::None
         } else if repeat.contains(KeyPad::DOWN) {
             Action::Down
         } else if repeat.contains(KeyPad::UP) {
@@ -677,11 +742,11 @@ fn main() {
                     Action::Sync
                 }
                 Screen::Question { .. }
-                    if (105.0..147.0).contains(&y) && (40.0..280.0).contains(&x) =>
+                    if (128.0..200.0).contains(&y) && (40.0..280.0).contains(&x) =>
                 {
                     Action::Reveal
                 }
-                Screen::Answer { .. } if (185.0..221.0).contains(&y) => {
+                Screen::Answer { .. } if (190.0..226.0).contains(&y) => {
                     let n = ((x - 8.0) / 76.0).floor() as i32;
                     if (0..4).contains(&n)
                         && x >= 8.0 + n as f32 * 76.0
@@ -690,15 +755,6 @@ fn main() {
                         Action::Rate(n)
                     } else {
                         Action::None
-                    }
-                }
-                Screen::Answer { .. } | Screen::Question { .. }
-                    if (43.0..180.0).contains(&y) && x >= 292.0 =>
-                {
-                    if y < 100.0 {
-                        Action::Up
-                    } else {
-                        Action::Down
                     }
                 }
                 Screen::Browser(_) | Screen::Editor { .. } | Screen::Menu { .. }
@@ -756,38 +812,12 @@ fn main() {
                 Screen::Empty { .. } if (110.0..144.0).contains(&y) => Action::Back,
                 _ => Action::None,
             };
-            if y >= 224.0 {
+            if y >= 224.0 && !matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
                 action = if x < 160.0 {
                     Action::Menu
                 } else {
                     Action::Options
                 };
-            }
-        }
-
-        if matches!(screen, Screen::Answer { .. }) && held.contains(KeyPad::TOUCH) {
-            let (x, y) = hid.touch_position();
-            if x >= 292 && (43..181).contains(&y) {
-                let max = top_max.max(bottom_max);
-                card_scroll = (((y - 43) as f32 / 137.0) * max as f32).round() as usize;
-                touch_drag = None;
-            } else if down.contains(KeyPad::TOUCH) && x < 292 && (43..181).contains(&y) {
-                touch_drag = Some((y as i32, 0.0, card_scroll));
-            } else if let Some((last_y, remainder, _)) = &mut touch_drag {
-                *remainder += (*last_y - y as i32) as f32;
-                *last_y = y as i32;
-                while *remainder >= 19.0 {
-                    card_scroll = (card_scroll + 1).min(top_max.max(bottom_max));
-                    *remainder -= 19.0;
-                }
-                while *remainder <= -19.0 {
-                    card_scroll = card_scroll.saturating_sub(1);
-                    *remainder += 19.0;
-                }
-            }
-        } else if let Some((_, _, start)) = touch_drag.take() {
-            if trace_touch {
-                event(&format!("TOUCH_SCROLL start={start} end={card_scroll}"));
             }
         }
 
@@ -877,6 +907,19 @@ fn main() {
                 return Ok(());
             }
             if let Screen::Menu { selected, .. } = &screen {
+                if *selected == FONT_SCALE_MENU_INDEX {
+                    let direction = match action {
+                        Action::Primary | Action::Right => 1,
+                        Action::Left => -1,
+                        _ => 0,
+                    };
+                    if direction != 0 {
+                        let percent = i18n::adjust_font_scale(direction)?;
+                        event(&format!("FONT_SCALE {percent}%"));
+                        review_scroll = 0.0;
+                        return Ok(());
+                    }
+                }
                 if matches!(action, Action::Primary) {
                     action = [
                         Action::Add,
@@ -891,6 +934,7 @@ fn main() {
                         Action::Logout,
                         Action::Clock,
                         Action::Language,
+                        Action::None,
                         Action::Exit,
                     ][*selected]
                         .clone();
@@ -1104,7 +1148,7 @@ fn main() {
                 }
                 Action::Help | Action::Stats => {
                     let (title, text) = match action {
-                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy.\nUP/DOWN scrolls. B returns. SELECT opens Menu. START closes and exits.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
+                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy when the card fits.\nScroll the top screen with Circle Pad, D-pad, C-stick or L/R.\nSELECT opens Menu. B returns. START closes and exits.\nMenu > Font scale changes card text size.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
                         Action::Stats => (tr("Statistics"), backend.as_mut().ok_or("collection unavailable")?.statistics()?),
                         _ => unreachable!(),
                     };
@@ -1346,37 +1390,42 @@ fn main() {
                             index.saturating_sub(1)
                         }
                     };
-                    match &mut screen {
-                        Screen::Decks => {
-                            selected = next(selected, decks.len());
-                            if selected < scroll_pos {
-                                scroll_pos = selected
-                            } else if selected >= scroll_pos + ROWS {
-                                scroll_pos = selected + 1 - ROWS
-                            };
-                        }
-                        Screen::Browser(b) => {
-                            b.selected = next(b.selected, b.ids.len());
-                            b.refresh(backend.as_mut().ok_or("collection unavailable")?)?;
-                            card_scroll = 0;
-                        }
-                        Screen::Editor { draft, field, .. } => {
-                            *field = next(*field, draft.labels.len() + 1);
-                            card_scroll = 0;
-                        }
-                        Screen::Options { field, .. } => {
-                            *field = next(*field, 2);
-                        }
-                        Screen::Menu { selected, .. } => {
-                            *selected = next(*selected, MENU.len());
-                        }
-                        _ => {
-                            let max = if matches!(screen, Screen::Answer { .. }) {
-                                top_max.max(bottom_max)
-                            } else {
-                                top_max
-                            };
-                            card_scroll = next(card_scroll, max + 1);
+                    if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+                        let step = 19.0 * i18n::font_scale_factor();
+                        let delta = if matches!(action, Action::Down) {
+                            step
+                        } else {
+                            -step
+                        };
+                        review_scroll = (review_scroll + delta).clamp(0.0, review_max_scroll);
+                    } else {
+                        match &mut screen {
+                            Screen::Decks => {
+                                selected = next(selected, decks.len());
+                                if selected < scroll_pos {
+                                    scroll_pos = selected
+                                } else if selected >= scroll_pos + ROWS {
+                                    scroll_pos = selected + 1 - ROWS
+                                };
+                            }
+                            Screen::Browser(b) => {
+                                b.selected = next(b.selected, b.ids.len());
+                                b.refresh(backend.as_mut().ok_or("collection unavailable")?)?;
+                                card_scroll = 0;
+                            }
+                            Screen::Editor { draft, field, .. } => {
+                                *field = next(*field, draft.labels.len() + 1);
+                                card_scroll = 0;
+                            }
+                            Screen::Options { field, .. } => {
+                                *field = next(*field, 2);
+                            }
+                            Screen::Menu { selected, .. } => {
+                                *selected = next(*selected, MENU.len());
+                            }
+                            _ => {
+                                card_scroll = next(card_scroll, top_max + 1);
+                            }
                         }
                     }
                 }
@@ -1396,16 +1445,20 @@ fn main() {
                                 scroll_pos = scroll_pos.min(decks.len().saturating_sub(ROWS));
                             }
                         }
+                    } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+                        let step = 19.0 * 5.0 * i18n::font_scale_factor();
+                        let delta = if matches!(action, Action::Right) {
+                            step
+                        } else {
+                            -step
+                        };
+                        review_scroll = (review_scroll + delta).clamp(0.0, review_max_scroll);
                     } else if matches!(
                         screen,
-                        Screen::Question { .. }
-                            | Screen::Answer { .. }
-                            | Screen::Info { .. }
-                            | Screen::Browser(_)
-                            | Screen::Editor { .. }
+                        Screen::Info { .. } | Screen::Browser(_) | Screen::Editor { .. }
                     ) {
                         card_scroll = if matches!(action, Action::Right) {
-                            card_scroll.saturating_add(5).min(top_max.max(bottom_max))
+                            card_scroll.saturating_add(5).min(top_max)
                         } else {
                             card_scroll.saturating_sub(5)
                         };
@@ -1452,6 +1505,15 @@ fn main() {
                 }
             }
         }
+        let review_card = match &screen {
+            Screen::Question { card, .. } => Some((card.id, false)),
+            Screen::Answer { card, .. } => Some((card.id, true)),
+            _ => None,
+        };
+        if review_card != last_review_card {
+            last_review_card = review_card;
+            review_scroll = 0.0;
+        }
         let state = match &screen {
             Screen::Decks => "DECKS",
             Screen::SyncWait => "SYNC_WAIT",
@@ -1489,16 +1551,8 @@ fn main() {
 
         Ui::frame_begin();
         Ui::target_top(COLOR_BG_TOP);
-        Ui::draw_status_bar(
-            TOP_WIDTH,
-            if login.is_test() {
-                tr("Anki 3DS - TEST SERVER")
-            } else {
-                "Anki 3DS"
-            },
-        );
         top_max = 0;
-        bottom_max = 0;
+        review_max_scroll = 0.0;
         match &screen {
             Screen::SyncWait => {
                 header(
@@ -1562,21 +1616,26 @@ fn main() {
                     Ui::draw_text_centered(200.0, 100.0, 0.60, COLOR_TEXT_DARK, tr("No decks"));
                 }
             }
-            Screen::Question { card, deck_name } | Screen::Answer { card, deck_name } => {
-                Ui::fit_text(200.0, 28.0, 0.46, 368.0, COLOR_TEXT_MUTED, deck_name);
-                Ui::draw_line(16.0, 49.0, 384.0, 49.0, 1.0, COLOR_PANEL_BORDER);
-                let text = if matches!(screen, Screen::Answer { .. }) {
-                    card.cloze_answer.as_deref().unwrap_or(&card.question)
-                } else { &card.question };
-                top_max = top_layout.draw(
-                    text,
-                    360.0,
-                    200.0,
-                    66.0,
-                    6,
-                    card_scroll,
+            Screen::Question { card, .. } | Screen::Answer { card, .. } => {
+                let html = if matches!(screen, Screen::Answer { .. }) {
+                    card.cloze_answer_html
+                        .as_deref()
+                        .unwrap_or(&card.answer_html)
+                } else {
+                    &card.question_html
+                };
+                top_card.set_text(html, CARD_WIDTH, i18n::font_scale_factor());
+                review_max_scroll = top_card.max_scroll();
+                review_scroll = review_scroll.min(review_max_scroll);
+                top_card.draw(review_scroll);
+                Ui::draw_scroll_indicator(
+                    TOP_WIDTH - 4.0,
+                    0.0,
+                    3.0,
+                    TOP_HEIGHT,
+                    review_scroll,
+                    review_max_scroll,
                 );
-                counts(card.new_count, card.learn_count, card.review_count, 193.0);
             }
             Screen::Browser(b) => {
                 Ui::draw_text_centered(200.0, 30.0, 0.60, COLOR_TEXT_DARK, tr("Preview"));
@@ -1608,7 +1667,7 @@ fn main() {
                 );
             }
             Screen::Menu { .. } => {
-                Ui::draw_text_centered(200.0, 70.0, 0.65, COLOR_TEXT_DARK, "Anki 3DS");
+                Ui::draw_text_centered(200.0, 70.0, 0.65, COLOR_TEXT_DARK, tr("Menu"));
                 Ui::draw_text_centered(
                     200.0,
                     112.0,
@@ -1691,47 +1750,54 @@ fn main() {
                 button(12.0, 194.0, 140.0, tr("Study [A]"), None, 0);
                 button(168.0, 194.0, 140.0, tr("Sync"), None, 6);
             }
-            Screen::Question { .. } => {
-                header(320.0, tr("Question"));
-                Ui::draw_button(
-                    40.0,
-                    105.0,
-                    240.0,
-                    42.0,
-                    tr("Show answer"),
-                    Some(tr("Tap or press [A]")),
-                    0,
-                    false,
+            Screen::Question { card, deck_name } => {
+                Ui::draw_text(
+                    8.0,
+                    3.0,
+                    0.44,
+                    COLOR_TEXT_MUTED,
+                    &Ui::ellipsize(deck_name, 0.44, 205.0),
+                );
+                Ui::draw_status_compact(314.0, 3.0, 0.42);
+                counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                Ui::draw_button(40.0, 128.0, 240.0, 52.0, tr("Show answer"), None, 0, false);
+                Ui::draw_text_centered(
+                    160.0,
+                    187.0,
+                    0.40,
+                    COLOR_TEXT_MUTED,
+                    tr("Tap or press [A]"),
                 );
             }
-            Screen::Answer { card, .. } => {
-                header(320.0, tr("Answer"));
-                bottom_max = bottom_layout.draw(&card.answer, 272.0, 152.0, 51.0, 6, card_scroll);
-                let review_max = top_max.max(bottom_max);
-                if review_max > 0 {
-                    Ui::draw_scrollbar(
-                        300.0,
-                        43.0,
-                        20.0,
-                        138.0,
-                        review_max + 6,
-                        6,
-                        card_scroll.min(review_max),
-                    );
-                }
+            Screen::Answer { card, deck_name } => {
+                Ui::draw_text(
+                    8.0,
+                    3.0,
+                    0.44,
+                    COLOR_TEXT_MUTED,
+                    &Ui::ellipsize(deck_name, 0.44, 205.0),
+                );
+                Ui::draw_status_compact(314.0, 3.0, 0.42);
+                counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
                 for (i, label) in [tr("Again"), tr("Hard"), tr("Good"), tr("Easy")]
                     .iter()
                     .enumerate()
                 {
                     let interval = card.intervals.get(i).map(String::as_str).unwrap_or("?");
-                    let hint = Ui::ellipsize(
-                        &format!("{interval} [{}]", ["Y", "X", "A", "R"][i]),
-                        0.42,
-                        68.0,
-                    );
+                    let key = if i == 3 && review_max_scroll > 0.0 {
+                        ""
+                    } else {
+                        ["Y", "X", "A", "R"][i]
+                    };
+                    let hint = if key.is_empty() {
+                        interval.to_owned()
+                    } else {
+                        format!("{interval} [{key}]")
+                    };
+                    let hint = Ui::ellipsize(&hint, 0.42, 68.0);
                     button(
                         8.0 + i as f32 * 76.0,
-                        185.0,
+                        190.0,
                         72.0,
                         label,
                         Some(&hint),
@@ -1824,7 +1890,12 @@ fn main() {
                     .skip(selected / ROWS * ROWS)
                     .take(ROWS)
                 {
-                    row(43.0 + (i % ROWS) as f32 * 24.0, tr(label), i == *selected);
+                    let label = if i == FONT_SCALE_MENU_INDEX {
+                        i18n::format("Font scale: {0}%", &[&i18n::font_scale().to_string()])
+                    } else {
+                        tr(label).to_owned()
+                    };
+                    row(43.0 + (i % ROWS) as f32 * 24.0, &label, i == *selected);
                 }
                 Ui::draw_scrollbar(
                     304.0,
@@ -1859,11 +1930,13 @@ fn main() {
                 Ui::draw_text_centered(160.0, 120.0, 0.50, COLOR_TEXT_DARK, tr("START: Exit"));
             }
         }
-        footer(if clock::is_known() {
-            tr("Menu [SELECT]                      Options")
-        } else {
-            tr("Clock will update when connected")
-        });
+        if !matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+            footer(if clock::is_known() {
+                tr("Menu [SELECT]                      Options")
+            } else {
+                tr("Clock will update when connected")
+            });
+        }
         Ui::frame_end();
     }
     if let Some(active) = job.take() {

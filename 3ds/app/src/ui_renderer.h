@@ -37,7 +37,15 @@ void ui_draw_text_centered(float x_center, float y, float scale, uint32_t color,
 void ui_draw_text_right(float x_right, float y, float scale, uint32_t color, const char* str);
 float ui_get_text_width(float scale, const char* str);
 
-void ui_draw_status_bar(float screen_w, const char* title);
+// Card text uses the system font when available, so Japanese furigana and
+// base characters can be rendered. Bold is approximated by a second pass.
+void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic);
+float ui_get_card_text_width(float scale, const char* str);
+
+// Compact clock + battery cluster without the old status-bar banner.
+void ui_draw_status_compact(float x_right, float y, float scale);
+// Minimal scroll thumb for full-screen content.
+void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, float max_scroll);
 
 void ui_draw_beveled_panel(float x, float y, float w, float h, float radius, uint32_t bg_color, uint32_t border_color);
 void ui_draw_plaque(float x, float y, float w, float h, const char* title, const char* subtitle);

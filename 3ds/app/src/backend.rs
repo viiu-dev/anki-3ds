@@ -26,17 +26,18 @@ use super::i18n::tr;
 pub const PATH: &str = "sdmc:/3ds/anki-3ds/prototype.anki2";
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Upstream's own line-break tag set (`text::HTML_LINEBREAK_TAGS`), which the
-/// console needs because `strip_html` deletes tags instead of spacing them. The
-/// full upstream set is broader; this covers the block-level tags a card
-/// template can realistically produce. Kept local so no upstream module
-/// changes.
-// Standard Anki templates mark the boundary after the repeated FrontSide.
+/// Standard Anki templates mark the boundary after the repeated FrontSide.
+/// Rich HTML is kept for the review renderer; plain conversion is still used
+/// by Browse previews.
 static ANSWER_DIVIDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<hr\b[^>]*\bid\s*=\s*(?:"answer"|'answer'|answer)(?:\s[^>]*)?/?>"#)
         .expect("static answer-divider pattern")
 });
 
+/// Upstream's own line-break tag set (`text::HTML_LINEBREAK_TAGS`), which the
+/// console needs because `strip_html` deletes tags instead of spacing them.
+/// Review cards use the rich renderer, but Browse previews still use this
+/// plain-text conversion.
 static LINE_BREAKS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?xsi)
@@ -60,9 +61,9 @@ pub struct OfferedCard {
     queued: QueuedCard,
     pub id: i64,
     pub intervals: Vec<String>,
-    pub question: String,
-    pub answer: String,
-    pub cloze_answer: Option<String>,
+    pub question_html: String,
+    pub answer_html: String,
+    pub cloze_answer_html: Option<String>,
     pub new_count: u32,
     pub learn_count: u32,
     pub review_count: u32,
@@ -99,9 +100,11 @@ impl Backend {
             Mode::Login => {
                 let result = (|| {
                     let mut client = client;
-                    let state = block_on(anki::sync::collection::status::online_sync_status_check(
-                        self.collection.sync_meta()?, &mut client,
-                    ))?;
+                    let state =
+                        block_on(anki::sync::collection::status::online_sync_status_check(
+                            self.collection.sync_meta()?,
+                            &mut client,
+                        ))?;
                     if let (Some(endpoint), Some(auth)) = (state.new_endpoint, auth.as_mut()) {
                         auth.endpoint = Some(ammonia::Url::parse(&endpoint)?);
                     }
@@ -200,12 +203,10 @@ impl Backend {
         if rendered.is_empty {
             return Err("the card rendered to nothing".into());
         }
-        let question = self.to_text(&render_nodes(rendered.question_nodes))?;
-        let answer_html = render_nodes(rendered.answer_nodes);
-        let cloze_answer = super::review_text::mark_clozes(&answer_html)
-            .map(|html| self.to_text(&html))
-            .transpose()?;
-        let answer = self.answer_text(&answer_html)?;
+        let question_html = self.to_html(&render_nodes(rendered.question_nodes))?;
+        let answer_html_full = self.to_html(&render_nodes(rendered.answer_nodes))?;
+        let cloze_answer_html = super::review_text::mark_clozes(&answer_html_full);
+        let answer_html = self.answer_html(&answer_html_full);
         let intervals = SchedulerService::describe_next_states(
             &mut self.collection,
             queued
@@ -217,9 +218,9 @@ impl Backend {
         Ok(Some(OfferedCard {
             id,
             intervals,
-            question,
-            answer,
-            cloze_answer,
+            question_html,
+            answer_html,
+            cloze_answer_html,
             queued,
             new_count,
             learn_count,
@@ -228,23 +229,32 @@ impl Backend {
         }))
     }
 
-    fn answer_text(&mut self, html: &str) -> Result<String> {
-        let answer = ANSWER_DIVIDER
+    fn answer_html(&self, html: &str) -> String {
+        ANSWER_DIVIDER
             .find(html)
             .map(|m| &html[m.end()..])
-            .unwrap_or(html);
-        self.to_text(answer)
+            .unwrap_or(html)
+            .to_owned()
+    }
+
+    fn answer_text(&mut self, html: &str) -> Result<String> {
+        let answer = self.answer_html(html);
+        self.to_text(&answer)
+    }
+
+    fn to_html(&mut self, html: &str) -> Result<String> {
+        Ok(CardRenderingService::strip_av_tags(
+            &mut self.collection,
+            anki_proto::generic::String {
+                val: html.to_owned(),
+            },
+        )?
+        .val)
     }
 
     fn to_text(&mut self, html: &str) -> Result<String> {
         let spaced = LINE_BREAKS.replace_all(html, "\n");
-        let without_media = CardRenderingService::strip_av_tags(
-            &mut self.collection,
-            anki_proto::generic::String {
-                val: spaced.into_owned(),
-            },
-        )?
-        .val;
+        let without_media = self.to_html(&spaced)?;
         let text = CardRenderingService::strip_html(
             &mut self.collection,
             StripHtmlRequest {
