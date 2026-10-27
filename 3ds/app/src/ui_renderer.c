@@ -782,6 +782,13 @@ void ui_draw_nav_tab(float x, float y, float w, float h, const char* label, int 
     } else if (icon_type == 3) {
         icon_arc(ix, iy, scale, 10, 10, 6, 0, 360, color);
         icon_line(ix, iy, scale, 14.5f, 14.5f, 21, 21, color);
+    } else if (icon_type == 4) {
+        icon_line(ix, iy, scale, 4, 7, 20, 7, color);
+        ui_draw_circle(ix + 15 * scale, iy + 7 * scale, 2.4f * scale, color);
+        icon_line(ix, iy, scale, 4, 12, 20, 12, color);
+        ui_draw_circle(ix + 9 * scale, iy + 12 * scale, 2.4f * scale, color);
+        icon_line(ix, iy, scale, 4, 17, 20, 17, color);
+        ui_draw_circle(ix + 15 * scale, iy + 17 * scale, 2.4f * scale, color);
     }
 
     ui_draw_text_centered(icon_cx, y + 26.0f, 0.42f, color, label);

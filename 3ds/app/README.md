@@ -45,7 +45,11 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
   advances the setting and Left/Right adjusts it. The choice is saved in
   `settings.json` and applies to both screens.
 - Add/Edit: select a field for the Nintendo keyboard; X saves, B cancels.
-- Browse: upstream search syntax; X opens search.
+- Browse: upstream search syntax plus quick filters (All, Current deck, Buried,
+  Suspended, Leeches). The selected card shows whether it is buried, suspended
+  or a leech, and Restore unburies/unsuspends it. X opens the search keyboard.
+- Deck options (toolbar or Menu): grouped Daily limits, New cards, Lapses and
+  leeches, FSRS and display-order/burying settings for the selected deck.
 - Settings → Log in: enter your AnkiWeb email and masked password once. Login
   checks authentication without uploading or downloading a collection. The saved
   login works after restarting. Settings → Log out removes it from this SD card.

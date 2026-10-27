@@ -6,7 +6,10 @@ use std::sync::LazyLock;
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::services::CardRenderingService;
+use anki::services::CardsService;
+use anki::services::DeckConfigService;
 use anki::services::DecksService;
+use anki::services::NotesService;
 use anki::services::SchedulerService;
 use anki::timestamp::TimestampMillis;
 use anki::timestamp::TimestampSecs;
@@ -409,29 +412,91 @@ impl Backend {
             .filter_map(|c| c.config.as_ref())
             .find(|c| c.id == deck.config_id)
             .ok_or("deck config missing")?;
-        let defaults = config.config.as_ref().ok_or("config missing")?;
-        let limits = deck.limits.as_ref().ok_or("limits missing")?;
+        let inner = config.config.as_ref().ok_or("config missing")?;
+        let limits = deck.limits.as_ref();
+        let new = limits.and_then(|l| l.new).unwrap_or(inner.new_per_day);
+        let reviews = limits
+            .and_then(|l| l.review)
+            .unwrap_or(inner.reviews_per_day);
+        let learn_steps = inner.learn_steps.clone();
+        let relearn_steps = inner.relearn_steps.clone();
+        let insert_order = inner.new_card_insert_order;
+        let leech_threshold = inner.leech_threshold;
+        let leech_action = inner.leech_action;
+        let new_mix = inner.new_mix;
+        let bury_new = inner.bury_new;
+        let bury_reviews = inner.bury_reviews;
+        let desired_retention = if inner.desired_retention > 0.0 {
+            inner.desired_retention
+        } else {
+            0.9
+        };
+        let fsrs = snapshot.fsrs;
         Ok(DeckOptions {
             deck_id,
-            new: limits.new.unwrap_or(defaults.new_per_day),
-            reviews: limits.review.unwrap_or(defaults.reviews_per_day),
+            new,
+            reviews,
+            learn_steps,
+            relearn_steps,
+            insert_order,
+            leech_threshold,
+            leech_action,
+            desired_retention,
+            new_mix,
+            bury_new,
+            bury_reviews,
+            fsrs,
             snapshot,
         })
     }
 
     pub fn save_options(&mut self, options: &DeckOptions) -> Result<()> {
-        let mut deck = self
-            .collection
-            .get_deck(anki::decks::DeckId(options.deck_id))?
-            .ok_or("deck missing")?
+        let current = options
+            .snapshot
+            .current_deck
             .as_ref()
-            .clone();
-        let anki::decks::DeckKind::Normal(normal) = &mut deck.kind else {
-            return Err(tr("Filtered decks have no daily limits.").into());
+            .ok_or("deck missing")?;
+        let mut config = options
+            .snapshot
+            .all_config
+            .iter()
+            .filter_map(|c| c.config.clone())
+            .find(|c| c.id == current.config_id)
+            .ok_or("deck config missing")?;
+        let inner = config.config.as_mut().ok_or("config missing")?;
+        inner.new_per_day = options.new;
+        inner.reviews_per_day = options.reviews;
+        inner.learn_steps = options.learn_steps.clone();
+        inner.relearn_steps = options.relearn_steps.clone();
+        inner.new_card_insert_order = options.insert_order;
+        inner.leech_threshold = options.leech_threshold;
+        inner.leech_action = options.leech_action;
+        inner.new_mix = options.new_mix;
+        inner.bury_new = options.bury_new;
+        inner.bury_reviews = options.bury_reviews;
+        inner.desired_retention = options.desired_retention;
+        if inner.fsrs_params_6.is_empty() {
+            if let Some(defaults) = options
+                .snapshot
+                .defaults
+                .as_ref()
+                .and_then(|deck| deck.config.as_ref())
+            {
+                inner.fsrs_params_6 = defaults.fsrs_params_6.clone();
+            }
+        }
+        let mut limits = current.limits.clone().unwrap_or_default();
+        limits.new = Some(options.new);
+        limits.review = Some(options.reviews);
+        let request = anki_proto::deck_config::UpdateDeckConfigsRequest {
+            target_deck_id: options.deck_id,
+            configs: vec![config],
+            limits: Some(limits),
+            fsrs: options.fsrs,
+            mode: anki_proto::deck_config::UpdateDeckConfigsMode::Normal as i32,
+            ..Default::default()
         };
-        normal.new_limit = Some(options.new);
-        normal.review_limit = Some(options.reviews);
-        let _changes = self.collection.add_or_update_deck(&mut deck)?;
+        let _ = DeckConfigService::update_deck_configs(&mut self.collection, request)?;
         Ok(())
     }
 
@@ -473,6 +538,39 @@ impl Backend {
         Ok(())
     }
 
+    pub fn card_status(&mut self, card_id: i64) -> Result<CardStatus> {
+        let card = CardsService::get_card(
+            &mut self.collection,
+            anki_proto::cards::CardId { cid: card_id },
+        )?;
+        let suspended = card.queue == anki::card::CardQueue::Suspended as i32;
+        let buried = card.queue == anki::card::CardQueue::SchedBuried as i32
+            || card.queue == anki::card::CardQueue::UserBuried as i32;
+        let note = NotesService::get_note(
+            &mut self.collection,
+            anki_proto::notes::NoteId { nid: card.note_id },
+        )?;
+        let leech = note
+            .tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("leech"));
+        Ok(CardStatus {
+            buried,
+            suspended,
+            leech,
+        })
+    }
+
+    pub fn restore_card(&mut self, card_id: i64) -> Result<()> {
+        let _ = SchedulerService::restore_buried_and_suspended_cards(
+            &mut self.collection,
+            anki_proto::cards::CardIds {
+                cids: vec![card_id],
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn close(self) -> Result<()> {
         self.collection.close(None)?;
         Ok(())
@@ -503,5 +601,22 @@ pub struct DeckOptions {
     pub deck_id: i64,
     pub new: u32,
     pub reviews: u32,
+    pub learn_steps: Vec<f32>,
+    pub relearn_steps: Vec<f32>,
+    pub insert_order: i32,
+    pub leech_threshold: u32,
+    pub leech_action: i32,
+    pub desired_retention: f32,
+    pub new_mix: i32,
+    pub bury_new: bool,
+    pub bury_reviews: bool,
+    pub fsrs: bool,
     pub snapshot: anki_proto::deck_config::DeckConfigsForUpdate,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct CardStatus {
+    pub buried: bool,
+    pub suspended: bool,
+    pub leech: bool,
 }

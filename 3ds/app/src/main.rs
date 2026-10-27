@@ -88,9 +88,11 @@ fn collect_deck_items(node: &DeckTreeNode, collapsed: &HashSet<i64>, items: &mut
 
 struct Browser {
     query: String,
+    filter: usize,
     ids: Vec<i64>,
     selected: usize,
     preview: (String, String),
+    status: backend::CardStatus,
     titles: Vec<String>,
     page: usize,
 }
@@ -98,23 +100,40 @@ impl Browser {
     fn load(backend: &mut Backend, query: String) -> backend::Result<Self> {
         let ids = backend.search(&query)?;
         let mut browser = Self {
+            filter: Self::filter_of(&query),
             query,
             ids,
             selected: 0,
             preview: Default::default(),
+            status: Default::default(),
             titles: Vec::new(),
             page: usize::MAX,
         };
         browser.refresh(backend)?;
         Ok(browser)
     }
+    fn filter_of(query: &str) -> usize {
+        if query == "is:buried" {
+            2
+        } else if query == "is:suspended" {
+            3
+        } else if query == "tag:leech" {
+            4
+        } else if query.starts_with("deck:") {
+            1
+        } else {
+            0
+        }
+    }
     fn refresh(&mut self, backend: &mut Backend) -> backend::Result<()> {
         if self.ids.is_empty() {
-            self.preview = ("Sin resultados".into(), String::new());
+            self.preview = (tr("No results").into(), String::new());
+            self.status = Default::default();
             return Ok(());
         }
         self.selected = self.selected.min(self.ids.len() - 1);
         self.preview = backend.preview(self.ids[self.selected])?;
+        self.status = backend.card_status(self.ids[self.selected])?;
         let page = self.selected / ROWS;
         if page != self.page {
             self.page = page;
@@ -124,6 +143,306 @@ impl Browser {
             }
         }
         Ok(())
+    }
+}
+
+const BROWSE_FILTERS: [&str; 5] = ["All", "Current deck", "Buried", "Suspended", "Leeches"];
+
+fn browse_filter_query(index: usize, deck_name: &str) -> String {
+    match index {
+        1 => format!("deck:\"{}\"", deck_name.replace('"', "")),
+        2 => "is:buried".into(),
+        3 => "is:suspended".into(),
+        4 => "tag:leech".into(),
+        _ => String::new(),
+    }
+}
+
+fn browse_status(status: &backend::CardStatus) -> String {
+    let mut parts = Vec::new();
+    if status.buried {
+        parts.push(tr("Buried"));
+    }
+    if status.suspended {
+        parts.push(tr("Suspended"));
+    }
+    if status.leech {
+        parts.push(tr("Leech"));
+    }
+    if parts.is_empty() {
+        tr("Active").to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn browse_chip_rects() -> [(f32, f32); 5] {
+    let labels = [
+        tr("All"),
+        tr("Current deck"),
+        tr("Buried"),
+        tr("Suspended"),
+        tr("Leeches"),
+    ];
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|label| Ui::get_text_width(0.38, label) + 12.0)
+        .collect();
+    let total: f32 = widths.iter().sum::<f32>() + 3.0 * (widths.len() as f32 - 1.0);
+    let mut x = ((320.0 - total) * 0.5).max(2.0);
+    let mut rects = [(0.0f32, 0.0f32); 5];
+    for (index, width) in widths.iter().enumerate() {
+        rects[index] = (x, *width);
+        x += width + 3.0;
+    }
+    rects
+}
+
+fn browse_chip(x: f32, y: f32, w: f32, h: f32, label: &str, active: bool) {
+    let background = if active {
+        current_theme().accent
+    } else {
+        current_theme().surface_alt
+    };
+    let foreground = if active {
+        current_theme().on_accent
+    } else {
+        current_theme().text
+    };
+    Ui::draw_rounded_rect(x, y, w, h, h * 0.5, background);
+    Ui::draw_text_centered(
+        x + w * 0.5,
+        y + 4.0,
+        0.38,
+        foreground,
+        &Ui::ellipsize(label, 0.38, w - 6.0),
+    );
+}
+
+fn browse_row(y: f32, title: &str, selected: bool) {
+    Ui::draw_rounded_rect(
+        6.0,
+        y,
+        296.0,
+        21.0,
+        7.0,
+        if selected {
+            current_theme().row_selected
+        } else {
+            current_theme().surface
+        },
+    );
+    Ui::draw_text(
+        14.0,
+        y + 3.0,
+        0.46,
+        current_theme().text,
+        &Ui::ellipsize(title, 0.46, 284.0),
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptField {
+    Section,
+    NewLimit,
+    ReviewLimit,
+    LearnSteps,
+    InsertOrder,
+    RelearnSteps,
+    LeechThreshold,
+    LeechAction,
+    Fsrs,
+    Retention,
+    NewMix,
+    BuryNew,
+    BuryReviews,
+}
+
+const OPTION_ROWS: usize = 17;
+
+fn format_steps(steps: &[f32]) -> String {
+    steps
+        .iter()
+        .map(|value| {
+            if *value >= 1440.0 && (value / 1440.0).fract() == 0.0 {
+                format!("{}d", (value / 1440.0) as i64)
+            } else if *value >= 60.0 && (value / 60.0).fract() == 0.0 {
+                format!("{}h", (value / 60.0) as i64)
+            } else if value.fract() == 0.0 {
+                format!("{}m", *value as i64)
+            } else {
+                format!("{value}m")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_steps(text: &str) -> Option<Vec<f32>> {
+    let mut steps = Vec::new();
+    for token in text.split_whitespace() {
+        let (number, multiplier) = if let Some(rest) = token.strip_suffix('d') {
+            (rest, 1440.0)
+        } else if let Some(rest) = token.strip_suffix('h') {
+            (rest, 60.0)
+        } else if let Some(rest) = token.strip_suffix('m') {
+            (rest, 1.0)
+        } else if let Some(rest) = token.strip_suffix('s') {
+            (rest, 1.0 / 60.0)
+        } else {
+            (token, 1.0)
+        };
+        let value: f32 = number.parse().ok()?;
+        if !(0.0..=100000.0).contains(&value) {
+            return None;
+        }
+        steps.push(value * multiplier);
+    }
+    if steps.is_empty() {
+        None
+    } else {
+        Some(steps)
+    }
+}
+
+fn on_off(value: bool) -> String {
+    tr(if value { "On" } else { "Off" }).to_owned()
+}
+
+fn insert_order_label(value: i32) -> String {
+    tr(if value == 1 {
+        "Random"
+    } else {
+        "Sequential (oldest first)"
+    })
+    .to_owned()
+}
+
+fn leech_action_label(value: i32) -> String {
+    tr(if value == 1 {
+        "Tag only"
+    } else {
+        "Suspend card"
+    })
+    .to_owned()
+}
+
+fn new_mix_label(value: i32) -> String {
+    tr(match value {
+        1 => "Show after reviews",
+        2 => "Show before reviews",
+        _ => "Mix with reviews",
+    })
+    .to_owned()
+}
+
+fn option_rows(options: &DeckOptions) -> Vec<(String, String, OptField)> {
+    vec![
+        (tr("Daily limits").into(), String::new(), OptField::Section),
+        (
+            tr("New cards/day").into(),
+            options.new.to_string(),
+            OptField::NewLimit,
+        ),
+        (
+            tr("Maximum reviews/day").into(),
+            options.reviews.to_string(),
+            OptField::ReviewLimit,
+        ),
+        (tr("New cards").into(), String::new(), OptField::Section),
+        (
+            tr("Learning steps").into(),
+            format_steps(&options.learn_steps),
+            OptField::LearnSteps,
+        ),
+        (
+            tr("Insertion order").into(),
+            insert_order_label(options.insert_order),
+            OptField::InsertOrder,
+        ),
+        (
+            tr("Lapses and leeches").into(),
+            String::new(),
+            OptField::Section,
+        ),
+        (
+            tr("Relearning steps").into(),
+            format_steps(&options.relearn_steps),
+            OptField::RelearnSteps,
+        ),
+        (
+            tr("Leech threshold").into(),
+            options.leech_threshold.to_string(),
+            OptField::LeechThreshold,
+        ),
+        (
+            tr("Leech action").into(),
+            leech_action_label(options.leech_action),
+            OptField::LeechAction,
+        ),
+        (tr("FSRS").into(), String::new(), OptField::Section),
+        (
+            tr("Enable FSRS").into(),
+            on_off(options.fsrs),
+            OptField::Fsrs,
+        ),
+        (
+            tr("Desired retention").into(),
+            format!("{}%", (options.desired_retention * 100.0).round() as i32),
+            OptField::Retention,
+        ),
+        (
+            tr("Display order and burying").into(),
+            String::new(),
+            OptField::Section,
+        ),
+        (
+            tr("New/review order").into(),
+            new_mix_label(options.new_mix),
+            OptField::NewMix,
+        ),
+        (
+            tr("Bury new siblings").into(),
+            on_off(options.bury_new),
+            OptField::BuryNew,
+        ),
+        (
+            tr("Bury review siblings").into(),
+            on_off(options.bury_reviews),
+            OptField::BuryReviews,
+        ),
+    ]
+}
+
+fn option_row(y: f32, label: &str, value: &str, section: bool, selected: bool) {
+    let background = if section {
+        current_theme().surface_alt
+    } else if selected {
+        current_theme().row_selected
+    } else {
+        current_theme().surface
+    };
+    Ui::draw_rounded_rect(6.0, y + 1.0, 296.0, 22.0, 8.0, background);
+    let color = if section {
+        current_theme().text_muted
+    } else {
+        current_theme().text
+    };
+    Ui::draw_text(
+        16.0,
+        y + 4.0,
+        0.48,
+        color,
+        &Ui::ellipsize(label, 0.48, 168.0),
+    );
+    if !value.is_empty() {
+        Ui::draw_text_right(
+            298.0,
+            y + 4.0,
+            0.46,
+            current_theme().text_muted,
+            &Ui::ellipsize(value, 0.46, 120.0),
+        );
     }
 }
 
@@ -207,6 +526,8 @@ enum Action {
     Language,
     Undo,
     Bury,
+    Filter(usize),
+    Restore,
     Exit,
 }
 
@@ -796,10 +1117,10 @@ fn main() {
                     }
                 }
                 Screen::Decks if y < 42.0 => match (x / 80.0) as usize {
-                    0 => Action::None,
-                    1 => Action::Add,
-                    2 => Action::Edit,
-                    _ => Action::Browse,
+                    0 => Action::Add,
+                    1 => Action::Edit,
+                    2 => Action::Browse,
+                    _ => Action::Options,
                 },
                 Screen::Decks if (ROW_Y..ROW_Y + ROW_H * ROWS as f32).contains(&y) && x < 304.0 => {
                     let index = scroll_pos + ((y - ROW_Y) / ROW_H) as usize;
@@ -856,18 +1177,26 @@ fn main() {
                         Action::None
                     }
                 }
-                Screen::Browser(_) | Screen::Editor { .. }
-                    if x >= 304.0 && (43.0..187.0).contains(&y) =>
-                {
+                Screen::Editor { .. } if x >= 304.0 && (43.0..187.0).contains(&y) => {
                     if y < 115.0 {
                         Action::Up
                     } else {
                         Action::Down
                     }
                 }
-                Screen::Browser(_) if y < 42.0 => Action::Search,
-                Screen::Browser(b) if (43.0..187.0).contains(&y) => {
-                    let index = b.page * ROWS + ((y - 43.0) / 24.0) as usize;
+                Screen::Browser(_) if y < 26.0 => Action::Search,
+                Screen::Browser(_) if (28.0..52.0).contains(&y) => {
+                    let mut hit = Action::None;
+                    for (index, (cx, cw)) in browse_chip_rects().iter().enumerate() {
+                        if x >= *cx && x < cx + cw {
+                            hit = Action::Filter(index);
+                            break;
+                        }
+                    }
+                    hit
+                }
+                Screen::Browser(b) if x < 304.0 && (54.0..186.0).contains(&y) => {
+                    let index = b.page * ROWS + ((y - 54.0) / 22.0) as usize;
                     if index < b.ids.len() {
                         b.selected = index;
                         Action::Primary
@@ -875,9 +1204,18 @@ fn main() {
                         Action::None
                     }
                 }
+                Screen::Browser(_) if x >= 304.0 && (54.0..186.0).contains(&y) => {
+                    if y < 120.0 {
+                        Action::Up
+                    } else {
+                        Action::Down
+                    }
+                }
                 Screen::Browser(_) if (194.0..222.0).contains(&y) => {
-                    if x < 160.0 {
+                    if x < 108.0 {
                         Action::Edit
+                    } else if x < 212.0 {
+                        Action::Restore
                     } else {
                         Action::Search
                     }
@@ -898,8 +1236,9 @@ fn main() {
                         Action::Back
                     }
                 }
-                Screen::Options { field, .. } if (43.0..91.0).contains(&y) => {
-                    *field = ((y - 43.0) / 24.0) as usize;
+                Screen::Options { field, .. } if (43.0..187.0).contains(&y) => {
+                    let start = *field / ROWS * ROWS;
+                    *field = (start + ((y - 43.0) / 24.0) as usize).min(OPTION_ROWS - 1);
                     Action::Field
                 }
                 Screen::Menu { selected, .. } => {
@@ -989,6 +1328,8 @@ fn main() {
                     "DOWN" => Action::Down,
                     "LEFT" => Action::Left,
                     "RIGHT" => Action::Right,
+                    "FILTER" => Action::Filter(value.parse().unwrap_or(0)),
+                    "RESTORE" => Action::Restore,
                     "COLLAPSE" => {
                         selected = value.parse().unwrap_or(0);
                         Action::Left
@@ -1394,8 +1735,12 @@ fn main() {
                     card_scroll = 0;
                 }
                 Action::Search => {
-                    if let Screen::Browser(b) = &screen {
-                        if let Some(query) = Ui::keyboard("Buscar tarjetas", &b.query)
+                    let initial = match &screen {
+                        Screen::Browser(b) => Some(b.query.clone()),
+                        _ => None,
+                    };
+                    if let Some(initial) = initial {
+                        if let Some(query) = Ui::keyboard(tr("Search"), &initial)
                             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
                         {
                             screen = Screen::Browser(Browser::load(
@@ -1406,13 +1751,35 @@ fn main() {
                         }
                     }
                 }
+                Action::Filter(index) => {
+                    let query = browse_filter_query(index, &deck_name);
+                    screen = Screen::Browser(Browser::load(
+                        backend.as_mut().ok_or("collection unavailable")?,
+                        query,
+                    )?);
+                    card_scroll = 0;
+                }
+                Action::Restore => {
+                    let target = match &screen {
+                        Screen::Browser(b) => {
+                            Some((b.ids.get(b.selected).copied(), b.query.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((Some(id), query)) = target {
+                        let b = backend.as_mut().ok_or("collection unavailable")?;
+                        b.restore_card(id)?;
+                        event(&format!("RESTORE card={id}"));
+                        screen = Screen::Browser(Browser::load(b, query)?);
+                    }
+                }
                 Action::Options => {
                     screen = Screen::Options {
                         options: backend
                             .as_mut()
                             .ok_or("collection unavailable")?
                             .options(did)?,
-                        field: 0,
+                        field: 1,
                     };
                     card_scroll = 0;
                 }
@@ -1578,24 +1945,88 @@ fn main() {
                             }
                         }
                         Screen::Options { options, field } => {
-                            let initial = if *field == 0 {
-                                options.new
-                            } else {
-                                options.reviews
-                            };
-                            if let Some(value) =
-                                Ui::keyboard(tr("Daily limit (0-9999)"), &initial.to_string())
-                                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
-                            {
-                                let value: u32 = value.parse()?;
-                                if value > 9999 {
-                                    return Err(tr("Maximum limit: 9999").into());
+                            let kind = option_rows(options)
+                                .get(*field)
+                                .map(|row| row.2)
+                                .unwrap_or(OptField::Section);
+                            match kind {
+                                OptField::Section => {}
+                                OptField::NewLimit
+                                | OptField::ReviewLimit
+                                | OptField::LeechThreshold
+                                | OptField::Retention => {
+                                    let (label, initial) = match kind {
+                                        OptField::NewLimit => {
+                                            (tr("New cards/day"), options.new.to_string())
+                                        }
+                                        OptField::ReviewLimit => {
+                                            (tr("Maximum reviews/day"), options.reviews.to_string())
+                                        }
+                                        OptField::LeechThreshold => (
+                                            tr("Leech threshold"),
+                                            options.leech_threshold.to_string(),
+                                        ),
+                                        _ => (
+                                            tr("Desired retention (%)"),
+                                            ((options.desired_retention * 100.0).round() as i32)
+                                                .to_string(),
+                                        ),
+                                    };
+                                    if let Some(value) = Ui::keyboard(label, &initial)
+                                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                                    {
+                                        let value: u32 = value.trim().parse()?;
+                                        match kind {
+                                            OptField::NewLimit => options.new = value.min(9999),
+                                            OptField::ReviewLimit => {
+                                                options.reviews = value.min(9999)
+                                            }
+                                            OptField::LeechThreshold => {
+                                                options.leech_threshold = value.min(99)
+                                            }
+                                            _ => {
+                                                options.desired_retention =
+                                                    (value.clamp(50, 99) as f32) / 100.0
+                                            }
+                                        }
+                                    }
                                 }
-                                if *field == 0 {
-                                    options.new = value
-                                } else {
-                                    options.reviews = value
-                                };
+                                OptField::LearnSteps | OptField::RelearnSteps => {
+                                    let (label, current) = if kind == OptField::LearnSteps {
+                                        (tr("Learning steps"), format_steps(&options.learn_steps))
+                                    } else {
+                                        (
+                                            tr("Relearning steps"),
+                                            format_steps(&options.relearn_steps),
+                                        )
+                                    };
+                                    if let Some(value) = Ui::keyboard(label, &current)
+                                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                                    {
+                                        let steps = parse_steps(&value).ok_or_else(
+                                            || -> Box<dyn std::error::Error> {
+                                                tr("Invalid steps, e.g. 10m").into()
+                                            },
+                                        )?;
+                                        if kind == OptField::LearnSteps {
+                                            options.learn_steps = steps
+                                        } else {
+                                            options.relearn_steps = steps
+                                        }
+                                    }
+                                }
+                                OptField::InsertOrder => {
+                                    options.insert_order = (options.insert_order + 1) % 2
+                                }
+                                OptField::LeechAction => {
+                                    options.leech_action = (options.leech_action + 1) % 2
+                                }
+                                OptField::NewMix => options.new_mix = (options.new_mix + 1) % 3,
+                                OptField::Fsrs => options.fsrs = !options.fsrs,
+                                OptField::BuryNew => options.bury_new = !options.bury_new,
+                                OptField::BuryReviews => {
+                                    options.bury_reviews = !options.bury_reviews
+                                }
                             }
                         }
                         _ => {}
@@ -1636,8 +2067,30 @@ fn main() {
                                 *field = next(*field, draft.labels.len() + 1);
                                 card_scroll = 0;
                             }
-                            Screen::Options { field, .. } => {
-                                *field = next(*field, 2);
+                            Screen::Options { options, field } => {
+                                let rows = option_rows(options);
+                                let length = rows.len() as i32;
+                                let step = if matches!(action, Action::Down) {
+                                    1
+                                } else {
+                                    -1
+                                };
+                                let mut index = *field as i32;
+                                loop {
+                                    index += step;
+                                    if index < 0 {
+                                        index = 0;
+                                        break;
+                                    }
+                                    if index >= length {
+                                        index = length - 1;
+                                        break;
+                                    }
+                                    if rows[index as usize].2 != OptField::Section {
+                                        break;
+                                    }
+                                }
+                                *field = index as usize;
                             }
                             Screen::Menu { selected, .. } => {
                                 let length = MAIN_MENU.len();
@@ -1905,9 +2358,10 @@ fn main() {
                 );
             }
             Screen::Browser(b) => {
-                Ui::draw_text_centered(200.0, 30.0, 0.60, current_theme().text, tr("Preview"));
-                let text = format!("{}\n\n{}", b.preview.0, b.preview.1);
-                top_max = top_layout.draw(&text, 360.0, 200.0, 62.0, 7, card_scroll);
+                Ui::draw_text_centered(200.0, 26.0, 0.55, current_theme().text, tr("Preview"));
+                let status = browse_status(&b.status);
+                let text = format!("{status}\n\n{}\n\n{}", b.preview.0, b.preview.1);
+                top_max = top_layout.draw(&text, 360.0, 200.0, 56.0, 7, card_scroll);
             }
             Screen::Editor { draft, field, .. } => {
                 let (label, value) = if *field < draft.labels.len() {
@@ -1918,19 +2372,21 @@ fn main() {
                 Ui::fit_text(200.0, 30.0, 0.60, 360.0, current_theme().text, label);
                 top_max = top_layout.draw(&value, 360.0, 200.0, 64.0, 7, card_scroll);
             }
-            Screen::Options { options, .. } => {
-                Ui::draw_text_centered(200.0, 35.0, 0.60, current_theme().text, tr("Deck options"));
-                top_max = top_layout.draw(tr("Daily limits for this deck.\nThe shared preset stays unchanged.\nSave applies changes. Cancel keeps previous limits."), 360.0, 200.0, 70.0, 7, 0);
-                Ui::draw_text_centered(
+            Screen::Options { options, field } => {
+                let rows = option_rows(options);
+                let label = rows.get(*field).map(|row| row.0.as_str()).unwrap_or("");
+                let value = rows.get(*field).map(|row| row.1.as_str()).unwrap_or("");
+                Ui::draw_text_centered(200.0, 40.0, 0.62, current_theme().text, label);
+                if !value.is_empty() {
+                    Ui::draw_text_centered(200.0, 80.0, 0.52, current_theme().text_muted, value);
+                }
+                top_max = top_layout.draw(
+                    tr("Changes apply to this deck's preset. Save [X] applies; Cancel [B] keeps the previous values."),
+                    360.0,
                     200.0,
-                    217.0,
-                    0.42,
-                    current_theme().text_muted,
-                    if options.snapshot.fsrs {
-                        tr("FSRS enabled")
-                    } else {
-                        tr("FSRS disabled")
-                    },
+                    118.0,
+                    6,
+                    0,
                 );
             }
             Screen::Menu { .. } => {
@@ -2049,11 +2505,14 @@ fn main() {
                 button(168.0, 194.0, 140.0, tr("Cancel [B]"), None, 6);
             }
             Screen::Decks => {
-                for (i, label) in [tr("Decks"), tr("Add"), tr("Edit"), tr("Browse")]
-                    .iter()
-                    .enumerate()
-                {
-                    Ui::draw_nav_tab(i as f32 * 80.0, 0.0, 80.0, 42.0, label, i as i32, i == 0);
+                let actions = [
+                    (tr("Add"), 1),
+                    (tr("Edit"), 2),
+                    (tr("Browse"), 3),
+                    (tr("Options"), 4),
+                ];
+                for (i, (label, icon)) in actions.iter().enumerate() {
+                    Ui::draw_nav_tab(i as f32 * 80.0, 0.0, 80.0, 42.0, label, *icon, false);
                 }
                 for (row_index, index) in (scroll_pos..decks.len()).take(ROWS).enumerate() {
                     let d = &decks[index];
@@ -2129,36 +2588,42 @@ fn main() {
                 }
             }
             Screen::Browser(b) => {
-                header(
-                    320.0,
-                    &format!(
-                        "{}: {}",
-                        tr("Search"),
-                        if b.query.is_empty() {
-                            tr("All")
-                        } else {
-                            &b.query
-                        }
-                    ),
+                let title = if b.query.is_empty() {
+                    tr("All").to_owned()
+                } else {
+                    b.query.clone()
+                };
+                Ui::draw_text(
+                    10.0,
+                    6.0,
+                    0.46,
+                    current_theme().text,
+                    &Ui::ellipsize(&format!("{}: {title}", tr("Search")), 0.46, 300.0),
                 );
+                for (i, (label, (cx, cw))) in
+                    BROWSE_FILTERS.iter().zip(browse_chip_rects()).enumerate()
+                {
+                    browse_chip(cx, 28.0, cw, 20.0, tr(*label), i == b.filter);
+                }
                 for (i, title) in b.titles.iter().enumerate() {
-                    row(
-                        43.0 + i as f32 * 24.0,
+                    browse_row(
+                        54.0 + i as f32 * 22.0,
                         title,
                         b.page * ROWS + i == b.selected,
                     );
                 }
                 Ui::draw_scrollbar(
                     304.0,
-                    43.0,
+                    54.0,
                     16.0,
-                    144.0,
+                    132.0,
                     b.ids.len(),
                     ROWS,
                     b.page.saturating_mul(ROWS),
                 );
-                button(12.0, 194.0, 140.0, tr("Edit note"), None, 0);
-                button(168.0, 194.0, 140.0, tr("Search"), None, 0);
+                button(8.0, 194.0, 98.0, tr("Edit note"), None, 0);
+                button(110.0, 194.0, 98.0, tr("Restore"), None, 0);
+                button(214.0, 194.0, 98.0, tr("Search"), None, 0);
             }
             Screen::Editor { draft, field, .. } => {
                 header(
@@ -2191,17 +2656,19 @@ fn main() {
                 button(168.0, 194.0, 140.0, tr("Cancel [B]"), None, 6);
             }
             Screen::Options { options, field } => {
-                header(320.0, tr("Daily limits"));
-                row(
-                    43.0,
-                    &format!("{}: {}", tr("New"), options.new),
-                    *field == 0,
-                );
-                row(
-                    67.0,
-                    &format!("{}: {}", tr("Review"), options.reviews),
-                    *field == 1,
-                );
+                header(320.0, tr("Deck options"));
+                let rows = option_rows(options);
+                let start = (*field / ROWS * ROWS).min(rows.len().saturating_sub(ROWS));
+                for (i, (label, value, kind)) in rows.iter().enumerate().skip(start).take(ROWS) {
+                    option_row(
+                        43.0 + (i - start) as f32 * 24.0,
+                        label,
+                        value,
+                        *kind == OptField::Section,
+                        i == *field,
+                    );
+                }
+                Ui::draw_scrollbar(304.0, 43.0, 16.0, 144.0, rows.len(), ROWS, start);
                 button(12.0, 194.0, 140.0, tr("Save [X]"), None, 0);
                 button(168.0, 194.0, 140.0, tr("Cancel [B]"), None, 6);
             }
