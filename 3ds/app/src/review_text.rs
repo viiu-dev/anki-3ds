@@ -67,6 +67,15 @@ pub fn mark_clozes(html: &str) -> Option<String> {
     found.then_some(output)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PitchStyle {
+    pub high: bool,
+    pub low: bool,
+    pub downstep: bool,
+    pub upstep: bool,
+    pub accent: Option<u8>,
+}
+
 /// Visual attributes for an inline run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Style {
@@ -78,6 +87,7 @@ pub struct Style {
     pub cloze: bool,
     pub color: Option<[u8; 3]>,
     pub highlight: Option<[u8; 3]>,
+    pub pitch: PitchStyle,
 }
 
 impl Style {
@@ -94,7 +104,23 @@ impl Style {
         if other.highlight.is_some() {
             self.highlight = other.highlight;
         }
+        self.pitch.high |= other.pitch.high;
+        self.pitch.low |= other.pitch.low;
+        self.pitch.downstep |= other.pitch.downstep;
+        self.pitch.upstep |= other.pitch.upstep;
+        if other.pitch.accent.is_some() {
+            self.pitch.accent = other.pitch.accent;
+        }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PitchMarker {
+    High,
+    Up,
+    Down,
+    Accent(u8),
+    Graph(Vec<(f32, f32)>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,12 +134,19 @@ pub enum Inline {
         reading: String,
         style: Style,
     },
+    PitchWord {
+        base: String,
+        accent: u8,
+        style: Style,
+    },
+    Marker(PitchMarker),
     Break,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Block {
     Paragraph(Vec<Inline>),
+    Section(Vec<Inline>),
     ListItem {
         marker: String,
         content: Vec<Inline>,
@@ -137,16 +170,26 @@ struct RubyState {
     style: Style,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BlockKind {
+    #[default]
+    Paragraph,
+    Section,
+    ListItem,
+}
+
 #[derive(Default)]
 struct Parser {
     blocks: Vec<Block>,
     current: Vec<Inline>,
     current_marker: Option<String>,
+    block_kind: BlockKind,
     styles: Vec<(String, Style)>,
     style: Style,
     cloze_depth: usize,
     lists: Vec<ListState>,
     ruby: Option<RubyState>,
+    svg: Option<String>,
     skip: Option<String>,
 }
 
@@ -229,6 +272,23 @@ impl Parser {
             .unwrap_or(inner.len());
         let name = inner[..name_end].to_ascii_lowercase();
         if name.is_empty() {
+            return;
+        }
+
+        if self.svg.is_some() {
+            if closing && name == "svg" {
+                let svg = self.svg.take().unwrap_or_default();
+                if let Some(points) = parse_svg_points(&svg) {
+                    self.current
+                        .push(Inline::Marker(PitchMarker::Graph(points)));
+                }
+            } else if let Some(svg) = self.svg.as_mut() {
+                svg.push_str(raw);
+            }
+            return;
+        }
+        if !closing && name == "svg" {
+            self.svg = Some(String::new());
             return;
         }
 
@@ -332,12 +392,22 @@ impl Parser {
                         "• ".to_owned()
                     };
                     self.current_marker = Some(marker);
+                    self.block_kind = BlockKind::ListItem;
                 }
             }
-            "p" | "div" | "section" | "article" | "header" | "footer" | "blockquote"
+            "p" => {
+                self.flush();
+                if !closing {
+                    self.block_kind = BlockKind::Paragraph;
+                }
+            }
+            "div" | "section" | "article" | "header" | "footer" | "main" | "nav" | "blockquote"
             | "address" | "aside" | "figure" | "figcaption" | "pre" | "table" | "tr" | "h1"
             | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.flush();
+                if !closing {
+                    self.block_kind = BlockKind::Section;
+                }
             }
             _ => {
                 let attributes = parse_attributes(inner, name_end);
@@ -370,6 +440,10 @@ impl Parser {
 
     fn handle_text(&mut self, text: &str) {
         if text.is_empty() || self.skip.is_some() {
+            return;
+        }
+        if let Some(svg) = self.svg.as_mut() {
+            svg.push_str(text);
             return;
         }
         let decoded = decode_entities(text);
@@ -454,14 +528,18 @@ impl Parser {
         });
         if self.current.is_empty() {
             self.current_marker = None;
+            self.block_kind = BlockKind::Paragraph;
             return;
         }
         let content = std::mem::take(&mut self.current);
         if let Some(marker) = self.current_marker.take() {
             self.blocks.push(Block::ListItem { marker, content });
+        } else if self.block_kind == BlockKind::Section {
+            self.blocks.push(Block::Section(content));
         } else {
             self.blocks.push(Block::Paragraph(content));
         }
+        self.block_kind = BlockKind::Paragraph;
     }
 
     fn finish(&mut self) {
@@ -513,6 +591,7 @@ fn apply_tag_style(tag: &str, attributes: &[(String, String)], style: &mut Style
     for (name, value) in attributes {
         match name.as_str() {
             "style" => apply_css(style, value),
+            "class" => apply_pitch_classes(style, value),
             "color" => {
                 if let Some(color) = parse_color(value) {
                     style.color = Some(color);
@@ -523,7 +602,54 @@ fn apply_tag_style(tag: &str, attributes: &[(String, String)], style: &mut Style
                     style.highlight = Some(color);
                 }
             }
+            "data-accent" | "data-pitch-accent" => {
+                if let Ok(accent) = value.trim().parse::<u8>() {
+                    if accent <= 20 {
+                        style.pitch.accent = Some(accent);
+                    }
+                }
+            }
+            "data-pitch" => apply_pitch_word(style, value),
             _ => {}
+        }
+    }
+}
+
+fn apply_pitch_classes(style: &mut Style, value: &str) {
+    for class in value.split_whitespace() {
+        apply_pitch_word(style, class);
+    }
+}
+
+fn apply_pitch_word(style: &mut Style, value: &str) {
+    let value = value.trim().to_ascii_lowercase();
+    let value = value.trim_start_matches("pitch-");
+    if matches!(value, "heiban") {
+        style.pitch.accent = Some(0);
+    } else if matches!(value, "atamadaka") {
+        style.pitch.accent = Some(1);
+    } else if matches!(value, "nakadaka" | "odaka") {
+        style.pitch.high = true;
+        style.pitch.downstep = true;
+    } else if matches!(value, "high" | "top" | "accent-high" | "accent-top") {
+        style.pitch.high = true;
+    } else if matches!(value, "low" | "bottom" | "accent-low") {
+        style.pitch.low = true;
+    } else if matches!(value, "downstep" | "down" | "drop" | "accent-drop" | "fall") {
+        style.pitch.downstep = true;
+    } else if matches!(
+        value,
+        "upstep" | "up" | "rise" | "accent-rise" | "accent-up"
+    ) {
+        style.pitch.upstep = true;
+    } else if let Some(number) = value
+        .strip_prefix("accent-")
+        .or_else(|| value.strip_prefix("accent_"))
+        .and_then(|number| number.parse::<u8>().ok())
+        .or_else(|| value.parse::<u8>().ok())
+    {
+        if number <= 20 {
+            style.pitch.accent = Some(number);
         }
     }
 }
@@ -564,8 +690,38 @@ fn apply_css(style: &mut Style, css: &str) {
                 }
             }
             "text-decoration" | "text-decoration-line" => {
-                if value.to_ascii_lowercase().contains("underline") {
+                let value = value.to_ascii_lowercase();
+                if value.contains("underline") {
                     style.underline = true;
+                }
+                if value.contains("overline") {
+                    style.pitch.high = true;
+                }
+            }
+            "border-top"
+            | "border-top-width"
+            | "border-top-style"
+            | "border-block-start"
+            | "border-block-start-width"
+            | "border-block-start-style" => {
+                if !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "none" | "hidden" | "0" | "0px"
+                ) {
+                    style.pitch.high = true;
+                }
+            }
+            "border-right"
+            | "border-right-width"
+            | "border-right-style"
+            | "border-inline-end"
+            | "border-inline-end-width"
+            | "border-inline-end-style" => {
+                if !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "none" | "hidden" | "0" | "0px"
+                ) {
+                    style.pitch.downstep = true;
                 }
             }
             _ => {}
@@ -683,6 +839,21 @@ fn push_text_with_furigana(output: &mut Vec<Inline>, text: &str, style: Style) {
         };
         let reading = after[..close].trim();
         let before = &rest[..open];
+        if let Some(accent) = reading.parse::<u8>().ok().filter(|accent| *accent <= 20) {
+            if let Some(start) = furigana_base_start(before) {
+                let base = before[start..].trim_end();
+                if !base.is_empty() {
+                    push_text(output, &before[..start], style.clone());
+                    output.push(Inline::PitchWord {
+                        base: base.to_owned(),
+                        accent,
+                        style: style.clone(),
+                    });
+                    rest = &after[close + 1..];
+                    continue;
+                }
+            }
+        }
         let valid = !reading.is_empty()
             && !reading.starts_with("sound:")
             && !reading.starts_with("anki:")
@@ -716,6 +887,22 @@ fn push_text(output: &mut Vec<Inline>, text: &str, style: Style) {
     if text.is_empty() {
         return;
     }
+    let mut rest = text;
+    while let Some((index, ch, marker)) = rest
+        .char_indices()
+        .find_map(|(index, ch)| pitch_symbol(ch).map(|marker| (index, ch, marker)))
+    {
+        push_text_plain(output, &rest[..index], style.clone());
+        output.push(Inline::Marker(marker));
+        rest = &rest[index + ch.len_utf8()..];
+    }
+    push_text_plain(output, rest, style);
+}
+
+fn push_text_plain(output: &mut Vec<Inline>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
     if let Some(Inline::Text {
         text: previous,
         style: previous_style,
@@ -730,6 +917,16 @@ fn push_text(output: &mut Vec<Inline>, text: &str, style: Style) {
         text: text.to_owned(),
         style,
     });
+}
+
+fn pitch_symbol(ch: char) -> Option<PitchMarker> {
+    Some(match ch {
+        '↗' | '↑' | '⤴' | '／' => PitchMarker::Up,
+        '↘' | '↓' | '⤵' | '＼' => PitchMarker::Down,
+        '‾' | '¯' | '\u{0304}' => PitchMarker::High,
+        '①'..='⑳' => PitchMarker::Accent((ch as u32 - 0x2460 + 1) as u8),
+        _ => return None,
+    })
 }
 
 fn furigana_base_start(text: &str) -> Option<usize> {
@@ -876,6 +1073,111 @@ fn named_entity(entity: &str) -> Option<char> {
     })
 }
 
+fn parse_svg_points(svg: &str) -> Option<Vec<(f32, f32)>> {
+    let data = attribute_value(svg, "points").or_else(|| attribute_value(svg, "d"))?;
+    let values = svg_numbers(data);
+    if values.len() < 4 {
+        return None;
+    }
+    let mut points: Vec<(f32, f32)> = values
+        .chunks_exact(2)
+        .take(64)
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
+    let min_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let width = (max_x - min_x).max(1.0);
+    let height = (max_y - min_y).max(1.0);
+    for point in &mut points {
+        point.0 = (point.0 - min_x) / width;
+        point.1 = 1.0 - (point.1 - min_y) / height;
+    }
+    Some(points)
+}
+
+fn attribute_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    for (index, _) in text.match_indices(name) {
+        let before = text[..index].chars().next_back();
+        if before.is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_')) {
+            continue;
+        }
+        let after = text[index + name.len()..].trim_start();
+        let Some(after) = after.strip_prefix('=') else {
+            continue;
+        };
+        let after = after.trim_start();
+        let quote = after.chars().next().filter(|ch| *ch == '"' || *ch == '\'');
+        if let Some(quote) = quote {
+            let quoted = &after[quote.len_utf8()..];
+            let end = quoted.find(quote)?;
+            return Some(&quoted[..end]);
+        }
+        let end = after
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .unwrap_or(after.len());
+        return Some(&after[..end]);
+    }
+    None
+}
+
+fn svg_numbers(data: &str) -> Vec<f32> {
+    let bytes = data.as_bytes();
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        while index < bytes.len() && !matches!(bytes[index], b'0'..=b'9' | b'+' | b'-' | b'.') {
+            index += 1;
+        }
+        let start = index;
+        if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
+            index += 1;
+        }
+        let mut digits = false;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            digits = true;
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                digits = true;
+                index += 1;
+            }
+        }
+        if digits && index < bytes.len() && matches!(bytes[index], b'e' | b'E') {
+            index += 1;
+            if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
+                index += 1;
+            }
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+        if digits {
+            if let Ok(value) = data[start..index].parse::<f32>() {
+                values.push(value);
+            }
+        } else {
+            index = index.max(start + 1);
+        }
+    }
+    values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,7 +1296,72 @@ mod tests {
             blocks[4],
             Block::ListItem { ref marker, .. } if marker == "1. "
         ));
-        assert!(matches!(blocks[5], Block::Paragraph(_)));
+        assert!(matches!(blocks[5], Block::Section(_)));
+    }
+
+    #[test]
+    fn pitch_accents_and_symbols_are_parsed() {
+        let blocks = parse_html(
+            "<span class=\"pitch-high\">高</span><span style=\"border-right: 1px solid\">低</span> <span class=\"atamadaka\">箸</span> 箸[1] ①",
+        );
+        let Block::Paragraph(content) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(content.iter().any(|inline| matches!(
+            inline,
+            Inline::Text { text, style, .. } if text == "高" && style.pitch.high
+        )));
+        assert!(content.iter().any(|inline| matches!(
+            inline,
+            Inline::Text { text, style, .. } if text == "低" && style.pitch.downstep
+        )));
+        assert!(content.iter().any(|inline| matches!(
+            inline,
+            Inline::Text { text, style, .. } if text == "箸" && style.pitch.accent == Some(1)
+        )));
+        assert!(content.iter().any(|inline| matches!(
+            inline,
+            Inline::PitchWord { base, accent, .. } if base == "箸" && *accent == 1
+        )));
+        assert!(content
+            .iter()
+            .any(|inline| matches!(inline, Inline::Marker(PitchMarker::Accent(1)))));
+
+        let blocks = parse_html("箸[1]");
+        let Block::Paragraph(content) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(content
+            .iter()
+            .any(|inline| matches!(inline, Inline::PitchWord { base, accent, .. } if base == "箸" && *accent == 1)));
+        assert!(!content
+            .iter()
+            .any(|inline| matches!(inline, Inline::Marker(_))));
+    }
+
+    #[test]
+    fn inline_svg_pitch_graph_is_parsed() {
+        let blocks = parse_html(
+            "<svg viewBox=\"0 0 100 20\"><polyline points=\"0,15 20,15 20,5 80,5 80,15\"/></svg>",
+        );
+        let Block::Paragraph(content) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(content.iter().any(|inline| match inline {
+            Inline::Marker(PitchMarker::Graph(points)) => {
+                points.len() == 5 && points[0].1 < 0.001 && (points[2].1 - 1.0).abs() < 0.001
+            }
+            _ => false,
+        }));
+
+        let blocks = parse_html("<svg><path id=\"curve\" d=\"M0 10 L10 10 L10 5\"/></svg>");
+        let Block::Paragraph(content) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(content.iter().any(|inline| matches!(
+            inline,
+            Inline::Marker(PitchMarker::Graph(points)) if points.len() == 3
+        )));
     }
 
     #[test]

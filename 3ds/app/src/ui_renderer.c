@@ -22,21 +22,28 @@ static bool s_initialized = false;
 static void ensure_card_font(void) {
     if (s_card_font_checked) return;
     s_card_font_checked = true;
-    // JPN/USA/EUR/AUS share the standard font, which includes kana and kanji.
-    // C2D_FontLoadSystem returns NULL for the console's own region because the
-    // default font is already the right one; on CHN/KOR/TWN consoles it loads
-    // that shared standard font instead of the regional one. It checks the
-    // region through CFGU, so the service must be active while loading.
-    Result initialized = cfguInit();
-    s_card_font = C2D_FontLoadSystem(CFG_REGION_JPN);
-    if (R_SUCCEEDED(initialized)) {
-        cfguExit();
+    s_card_font = C2D_FontLoad("sdmc:/3ds/anki-3ds/cjk.bcfnt");
+    if (!s_card_font) {
+        // JPN/USA/EUR/AUS share the standard font, which includes kana and kanji.
+        // C2D_FontLoadSystem returns NULL for the console's own region because the
+        // default font is already the right one; on CHN/KOR/TWN consoles it loads
+        // that shared standard font instead of the regional one. It checks the
+        // region through CFGU, so the service must be active while loading.
+        Result initialized = cfguInit();
+        s_card_font = C2D_FontLoadSystem(CFG_REGION_JPN);
+        if (R_SUCCEEDED(initialized)) {
+            cfguExit();
+        }
+    }
+    if (s_card_font) {
+        C2D_FontSetFilter(s_card_font, GPU_LINEAR, GPU_LINEAR);
     }
 }
 
 bool ui_init(void) {
     if (s_initialized) return true;
 
+    osSetSpeedupEnable(true);
     if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
         return false;
     }
@@ -189,12 +196,12 @@ void ui_draw_text_right(float x_right, float y, float scale, uint32_t color, con
 }
 
 static void draw_clock_battery(float x_right, float y, float scale) {
-    extern time_t __real_time(time_t *);
-    time_t raw_time = __real_time(NULL);
-    struct tm* ti = gmtime(&raw_time);
+    static const int64_t epoch_1900_to_1970 = 2208988800LL;
+    time_t raw_time = (time_t)((int64_t)(osGetTime() / 1000) - epoch_1900_to_1970);
+    struct tm ti;
     char time_str[16];
-    if (ti) {
-        snprintf(time_str, sizeof(time_str), "%02d:%02d", ti->tm_hour, ti->tm_min);
+    if (gmtime_r(&raw_time, &ti)) {
+        snprintf(time_str, sizeof(time_str), "%02d:%02d", ti.tm_hour, ti.tm_min);
     } else {
         snprintf(time_str, sizeof(time_str), "--:--");
     }

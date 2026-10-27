@@ -634,10 +634,10 @@ fn main() {
             } else if held.contains(KeyPad::CPAD_UP) {
                 delta -= 5.5 * factor;
             }
-            if held.intersects(KeyPad::L | KeyPad::ZL) {
+            if held.contains(KeyPad::ZL) {
                 delta -= 9.0 * factor;
             }
-            if held.intersects(KeyPad::R | KeyPad::ZR) {
+            if held.contains(KeyPad::ZR) {
                 delta += 9.0 * factor;
             }
             if delta != 0.0 {
@@ -685,10 +685,7 @@ fn main() {
             Action::Rate(0)
         } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::X) {
             Action::Rate(1)
-        } else if matches!(screen, Screen::Answer { .. })
-            && down.contains(KeyPad::R)
-            && review_max_scroll <= 0.0
-        {
+        } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::R) {
             Action::Rate(3)
         } else if down.contains(KeyPad::A) {
             Action::Primary
@@ -1185,7 +1182,7 @@ fn main() {
                 }
                 Action::Help | Action::Stats => {
                     let (title, text) = match action {
-                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy when the card fits.\nScroll the top screen with Circle Pad, D-pad, C-stick or L/R.\nSELECT opens Menu. B returns. START closes and exits.\nMenu > Font scale changes card text size.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
+                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy.\nScroll the top screen with Circle Pad, D-pad, C-stick or ZL/ZR.\nSELECT opens Menu. B returns. START closes and exits.\nMenu > Font scale changes card text size.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
                         Action::Stats => (tr("Statistics"), backend.as_mut().ok_or("collection unavailable")?.statistics()?),
                         _ => unreachable!(),
                     };
@@ -1482,14 +1479,6 @@ fn main() {
                                 scroll_pos = scroll_pos.min(decks.len().saturating_sub(ROWS));
                             }
                         }
-                    } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
-                        let step = 19.0 * 5.0 * i18n::font_scale_factor();
-                        let delta = if matches!(action, Action::Right) {
-                            step
-                        } else {
-                            -step
-                        };
-                        review_scroll = (review_scroll + delta).clamp(0.0, review_max_scroll);
                     } else if matches!(
                         screen,
                         Screen::Info { .. } | Screen::Browser(_) | Screen::Editor { .. }
@@ -1869,16 +1858,7 @@ fn main() {
                     .enumerate()
                 {
                     let interval = card.intervals.get(i).map(String::as_str).unwrap_or("?");
-                    let key = if i == 3 && review_max_scroll > 0.0 {
-                        ""
-                    } else {
-                        ["Y", "X", "A", "R"][i]
-                    };
-                    let hint = if key.is_empty() {
-                        interval.to_owned()
-                    } else {
-                        format!("{interval} [{key}]")
-                    };
+                    let hint = format!("{interval} [{}]", ["Y", "X", "A", "R"][i]);
                     let hint = Ui::ellipsize(&hint, 0.42, 68.0);
                     button(
                         8.0 + i as f32 * 76.0,

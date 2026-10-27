@@ -3,6 +3,7 @@
 
 #include <time.h>
 #include <stdint.h>
+#include <3ds.h>
 
 /* Horizon's RTC is local civil time and carries no time zone. */
 static int64_t utc_offset_seconds;
@@ -14,7 +15,9 @@ int __wrap_clock_gettime(clockid_t id, struct timespec *value) {
     return result;
 }
 time_t __real_time(time_t *value);
-int64_t anki_local_time(void) { return (int64_t)__real_time(NULL); }
+int64_t anki_local_time(void) {
+    return (int64_t)(osGetTime() / 1000) - 2208988800LL;
+}
 time_t __wrap_time(time_t *value) {
     time_t result = __real_time(NULL);
     if (result != (time_t)-1) result -= utc_offset_seconds;

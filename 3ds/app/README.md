@@ -31,15 +31,16 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
 - Decks: D-pad selects; A studies; Left/Right expands or collapses.
 - Review: the top screen shows the card front, then the card back after A.
   The bottom screen shows the deck, counters, a large Show Answer button, and
-  rating buttons with their intervals. Y Again, X Hard, A Good, R Easy; when the
-  card is scrollable, R scrolls instead, and Easy remains available by touch.
+  rating buttons with their intervals. Y Again, X Hard, A Good, R Easy.
   Touch ratings also work. Revealed cloze answers appear highlighted in their
-  context on the top screen. Scroll with the Circle Pad, D-pad, C-stick, L/R or
-  ZL/ZR; a subtle scrollbar appears at the right edge when the card is taller
+  context on the top screen. Scroll with the Circle Pad, D-pad, C-stick, ZL or
+  ZR; a subtle scrollbar appears at the right edge when the card is taller
   than the screen.
-- Font scale: Menu → Font scale offers 85%, 100%, 125% and 150%. A advances the
-  setting and Left/Right adjusts it. It scales card text, furigana and line
-  spacing, and is saved in `settings.json`.
+- Font scale: Menu → Font scale offers 85%, 100%, 125%, 150%, 175%, 200% and
+  250%. A advances the setting and Left/Right adjusts it. It scales card text,
+  furigana and line spacing, and is saved in `settings.json`. A high-resolution
+  `cjk.bcfnt` placed at `sdmc:/3ds/anki-3ds/cjk.bcfnt` is used automatically;
+  otherwise the console's shared CJK font is used.
 - Add/Edit: select a field for the Nintendo keyboard; X saves, B cancels.
 - Browse: upstream search syntax; X opens search.
 - Menu → Log in: enter your AnkiWeb email and masked password once. Login checks

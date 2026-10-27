@@ -17,7 +17,7 @@ static ES: OnceLock<HashMap<String, String>> = OnceLock::new();
 const PATH: &str = "sdmc:/3ds/anki-3ds/language.txt";
 
 const SETTINGS_PATH: &str = "sdmc:/3ds/anki-3ds/settings.json";
-pub const FONT_SCALES: [u16; 4] = [85, 100, 125, 150];
+pub const FONT_SCALES: [u16; 7] = [85, 100, 125, 150, 175, 200, 250];
 const DEFAULT_FONT_SCALE: u16 = 100;
 static FONT_SCALE: AtomicU16 = AtomicU16::new(DEFAULT_FONT_SCALE);
 
