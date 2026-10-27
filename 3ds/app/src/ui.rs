@@ -34,7 +34,7 @@ const CARD_RULE_HEIGHT: f32 = 12.0;
 // slightly taller ink than the system bitmap font, especially below the
 // baseline for kana such as く.
 const CARD_CJK_SCALE: f32 = 1.10;
-const CARD_HEADWORD_SCALE: f32 = 1.20;
+const CARD_HEADWORD_SCALE: f32 = 1.30;
 const CARD_HEADWORD_MAX_CHARS: usize = 28;
 const CARD_PITCH_HEIGHT: f32 = 6.0;
 const CARD_PITCH_GAP: f32 = 4.0;
@@ -48,17 +48,12 @@ pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24)
 }
 
-pub const COLOR_BG_TOP: u32 = rgba(246, 246, 242, 255);
-pub const COLOR_BG_BOTTOM: u32 = rgba(236, 238, 240, 255);
-pub const COLOR_PANEL_WHITE: u32 = rgba(254, 254, 252, 255);
-pub const COLOR_PANEL_BORDER: u32 = rgba(214, 214, 208, 255);
-pub const COLOR_TEXT_DARK: u32 = rgba(30, 30, 30, 255);
-pub const COLOR_TEXT_MUTED: u32 = rgba(100, 105, 115, 255);
-pub const COLOR_COUNT_DUE: u32 = rgba(36, 130, 56, 255);
-pub const COLOR_COUNT_NEW: u32 = rgba(20, 100, 200, 255);
-pub const COLOR_COUNT_LEARN: u32 = rgba(210, 60, 40, 255);
-pub const COLOR_CLOZE_BG: u32 = rgba(255, 243, 166, 255);
-pub const COLOR_PITCH: u32 = rgba(37, 99, 235, 255);
+pub use super::theme::Theme;
+
+#[inline]
+fn theme() -> &'static Theme {
+    super::theme::current()
+}
 
 extern "C" {
     fn ui_keyboard(
@@ -71,6 +66,7 @@ extern "C" {
         accept: *const c_char,
     ) -> c_int;
     fn ui_init(font_data: *const c_void, font_size: usize) -> bool;
+    fn ui_set_theme(theme: *const Theme);
     fn ui_wifi_connected() -> bool;
     fn ui_fini();
     fn ui_frame_begin();
@@ -79,6 +75,7 @@ extern "C" {
     fn ui_target_bottom(bg_color: u32);
 
     fn ui_draw_rect(x: f32, y: f32, w: f32, h: f32, color: u32);
+    fn ui_draw_rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, color: u32);
     fn ui_draw_line(x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: u32);
 
     fn ui_draw_text(x: f32, y: f32, scale: f32, color: u32, str: *const c_char);
@@ -242,6 +239,10 @@ impl Ui {
         unsafe { ui_fini() }
     }
 
+    pub fn apply_theme() {
+        unsafe { ui_set_theme(theme() as *const Theme) }
+    }
+
     pub fn frame_begin() {
         unsafe { ui_frame_begin() }
     }
@@ -260,6 +261,10 @@ impl Ui {
 
     pub fn draw_rect(x: f32, y: f32, w: f32, h: f32, color: u32) {
         unsafe { ui_draw_rect(x, y, w, h, color) }
+    }
+
+    pub fn draw_rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, color: u32) {
+        unsafe { ui_draw_rounded_rect(x, y, w, h, radius, color) }
     }
 
     pub fn draw_line(x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: u32) {
@@ -663,7 +668,7 @@ impl RichTextLayout {
                     content_left + self.width,
                     y,
                     1.0,
-                    COLOR_PANEL_BORDER,
+                    theme().border,
                 );
                 continue;
             }
@@ -675,7 +680,7 @@ impl RichTextLayout {
                     line_left,
                     text_top,
                     scale,
-                    COLOR_TEXT_MUTED,
+                    theme().text_muted,
                     marker,
                     false,
                     false,
@@ -699,15 +704,17 @@ impl RichTextLayout {
                 let color = if let Some(rgb) = piece.style.color {
                     rgba(rgb[0], rgb[1], rgb[2], 255)
                 } else if piece.style.cloze {
-                    COLOR_COUNT_NEW
+                    theme().new
+                } else if piece.style.bold {
+                    theme().accent
                 } else {
-                    COLOR_TEXT_DARK
+                    theme().text
                 };
                 let highlight = piece
                     .style
                     .highlight
                     .map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255))
-                    .or_else(|| piece.style.cloze.then_some(COLOR_CLOZE_BG));
+                    .or_else(|| piece.style.cloze.then_some(theme().cloze_bg));
                 if let Some(highlight) = highlight {
                     let height = 15.0
                         * self.font_scale
@@ -756,7 +763,7 @@ impl RichTextLayout {
                             base_x + piece.base_width,
                             bar_y,
                             1.5,
-                            COLOR_PITCH,
+                            theme().pitch,
                         );
                     }
                     if piece.style.pitch.downstep {
@@ -766,7 +773,7 @@ impl RichTextLayout {
                             base_x + piece.base_width,
                             y + 2.0 * self.font_scale,
                             1.5,
-                            COLOR_PITCH,
+                            theme().pitch,
                         );
                     }
                     if piece.style.pitch.upstep {
@@ -776,7 +783,7 @@ impl RichTextLayout {
                             base_x,
                             bar_y,
                             1.5,
-                            COLOR_PITCH,
+                            theme().pitch,
                         );
                     }
                 }
@@ -850,30 +857,30 @@ impl RichTextLayout {
         let bar_y = pitch_top - CARD_PITCH_GAP * factor;
         match marker {
             PitchMarker::High => {
-                Ui::draw_line(x, bar_y, x + width, bar_y, 1.5, COLOR_PITCH);
+                Ui::draw_line(x, bar_y, x + width, bar_y, 1.5, theme().pitch);
             }
             PitchMarker::Up => {
                 let mid = x + width / 2.0;
-                Ui::draw_line(x, bar_y + 4.0 * factor, mid, bar_y, 1.4, COLOR_PITCH);
+                Ui::draw_line(x, bar_y + 4.0 * factor, mid, bar_y, 1.4, theme().pitch);
                 Ui::draw_line(
                     mid,
                     bar_y,
                     x + width,
                     bar_y + 4.0 * factor,
                     1.4,
-                    COLOR_PITCH,
+                    theme().pitch,
                 );
             }
             PitchMarker::Down => {
                 let mid = x + width / 2.0;
-                Ui::draw_line(x, bar_y, mid, bar_y + 4.0 * factor, 1.4, COLOR_PITCH);
+                Ui::draw_line(x, bar_y, mid, bar_y + 4.0 * factor, 1.4, theme().pitch);
                 Ui::draw_line(
                     mid,
                     bar_y + 4.0 * factor,
                     x + width,
                     bar_y,
                     1.4,
-                    COLOR_PITCH,
+                    theme().pitch,
                 );
             }
             PitchMarker::Accent(number) => {
@@ -884,7 +891,7 @@ impl RichTextLayout {
                     x + (width - text_width) / 2.0,
                     text_top + 1.0,
                     text_scale,
-                    COLOR_PITCH,
+                    theme().pitch,
                     &text,
                     false,
                     false,
@@ -897,7 +904,7 @@ impl RichTextLayout {
                     let px = x + point.0 * width;
                     let py = pitch_top - height + point.1 * height;
                     if let Some((last_x, last_y)) = previous {
-                        Ui::draw_line(last_x, last_y, px, py, 1.4, COLOR_PITCH);
+                        Ui::draw_line(last_x, last_y, px, py, 1.4, theme().pitch);
                     }
                     previous = Some((px, py));
                 }

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::i18n::tr;
+use super::theme::current as current_theme;
 use super::ui::*;
 
 static KNOWN: AtomicBool = AtomicBool::new(false);
@@ -229,19 +230,19 @@ pub fn configure(
             job.cancel.store(true, Ordering::Release);
         }
         Ui::frame_begin();
-        Ui::target_top(COLOR_BG_TOP);
+        Ui::target_top(current_theme().bg_top);
         Ui::draw_text_centered(
             200.0,
             45.0,
             0.6,
-            COLOR_TEXT_DARK,
+            current_theme().text,
             tr("Setting clock automatically"),
         );
         Ui::draw_text_centered(
             200.0,
             90.0,
             0.45,
-            COLOR_TEXT_MUTED,
+            current_theme().text_muted,
             tr("Connect to Wi-Fi once. No account needed."),
         );
         let phase = (started.elapsed().as_millis() / 120 % 8) as usize;
@@ -252,14 +253,14 @@ pub fn configure(
                 8.0,
                 8.0,
                 if i == phase {
-                    COLOR_COUNT_NEW
+                    current_theme().new
                 } else {
-                    COLOR_PANEL_BORDER
+                    current_theme().border
                 },
             );
         }
-        Ui::target_bottom(COLOR_BG_BOTTOM);
-        Ui::draw_text_centered(160.0, 100.0, 0.5, COLOR_TEXT_DARK, tr("Cancel [B]"));
+        Ui::target_bottom(current_theme().bg_bottom);
+        Ui::draw_text_centered(160.0, 100.0, 0.5, current_theme().text, tr("Cancel [B]"));
         Ui::frame_end();
     };
     result

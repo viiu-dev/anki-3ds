@@ -36,22 +36,27 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
   context on the top screen. Scroll with the Circle Pad, D-pad, C-stick, ZL or
   ZR; a subtle scrollbar appears at the right edge when the card is taller
   than the screen.
-- Font scale: Menu → Font scale offers 85%, 100%, 125%, 150%, 175%, 200% and
-  250%. A advances the setting and Left/Right adjusts it. It scales card text,
-  furigana and line spacing, and is saved in `settings.json`. Card text is drawn
-  with the bundled Noto Sans JP font (SIL Open Font License), rasterized on
-  demand, so no `cjk.bcfnt` needs to be copied to the SD card.
+- Font scale: Settings → Font scale offers 85%, 100%, 125%, 150%, 175%, 200%
+  and 250%. A advances the setting and Left/Right adjusts it. It scales card
+  text, furigana and line spacing, and is saved in `settings.json`. Card text is
+  drawn with the bundled Noto Sans JP font (SIL Open Font License), rasterized
+  on demand, so no `cjk.bcfnt` needs to be copied to the SD card.
+- Theme: Settings → Theme cycles Light, Cream, Dark and Black (AMOLED). A
+  advances the setting and Left/Right adjusts it. The choice is saved in
+  `settings.json` and applies to both screens.
 - Add/Edit: select a field for the Nintendo keyboard; X saves, B cancels.
 - Browse: upstream search syntax; X opens search.
-- Menu → Log in: enter your AnkiWeb email and masked password once. Login checks
-  authentication without uploading or downloading a collection. The saved login
-  works after restarting. Menu → Log out removes it from this SD card.
+- Settings → Log in: enter your AnkiWeb email and masked password once. Login
+  checks authentication without uploading or downloading a collection. The saved
+  login works after restarting. Settings → Log out removes it from this SD card.
 - Sync reuses the saved login, or asks for credentials when needed. B cancels;
-  START cancels and exits after cleanup. Full sync requires a direction when both collections contain data, then asks
-  twice before replacement.
-- SELECT opens Menu, including language, font scale and automatic clock updates.
+  START cancels and exits after cleanup. Full sync requires a direction when both
+  collections contain data, then asks twice before replacement.
+- SELECT opens a two-column Menu of the common review actions (Undo,
+  Bury/Suspend, Edit/Add note, Browse, Sync, Statistics, deck options). Settings
+  holds the preferences, account and help, so the whole menu fits one page.
 
-English/Spanish follow the console language. Menu overrides are stored in
+English/Spanish follow the console language. Language overrides are stored in
 `language.txt`; remove it to follow the system again. The card font scale is
 stored in `settings.json`. No timezone or numeric clock
 setup is required. The app opens offline immediately. Until the first verified

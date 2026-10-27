@@ -17,6 +17,7 @@ use anki_proto::decks::DeckId;
 use anki_proto::decks::DeckTreeNode;
 use anki_proto::decks::DeckTreeRequest;
 use anki_proto::scheduler::queued_cards::QueuedCard;
+use anki_proto::scheduler::BuryOrSuspendCardsRequest;
 use anki_proto::scheduler::CardAnswer;
 use anki_proto::scheduler::GetQueuedCardsRequest;
 use regex::Regex;
@@ -451,6 +452,24 @@ impl Backend {
 
     pub fn undo(&mut self) -> Result<()> {
         self.collection.undo()?;
+        Ok(())
+    }
+
+    pub fn bury_or_suspend(&mut self, card_id: i64, mode: i32) -> Result<()> {
+        use anki_proto::scheduler::bury_or_suspend_cards_request::Mode as BuryMode;
+        let mode = match mode {
+            0 => BuryMode::Suspend,
+            1 => BuryMode::BurySched,
+            _ => BuryMode::BuryUser,
+        };
+        let _ = SchedulerService::bury_or_suspend_cards(
+            &mut self.collection,
+            BuryOrSuspendCardsRequest {
+                card_ids: vec![card_id],
+                note_ids: Vec::new(),
+                mode: mode as i32,
+            },
+        )?;
         Ok(())
     }
 

@@ -39,6 +39,45 @@ typedef struct {
     float advance;
 } CardGlyph;
 
+static UiTheme g_theme = {
+    C2D_RGBA(247, 247, 245, 255), C2D_RGBA(238, 241, 243, 255),
+    C2D_RGBA(255, 255, 255, 255), C2D_RGBA(243, 244, 246, 255),
+    C2D_RGBA(226, 229, 233, 255), C2D_RGBA(226, 227, 224, 255),
+    C2D_RGBA(30, 32, 36, 255), C2D_RGBA(107, 114, 128, 255),
+    C2D_RGBA(156, 163, 175, 255), C2D_RGBA(37, 99, 235, 255),
+    C2D_RGBA(255, 255, 255, 255), C2D_RGBA(20, 100, 200, 255),
+    C2D_RGBA(210, 60, 40, 255), C2D_RGBA(36, 130, 56, 255),
+    C2D_RGBA(255, 243, 166, 255), C2D_RGBA(30, 32, 36, 255),
+    C2D_RGBA(226, 238, 250, 255), C2D_RGBA(219, 234, 254, 255),
+    C2D_RGBA(37, 99, 235, 255), C2D_RGBA(243, 244, 246, 255),
+    C2D_RGBA(107, 114, 128, 255), C2D_RGBA(120, 126, 134, 36),
+    C2D_RGBA(120, 126, 134, 130), C2D_RGBA(252, 232, 230, 255),
+    C2D_RGBA(197, 40, 41, 255), C2D_RGBA(254, 243, 224, 255),
+    C2D_RGBA(176, 110, 0, 255), C2D_RGBA(230, 244, 234, 255),
+    C2D_RGBA(30, 142, 62, 255), C2D_RGBA(232, 240, 254, 255),
+    C2D_RGBA(26, 115, 232, 255), C2D_RGBA(0, 0, 0, 26),
+};
+
+void ui_set_theme(const UiTheme* theme) {
+    if (theme) g_theme = *theme;
+}
+
+static uint32_t mix_color(uint32_t a, uint32_t b, float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    int ar = a & 0xFF, ag = (a >> 8) & 0xFF, ab = (a >> 16) & 0xFF, aa = (a >> 24) & 0xFF;
+    int br = b & 0xFF, bg = (b >> 8) & 0xFF, bb = (b >> 16) & 0xFF, ba = (b >> 24) & 0xFF;
+    int r = (int)(ar + (br - ar) * t);
+    int g = (int)(ag + (bg - ag) * t);
+    int bl = (int)(ab + (bb - ab) * t);
+    int al = (int)(aa + (ba - aa) * t);
+    return C2D_RGBA(r, g, bl, al);
+}
+
+static uint32_t darken(uint32_t color, float t) {
+    return mix_color(color, C2D_RGBA(0, 0, 0, 255), t);
+}
+
 static C3D_RenderTarget* s_top_target = NULL;
 static C3D_RenderTarget* s_bottom_target = NULL;
 static C2D_TextBuf s_text_buf = NULL;
@@ -339,6 +378,7 @@ void ui_fini(void) {
 
 void ui_frame_begin(void) {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    commit_card_atlas();
     if (s_text_buf) {
         C2D_TextBufClear(s_text_buf);
     }
@@ -364,6 +404,24 @@ void ui_draw_rect(float x, float y, float w, float h, uint32_t color) {
     C2D_DrawRectSolid(x, y, 0.5f, w, h, color);
 }
 
+void ui_draw_rounded_rect(float x, float y, float w, float h, float radius, uint32_t color) {
+    if (w <= 0.0f || h <= 0.0f) return;
+    if (radius > w * 0.5f) radius = w * 0.5f;
+    if (radius > h * 0.5f) radius = h * 0.5f;
+    if (radius < 0.0f) radius = 0.0f;
+    if (radius <= 0.5f) {
+        ui_draw_rect(x, y, w, h, color);
+        return;
+    }
+    ui_draw_rect(x + radius, y, w - radius * 2.0f, h, color);
+    ui_draw_rect(x, y + radius, radius, h - radius * 2.0f, color);
+    ui_draw_rect(x + w - radius, y + radius, radius, h - radius * 2.0f, color);
+    ui_draw_circle(x + radius, y + radius, radius, color);
+    ui_draw_circle(x + w - radius, y + radius, radius, color);
+    ui_draw_circle(x + radius, y + h - radius, radius, color);
+    ui_draw_circle(x + w - radius, y + h - radius, radius, color);
+}
+
 void ui_draw_rect_gradient(float x, float y, float w, float h, uint32_t c_top, uint32_t c_bot) {
     C2D_DrawRectangle(x, y, 0.5f, w, h, c_top, c_top, c_bot, c_bot);
 }
@@ -380,8 +438,16 @@ void ui_draw_triangle(float x0, float y0, float x1, float y1, float x2, float y2
     C2D_DrawTriangle(x0, y0, color, x1, y1, color, x2, y2, color, 0.5f);
 }
 
+static bool draw_glyph_run(float x, float y, float scale, uint32_t color,
+                           const char* str, bool bold, bool italic);
+
 void ui_draw_text(float x, float y, float scale, uint32_t color, const char* str) {
-    if (!str || !str[0] || !s_text_buf) return;
+    if (!str || !str[0]) return;
+    if (s_font_loaded && s_card_atlas_ready &&
+        draw_glyph_run(x, y, scale, color, str, false, false)) {
+        return;
+    }
+    if (!s_text_buf) return;
     C2D_Text text;
     C2D_TextParse(&text, s_text_buf, str);
     C2D_TextOptimize(&text);
@@ -389,7 +455,11 @@ void ui_draw_text(float x, float y, float scale, uint32_t color, const char* str
 }
 
 float ui_get_text_width(float scale, const char* str) {
-    if (!str || !str[0] || !s_measure_buf) return 0.0f;
+    if (!str || !str[0]) return 0.0f;
+    if (s_font_loaded) {
+        return ui_get_card_text_width(scale, str);
+    }
+    if (!s_measure_buf) return 0.0f;
     C2D_TextBufClear(s_measure_buf);
     C2D_Text text;
     C2D_TextParse(&text, s_measure_buf, str);
@@ -429,29 +499,16 @@ static void draw_card_glyph(const CardGlyph* glyph, float x, float y, uint32_t c
     C2D_DrawImageAt(image, x + glyph->offset_x, y + glyph->offset_y, 0.6f, &tint, 1.0f, 1.0f);
 }
 
-void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic) {
-    if (!str || !str[0]) return;
-    if (!s_font_loaded || !s_card_atlas_ready) {
-        draw_system_card_text(x, y, scale, color, str, bold, italic);
-        return;
-    }
-
+static bool draw_glyph_run(float x, float y, float scale, uint32_t color,
+                           const char* str, bool bold, bool italic) {
     int px = card_font_px(scale);
-    bool glyphs_ready = true;
     const unsigned char* cursor = (const unsigned char*)str;
     while (*cursor) {
         uint32_t cp = utf8_next(&cursor);
         if (!ensure_glyph(cp, px)) {
-            glyphs_ready = false;
-            break;
+            return false;
         }
     }
-    if (!glyphs_ready) {
-        draw_system_card_text(x, y, scale, color, str, bold, italic);
-        return;
-    }
-    commit_card_atlas();
-
     float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
     float baseline = y + CARD_FONT_BASELINE * (float)px;
     float pen_x = x;
@@ -477,6 +534,17 @@ void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char
         }
         previous_glyph = glyph_index;
     }
+    return true;
+}
+
+void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic) {
+    if (!str || !str[0]) return;
+    if (!s_font_loaded || !s_card_atlas_ready ||
+        !draw_glyph_run(x, y, scale, color, str, bold, italic)) {
+        draw_system_card_text(x, y, scale, color, str, bold, italic);
+        return;
+    }
+    commit_card_atlas();
 }
 
 float ui_get_card_text_width(float scale, const char* str) {
@@ -546,18 +614,18 @@ static void draw_clock_battery(float x_right, float y, float scale) {
     float batt_h = 8.0f;
     float batt_x = x_right - batt_w;
     float batt_y = y + 1.0f;
-    ui_draw_rect(batt_x, batt_y, batt_w, batt_h, C2D_RGBA(120, 120, 120, 255));
-    ui_draw_rect(batt_x + 1, batt_y + 1, batt_w - 2, batt_h - 2, C2D_RGBA(250, 250, 250, 255));
-    ui_draw_rect(batt_x + batt_w, batt_y + 2, 2, 4, C2D_RGBA(120, 120, 120, 255));
+    ui_draw_rounded_rect(batt_x, batt_y, batt_w, batt_h, 2.0f, g_theme.text_muted);
+    ui_draw_rounded_rect(batt_x + 1, batt_y + 1, batt_w - 2, batt_h - 2, 1.5f, g_theme.bg_bottom);
+    ui_draw_rect(batt_x + batt_w, batt_y + 2, 2, 4, g_theme.text_muted);
 
     int bars = (int)batt;
     if (bars > 4) bars = 4;
-    uint32_t fill_clr = (bars <= 1) ? C2D_RGBA(220, 50, 40, 255) : C2D_RGBA(60, 160, 60, 255);
+    uint32_t fill_clr = (bars <= 1) ? g_theme.learn : g_theme.review;
     for (int b = 0; b < bars; b++) {
         ui_draw_rect(batt_x + 2 + b * 3.0f, batt_y + 2, 2.2f, batt_h - 4, fill_clr);
     }
 
-    ui_draw_text_right(batt_x - 5.0f, y, scale, C2D_RGBA(70, 75, 82, 255), time_str);
+    ui_draw_text_right(batt_x - 5.0f, y, scale, g_theme.text_muted, time_str);
 }
 
 void ui_draw_status_compact(float x_right, float y, float scale) {
@@ -573,8 +641,9 @@ void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, 
     if (thumb_h < 22.0f) thumb_h = 22.0f;
     if (thumb_h > h) thumb_h = h;
     float thumb_y = y + (h - thumb_h) * ratio;
-    ui_draw_rect(x, y, w, h, C2D_RGBA(80, 85, 90, 16));
-    ui_draw_rect(x, thumb_y, w, thumb_h, C2D_RGBA(95, 100, 108, 110));
+    float radius = w * 0.5f;
+    ui_draw_rounded_rect(x, y, w, h, radius, g_theme.scroll_track);
+    ui_draw_rounded_rect(x, thumb_y, w, thumb_h, radius, g_theme.scroll_thumb);
 }
 
 void ui_draw_beveled_panel(float x, float y, float w, float h, float radius, uint32_t bg_color, uint32_t border_color) {
@@ -687,24 +756,17 @@ void ui_draw_icon_gear(float x, float y, float size) {
 }
 
 void ui_draw_nav_tab(float x, float y, float w, float h, const char* label, int icon_type, bool active) {
+    ui_draw_rect(x, y, w, h, g_theme.surface_alt);
     if (active) {
-        ui_draw_rect_gradient(x, y, w, h, C2D_RGBA(222, 237, 251, 255), C2D_RGBA(208, 227, 245, 255));
-        ui_draw_line(x, y, x + w, y, 1.0f, C2D_RGBA(244, 249, 255, 255)); // top highlight
-        ui_draw_line(x, y + h, x + w, y + h, 1.0f, C2D_RGBA(135, 170, 205, 255)); // bottom border
-        ui_draw_line(x + w, y, x + w, y + h, 1.0f, C2D_RGBA(155, 185, 215, 255));
-    } else {
-        ui_draw_rect_gradient(x, y, w, h, C2D_RGBA(246, 246, 244, 255), C2D_RGBA(228, 228, 224, 255));
-        ui_draw_line(x, y, x + w, y, 1.0f, C2D_RGBA(255, 255, 255, 255));
-        ui_draw_line(x, y + h, x + w, y + h, 1.0f, C2D_RGBA(190, 190, 186, 255));
-        ui_draw_line(x + w, y, x + w, y + h, 1.0f, C2D_RGBA(200, 200, 196, 255));
+        ui_draw_rounded_rect(x + 8.0f, y + 3.0f, w - 16.0f, h - 6.0f, 14.0f, g_theme.tab_active_bg);
     }
 
     float icon_cx = x + (w / 2.0f);
-    float icon_cy = y + 12.0f;
+    float icon_cy = y + 13.0f;
     float ix = icon_cx - 10.0f;
     float iy = icon_cy - 10.0f;
     float scale = 20.0f / 24.0f;
-    uint32_t color = active ? C2D_RGBA(37, 99, 235, 255) : C2D_RGBA(91, 108, 130, 255);
+    uint32_t color = active ? g_theme.tab_active_fg : g_theme.tab_inactive_fg;
     if (icon_type == 0) {
         icon_card(ix, iy, scale, color);
     } else if (icon_type == 1) {
@@ -722,45 +784,37 @@ void ui_draw_nav_tab(float x, float y, float w, float h, const char* label, int 
         icon_line(ix, iy, scale, 14.5f, 14.5f, 21, 21, color);
     }
 
-    uint32_t text_clr = active ? C2D_RGBA(20, 20, 20, 255) : C2D_RGBA(60, 60, 60, 255);
-    ui_draw_text_centered(icon_cx, y + 25.0f, 0.45f, text_clr, label);
+    ui_draw_text_centered(icon_cx, y + 26.0f, 0.42f, color, label);
 }
 
 void ui_draw_deck_row(float y, float w, const char* name, int level, bool has_children, bool expanded,
                      uint32_t due_count, uint32_t new_count, uint32_t learn_count, bool selected) {
     float h = 24.0f;
+    ui_draw_rounded_rect(5.0f, y + 1.0f, w - 10.0f, h - 2.0f, 8.0f,
+                         selected ? g_theme.row_selected : g_theme.surface);
 
-    if (selected) {
-        ui_draw_rect(0, y, w, h, C2D_RGBA(220, 236, 248, 255));
-    } else {
-        ui_draw_rect(0, y, w, h, C2D_RGBA(250, 250, 248, 255));
-    }
-
-    ui_draw_line(0, y + h, w, y + h, 1.0f, C2D_RGBA(224, 224, 220, 255));
-
-    float indent = 8.0f + (float)level * 16.0f;
+    float indent = 12.0f + (float)level * 14.0f;
 
     if (has_children) {
-        float btn_x = indent;
-        float btn_y = y + 6.0f;
-        ui_draw_rect(btn_x, btn_y, 11, 11, C2D_RGBA(180, 180, 180, 255));
-        ui_draw_rect(btn_x + 1, btn_y + 1, 9, 9, C2D_RGBA(255, 255, 255, 255));
-        ui_draw_rect(btn_x + 3, btn_y + 5, 5, 1, C2D_RGBA(40, 40, 40, 255));
-        if (!expanded) {
-            ui_draw_rect(btn_x + 5, btn_y + 3, 1, 5, C2D_RGBA(40, 40, 40, 255));
+        float cx = indent + 4.0f;
+        float cy = y + h * 0.5f;
+        uint32_t arrow = selected ? g_theme.tab_active_fg : g_theme.text_muted;
+        if (expanded) {
+            ui_draw_triangle(cx - 5.0f, cy - 2.5f, cx + 5.0f, cy - 2.5f, cx, cy + 3.5f, arrow);
+        } else {
+            ui_draw_triangle(cx - 2.5f, cy - 5.0f, cx - 2.5f, cy + 5.0f, cx + 3.5f, cy, arrow);
         }
         indent += 15.0f;
     }
 
-    // Deck Name (with safe truncation if name is long)
-    float max_name_w = (w - 126.0f) - indent;
+    float max_name_w = (w - 132.0f) - indent;
     char disp_name[1024];
     size_t bytes = strlen(name);
     if (bytes > sizeof(disp_name) - 4) bytes = sizeof(disp_name) - 4;
     while (bytes && ((unsigned char)name[bytes] & 0xc0) == 0x80) bytes--;
     memcpy(disp_name, name, bytes);
     disp_name[bytes] = '\0';
-    if (ui_get_text_width(0.52f, disp_name) > max_name_w) {
+    if (ui_get_text_width(0.50f, disp_name) > max_name_w) {
         size_t ends[1024], n = 0;
         for (size_t i = 0; i < bytes; i++) {
             if (((unsigned char)name[i] & 0xc0) != 0x80) ends[n++] = i;
@@ -771,124 +825,94 @@ void ui_draw_deck_row(float y, float w, const char* name, int level, bool has_ch
             size_t cut = mid < n ? ends[mid] : bytes;
             memcpy(disp_name, name, cut);
             strcpy(disp_name + cut, "...");
-            if (ui_get_text_width(0.52f, disp_name) <= max_name_w) low = mid;
+            if (ui_get_text_width(0.50f, disp_name) <= max_name_w) low = mid;
             else high = mid - 1;
         }
         size_t cut = low < n ? ends[low] : bytes;
         memcpy(disp_name, name, cut); strcpy(disp_name + cut, "...");
     }
 
-    uint32_t name_clr = selected ? C2D_RGBA(0, 40, 90, 255) : C2D_RGBA(20, 20, 20, 255);
-    ui_draw_text(indent, y + 4.0f, 0.52f, name_clr, disp_name);
-
-    // Fixed-column alignment for counts and chevron
-    // Chevron '>'
-    ui_draw_text_right(w - 8.0f, y + 4.0f, 0.50f, C2D_RGBA(150, 150, 150, 255), ">");
+    ui_draw_text(indent, y + 4.0f, 0.50f, g_theme.text, disp_name);
 
     char count_buf[16];
+    uint32_t off = g_theme.text_faint;
+
     snprintf(count_buf, sizeof(count_buf), "%u", (unsigned int)new_count);
-    uint32_t new_clr = (new_count > 0) ? C2D_RGBA(20, 100, 200, 255) : C2D_RGBA(140, 140, 140, 255);
-    ui_draw_text_right(w - 24.0f, y + 4.0f, 0.42f, new_clr, count_buf);
+    ui_draw_text_right(w - 118.0f, y + 5.0f, 0.40f, new_count > 0 ? g_theme.new_color : off, count_buf);
 
     snprintf(count_buf, sizeof(count_buf), "%u", (unsigned int)learn_count);
-    ui_draw_text_right(w - 100.0f, y + 4.0f, 0.42f, C2D_RGBA(190, 55, 45, 255), count_buf);
+    ui_draw_text_right(w - 72.0f, y + 5.0f, 0.40f, learn_count > 0 ? g_theme.learn : off, count_buf);
 
     snprintf(count_buf, sizeof(count_buf), "%u", (unsigned int)due_count);
-    uint32_t due_clr = (due_count > 0) ? C2D_RGBA(36, 130, 56, 255) : C2D_RGBA(140, 140, 140, 255);
-    ui_draw_text_right(w - 62.0f, y + 4.0f, 0.42f, due_clr, count_buf);
+    ui_draw_text_right(w - 22.0f, y + 5.0f, 0.40f, due_count > 0 ? g_theme.review : off, count_buf);
 }
 
 void ui_draw_scrollbar(float x, float y, float w, float h, int total_items, int visible_items, int scroll_pos) {
-    ui_draw_rect(x, y, w, h, C2D_RGBA(236, 236, 236, 255));
-    ui_draw_line(x, y, x, y + h, 1.0f, C2D_RGBA(210, 210, 210, 255));
+    if (total_items <= visible_items || total_items <= 0 || h <= 0.0f) return;
+    float track_w = 4.0f;
+    float tx = x + (w - track_w) * 0.5f;
+    float radius = track_w * 0.5f;
+    ui_draw_rounded_rect(tx, y, track_w, h, radius, g_theme.scroll_track);
 
-    ui_draw_rect(x, y, w, 12, C2D_RGBA(224, 224, 224, 255));
-    ui_draw_triangle(x + 2, y + 9, x + w - 2, y + 9, x + w / 2.0f, y + 3, C2D_RGBA(80, 80, 80, 255));
-
-    ui_draw_rect(x, y + h - 12, w, 12, C2D_RGBA(224, 224, 224, 255));
-    ui_draw_triangle(x + 2, y + h - 9, x + w - 2, y + h - 9, x + w / 2.0f, y + h - 3, C2D_RGBA(80, 80, 80, 255));
-
-    float track_h = h - 24.0f;
-    if (total_items <= visible_items || total_items <= 0) {
-        ui_draw_rect(x + 1, y + 12, w - 2, track_h, C2D_RGBA(180, 184, 192, 255));
-    } else {
-        float thumb_h = track_h * ((float)visible_items / (float)total_items);
-        if (thumb_h < 12.0f) thumb_h = 12.0f;
-        float max_scroll = (float)(total_items - visible_items);
-        float scroll_ratio = (float)scroll_pos / max_scroll;
-        if (scroll_ratio > 1.0f) scroll_ratio = 1.0f;
-        float thumb_y = y + 12.0f + (track_h - thumb_h) * scroll_ratio;
-
-        ui_draw_rect_gradient(x + 1, thumb_y, w - 2, thumb_h, C2D_RGBA(196, 200, 208, 255), C2D_RGBA(160, 166, 176, 255));
-        ui_draw_line(x + 1, thumb_y, x + w - 1, thumb_y, 1.0f, C2D_RGBA(255, 255, 255, 200));
-        ui_draw_line(x + 1, thumb_y + thumb_h, x + w - 1, thumb_y + thumb_h, 1.0f, C2D_RGBA(120, 126, 134, 255));
-    }
+    float thumb_h = h * ((float)visible_items / (float)total_items);
+    if (thumb_h < 24.0f) thumb_h = 24.0f;
+    if (thumb_h > h) thumb_h = h;
+    float max_scroll = (float)(total_items - visible_items);
+    float scroll_ratio = (float)scroll_pos / max_scroll;
+    if (scroll_ratio < 0.0f) scroll_ratio = 0.0f;
+    if (scroll_ratio > 1.0f) scroll_ratio = 1.0f;
+    float thumb_y = y + (h - thumb_h) * scroll_ratio;
+    ui_draw_rounded_rect(tx, thumb_y, track_w, thumb_h, radius, g_theme.scroll_thumb);
 }
 
 void ui_draw_button(float x, float y, float w, float h, const char* text, const char* subtext, int style, bool pressed) {
-    uint32_t top_clr, bot_clr, border_clr, shadow_clr;
-
+    uint32_t bg, fg;
+    bool rating = (style >= 2 && style <= 5);
     switch (style) {
-        case 0: // Blue ("Añadir/Exportar" or "Estudiar")
-            top_clr = pressed ? C2D_RGBA(30, 96, 180, 255) : C2D_RGBA(62, 146, 232, 255);
-            bot_clr = pressed ? C2D_RGBA(20, 70, 140, 255) : C2D_RGBA(32, 110, 196, 255);
-            border_clr = C2D_RGBA(18, 68, 136, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 35);
+        case 0:
+            bg = g_theme.accent;
+            fg = g_theme.on_accent;
             break;
-        case 1: // Amber/Orange ("Sincronizar")
-            top_clr = pressed ? C2D_RGBA(200, 110, 14, 255) : C2D_RGBA(238, 140, 26, 255);
-            bot_clr = pressed ? C2D_RGBA(160, 80, 8, 255) : C2D_RGBA(200, 106, 8, 255);
-            border_clr = C2D_RGBA(140, 70, 6, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 35);
+        case 1:
+            bg = g_theme.hard_bg;
+            fg = g_theme.hard_fg;
             break;
-        case 2: // Red Rating ("Otra vez")
-            top_clr = pressed ? C2D_RGBA(170, 40, 36, 255) : C2D_RGBA(216, 72, 66, 255);
-            bot_clr = pressed ? C2D_RGBA(140, 28, 24, 255) : C2D_RGBA(182, 44, 38, 255);
-            border_clr = C2D_RGBA(120, 24, 20, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 45);
+        case 2:
+            bg = g_theme.again_bg;
+            fg = g_theme.again_fg;
             break;
-        case 3: // Orange Rating ("Difícil")
-            top_clr = pressed ? C2D_RGBA(196, 110, 16, 255) : C2D_RGBA(238, 144, 32, 255);
-            bot_clr = pressed ? C2D_RGBA(160, 80, 8, 255) : C2D_RGBA(198, 108, 8, 255);
-            border_clr = C2D_RGBA(140, 70, 6, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 45);
+        case 3:
+            bg = g_theme.hard_bg;
+            fg = g_theme.hard_fg;
             break;
-        case 4: // Green Rating ("Bien")
-            top_clr = pressed ? C2D_RGBA(40, 140, 52, 255) : C2D_RGBA(56, 176, 72, 255);
-            bot_clr = pressed ? C2D_RGBA(28, 110, 38, 255) : C2D_RGBA(36, 136, 48, 255);
-            border_clr = C2D_RGBA(24, 96, 32, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 45);
+        case 4:
+            bg = g_theme.good_bg;
+            fg = g_theme.good_fg;
             break;
-        case 5: // Blue Rating ("Fácil")
-            top_clr = pressed ? C2D_RGBA(28, 106, 196, 255) : C2D_RGBA(38, 136, 232, 255);
-            bot_clr = pressed ? C2D_RGBA(18, 80, 156, 255) : C2D_RGBA(22, 100, 192, 255);
-            border_clr = C2D_RGBA(16, 70, 140, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 45);
+        case 5:
+            bg = g_theme.easy_bg;
+            fg = g_theme.easy_fg;
             break;
-        default: // Neutral
-            top_clr = pressed ? C2D_RGBA(210, 210, 206, 255) : C2D_RGBA(244, 244, 240, 255);
-            bot_clr = pressed ? C2D_RGBA(190, 190, 186, 255) : C2D_RGBA(224, 224, 220, 255);
-            border_clr = C2D_RGBA(170, 170, 166, 255);
-            shadow_clr = C2D_RGBA(0, 0, 0, 25);
+        default:
+            bg = g_theme.surface_alt;
+            fg = g_theme.text;
             break;
     }
+    if (pressed) bg = darken(bg, style == 0 ? 0.18f : 0.10f);
 
-    ui_draw_rect(x + 1, y + 2, w, h, shadow_clr);
+    float radius = h * 0.5f;
+    if (radius > 16.0f) radius = 16.0f;
+    ui_draw_rounded_rect(x, y + 1.5f, w, h, radius, g_theme.shadow);
+    ui_draw_rounded_rect(x, y, w, h, radius, bg);
 
-    ui_draw_rect_gradient(x, y, w, h, top_clr, bot_clr);
-
-    ui_draw_line(x + 1, y + 1, x + w - 1, y + 1, 1.0f, C2D_RGBA(255, 255, 255, 120)); // top inner highlight
-    ui_draw_line(x, y, x + w, y, 1.0f, border_clr);
-    ui_draw_line(x, y + h, x + w, y + h, 1.0f, border_clr);
-    ui_draw_line(x, y, x, y + h, 1.0f, border_clr);
-    ui_draw_line(x + w, y, x + w, y + h, 1.0f, border_clr);
-
-    uint32_t text_clr = (style >= 0 && style <= 5) ? C2D_RGBA(255, 255, 255, 255) : C2D_RGBA(40, 40, 40, 255);
     if (subtext && subtext[0]) {
-        ui_draw_text_centered(x + (w / 2.0f), y + 4.0f, 0.48f, text_clr, text);
-        ui_draw_text_centered(x + (w / 2.0f), y + 19.0f, 0.42f, text_clr, subtext);
+        const char* top_line = rating ? subtext : text;
+        const char* bottom_line = rating ? text : subtext;
+        uint32_t top_clr = rating ? mix_color(fg, bg, 0.35f) : fg;
+        ui_draw_text_centered(x + (w / 2.0f), y + 5.0f, 0.40f, top_clr, top_line);
+        ui_draw_text_centered(x + (w / 2.0f), y + 19.0f, 0.46f, fg, bottom_line);
     } else {
-        ui_draw_text_centered(x + (w / 2.0f), y + (h / 2.0f) - 6.0f, 0.50f, text_clr, text);
+        ui_draw_text_centered(x + (w / 2.0f), y + (h / 2.0f) - 6.0f, 0.50f, fg, text);
     }
 }
 

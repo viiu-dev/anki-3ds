@@ -8,6 +8,7 @@ mod clock;
 mod i18n;
 mod review_text;
 mod sync;
+mod theme;
 mod time_correction;
 mod ui;
 use std::collections::HashSet;
@@ -23,6 +24,8 @@ use backend::NoteDraft;
 use backend::OfferedCard;
 use ctru::prelude::*;
 use i18n::tr;
+use theme::current as current_theme;
+use theme::ThemeKind;
 use ui::*;
 
 const LOG: &str = "sdmc:/3ds/anki-3ds/prototype-events.txt";
@@ -158,6 +161,15 @@ enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    Settings {
+        selected: usize,
+        previous: Box<Screen>,
+    },
+    CardChoice {
+        card_id: i64,
+        selected: usize,
+        previous: Box<Screen>,
+    },
     Info {
         title: String,
         text: String,
@@ -184,14 +196,17 @@ enum Action {
     Save,
     Options,
     Menu,
+    Settings,
     Help,
     Stats,
     Sync,
+    FullSync,
     Login,
     Logout,
     Clock,
     Language,
     Undo,
+    Bury,
     Exit,
 }
 
@@ -283,9 +298,9 @@ impl TextLayout {
                 if matches!(ch, review_text::CLOZE_START | review_text::CLOZE_END | '\0') {
                     if index >= start {
                         let color = if emphasis > 0 {
-                            COLOR_COUNT_NEW
+                            current_theme().new
                         } else {
-                            COLOR_TEXT_DARK
+                            current_theme().text
                         };
                         Ui::draw_text(x, y + (index - start) as f32 * 19.0, 0.55, color, &run);
                     }
@@ -306,7 +321,7 @@ impl TextLayout {
                 center + width / 2.0,
                 y + count as f32 * 19.0,
                 0.40,
-                COLOR_TEXT_MUTED,
+                current_theme().text_muted,
                 &format!("{} / {}  UP/DOWN", start + 1, max + 1),
             );
         }
@@ -314,39 +329,39 @@ impl TextLayout {
     }
 }
 fn header(width: f32, title: &str) {
-    Ui::draw_rect(0.0, 0.0, width, 42.0, rgba(239, 244, 249, 255));
-    Ui::draw_line(0.0, 42.0, width, 42.0, 1.0, COLOR_PANEL_BORDER);
+    Ui::draw_rect(0.0, 0.0, width, 42.0, current_theme().surface_alt);
+    Ui::draw_line(0.0, 42.0, width, 42.0, 1.0, current_theme().border);
     Ui::fit_text(
         width / 2.0,
         12.0,
         0.60,
         width - 24.0,
-        COLOR_TEXT_DARK,
+        current_theme().text,
         title,
     );
 }
 fn footer(text: &str) {
-    Ui::draw_rect(0.0, 224.0, BOTTOM_WIDTH, 16.0, rgba(231, 237, 243, 255));
-    Ui::fit_text(160.0, 226.0, 0.40, 304.0, COLOR_TEXT_MUTED, text);
+    Ui::draw_rect(0.0, 224.0, BOTTOM_WIDTH, 16.0, current_theme().surface_alt);
+    Ui::fit_text(160.0, 226.0, 0.40, 304.0, current_theme().text_muted, text);
 }
 fn counts(new: u32, learn: u32, review: u32, y: f32) {
     for (x, label, value, color) in [
-        (75.0, tr("New"), new, COLOR_COUNT_NEW),
-        (200.0, tr("Learning"), learn, COLOR_COUNT_LEARN),
-        (325.0, tr("Review"), review, COLOR_COUNT_DUE),
+        (75.0, tr("New"), new, current_theme().new),
+        (200.0, tr("Learning"), learn, current_theme().learn),
+        (325.0, tr("Review"), review, current_theme().review),
     ] {
         Ui::draw_text_centered(x, y, 0.48, color, &value.to_string());
-        Ui::draw_text_centered(x, y + 17.0, 0.43, COLOR_TEXT_MUTED, label);
+        Ui::draw_text_centered(x, y + 17.0, 0.43, current_theme().text_muted, label);
     }
 }
 fn counts_compact(new: u32, learn: u32, review: u32, y: f32) {
     for (x, label, value, color) in [
-        (70.0, tr("New"), new, COLOR_COUNT_NEW),
-        (160.0, tr("Learning"), learn, COLOR_COUNT_LEARN),
-        (250.0, tr("Review"), review, COLOR_COUNT_DUE),
+        (70.0, tr("New"), new, current_theme().new),
+        (160.0, tr("Learning"), learn, current_theme().learn),
+        (250.0, tr("Review"), review, current_theme().review),
     ] {
         Ui::draw_text_centered(x, y, 0.54, color, &value.to_string());
-        Ui::draw_text_centered(x, y + 17.0, 0.37, COLOR_TEXT_MUTED, label);
+        Ui::draw_text_centered(x, y + 17.0, 0.37, current_theme().text_muted, label);
     }
 }
 fn button(x: f32, y: f32, w: f32, label: &str, hint: Option<&str>, style: i32) {
@@ -362,43 +377,87 @@ fn button(x: f32, y: f32, w: f32, label: &str, hint: Option<&str>, style: i32) {
     );
 }
 fn row(y: f32, label: &str, selected: bool) {
-    Ui::draw_rect(
-        0.0,
-        y,
-        320.0,
-        24.0,
+    Ui::draw_rounded_rect(
+        6.0,
+        y + 1.0,
+        296.0,
+        22.0,
+        8.0,
         if selected {
-            rgba(220, 236, 248, 255)
+            current_theme().row_selected
         } else {
-            COLOR_PANEL_WHITE
+            current_theme().surface
         },
     );
-    Ui::draw_line(0.0, y + 24.0, 320.0, y + 24.0, 1.0, COLOR_PANEL_BORDER);
     Ui::draw_text(
-        10.0,
+        16.0,
         y + 4.0,
         0.52,
-        COLOR_TEXT_DARK,
-        &Ui::ellipsize(label, 0.52, 282.0),
+        current_theme().text,
+        &Ui::ellipsize(label, 0.52, 276.0),
     );
 }
-const MENU: [&str; 14] = [
-    "Add note",
-    "Edit note",
-    "Browse",
-    "Help",
-    "Statistics",
-    "Undo",
-    "Deck options",
-    "Sync",
-    "Log in",
-    "Log out",
-    "Update clock",
-    "Language",
-    "Font scale",
-    "Exit",
+const MAIN_MENU: [(Action, &str); 10] = [
+    (Action::Undo, "Undo"),
+    (Action::Bury, "Bury / Suspend"),
+    (Action::Edit, "Edit note"),
+    (Action::Add, "Add note"),
+    (Action::Browse, "Browse"),
+    (Action::Sync, "Sync"),
+    (Action::Stats, "Statistics"),
+    (Action::Options, "Deck options"),
+    (Action::Settings, "Settings"),
+    (Action::Exit, "Exit"),
 ];
-const FONT_SCALE_MENU_INDEX: usize = 12;
+const SETTINGS_MENU: [(Action, &str); 8] = [
+    (Action::None, "Font scale"),
+    (Action::None, "Theme"),
+    (Action::Language, "Language"),
+    (Action::Login, "Log in"),
+    (Action::Logout, "Log out"),
+    (Action::FullSync, "Full sync"),
+    (Action::Clock, "Update clock"),
+    (Action::Help, "Help"),
+];
+const FONT_SCALE_ITEM: usize = 0;
+const THEME_ITEM: usize = 1;
+const MENU_COLS: usize = 2;
+const MENU_TILE_W: f32 = 146.0;
+const MENU_TILE_H: f32 = 30.0;
+const MENU_TILE_GAP_X: f32 = 8.0;
+const MENU_TILE_GAP_Y: f32 = 6.0;
+const MENU_TILE_X0: f32 = 10.0;
+const MENU_TILE_Y0: f32 = 44.0;
+const MENU_ROWS_MAX: usize = 5;
+
+fn menu_tile(index: usize, rows: usize) -> (f32, f32) {
+    let col = index % MENU_COLS;
+    let row = index / MENU_COLS;
+    let y_offset = (MENU_ROWS_MAX - rows) as f32 * (MENU_TILE_H + MENU_TILE_GAP_Y) * 0.5;
+    (
+        MENU_TILE_X0 + col as f32 * (MENU_TILE_W + MENU_TILE_GAP_X),
+        MENU_TILE_Y0 + y_offset + row as f32 * (MENU_TILE_H + MENU_TILE_GAP_Y),
+    )
+}
+
+fn menu_hit(x: f32, y: f32, rows: usize, length: usize) -> Option<usize> {
+    (0..length).find(|index| {
+        let (tx, ty) = menu_tile(*index, rows);
+        x >= tx && x < tx + MENU_TILE_W && y >= ty && y < ty + MENU_TILE_H
+    })
+}
+
+fn settings_label(index: usize) -> String {
+    match index {
+        FONT_SCALE_ITEM => i18n::format("Font scale: {0}%", &[&i18n::font_scale().to_string()]),
+        THEME_ITEM => i18n::format("Theme: {0}", &[tr(ThemeKind::label(theme::kind()))]),
+        _ => tr(SETTINGS_MENU[index].1).to_owned(),
+    }
+}
+
+fn menu_label(index: usize) -> String {
+    tr(MAIN_MENU[index].1).to_owned()
+}
 
 fn main() {
     let apt = Apt::new().expect("APT initialization");
@@ -428,6 +487,8 @@ fn main() {
         )
         .init();
     i18n::init();
+    theme::init();
+    Ui::apply_theme();
     let startup_error = assets::prepare()
         .map_err(|e| e.to_string())
         .and_then(|_| {
@@ -795,7 +856,7 @@ fn main() {
                         Action::None
                     }
                 }
-                Screen::Browser(_) | Screen::Editor { .. } | Screen::Menu { .. }
+                Screen::Browser(_) | Screen::Editor { .. }
                     if x >= 304.0 && (43.0..187.0).contains(&y) =>
                 {
                     if y < 115.0 {
@@ -841,16 +902,41 @@ fn main() {
                     *field = ((y - 43.0) / 24.0) as usize;
                     Action::Field
                 }
-                Screen::Menu { selected, .. } if (43.0..187.0).contains(&y) => {
-                    *selected = *selected / ROWS * ROWS + ((y - 43.0) / 24.0) as usize;
-                    *selected = (*selected).min(MENU.len() - 1);
+                Screen::Menu { selected, .. } => {
+                    if let Some(index) = menu_hit(x, y, MENU_ROWS_MAX, MAIN_MENU.len()) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::Settings { selected, .. } => {
+                    let rows = (SETTINGS_MENU.len() + MENU_COLS - 1) / MENU_COLS;
+                    if let Some(index) = menu_hit(x, y, rows, SETTINGS_MENU.len()) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::CardChoice { selected, .. } if (70.0..118.0).contains(&y) => {
+                    *selected = if x < 160.0 { 0 } else { 1 };
                     Action::Primary
                 }
+                Screen::CardChoice { .. } if (150.0..192.0).contains(&y) => Action::Back,
                 Screen::Info { .. } if (194.0..222.0).contains(&y) => Action::Back,
                 Screen::Empty { .. } if (110.0..144.0).contains(&y) => Action::Back,
                 _ => Action::None,
             };
-            if y >= 224.0 && !matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
+            if y >= 224.0
+                && !matches!(
+                    screen,
+                    Screen::Question { .. }
+                        | Screen::Answer { .. }
+                        | Screen::SyncChoice { .. }
+                        | Screen::CardChoice { .. }
+                )
+            {
                 action = if x < 160.0 {
                     Action::Menu
                 } else {
@@ -901,6 +987,8 @@ fn main() {
                     "EXIT" => Action::Exit,
                     "UP" => Action::Up,
                     "DOWN" => Action::Down,
+                    "LEFT" => Action::Left,
+                    "RIGHT" => Action::Right,
                     "COLLAPSE" => {
                         selected = value.parse().unwrap_or(0);
                         Action::Left
@@ -945,42 +1033,105 @@ fn main() {
                 return Ok(());
             }
             if let Screen::Menu { selected, .. } = &screen {
-                if *selected == FONT_SCALE_MENU_INDEX {
-                    let direction = match action {
-                        Action::Primary | Action::Right => 1,
-                        Action::Left => -1,
-                        _ => 0,
-                    };
-                    if direction != 0 {
+                if matches!(action, Action::Primary) {
+                    let chosen = MAIN_MENU[*selected].0;
+                    if matches!(chosen, Action::Settings) {
+                        let menu = std::mem::replace(&mut screen, Screen::Decks);
+                        screen = Screen::Settings {
+                            selected: 0,
+                            previous: Box::new(menu),
+                        };
+                        card_scroll = 0;
+                        return Ok(());
+                    }
+                    action = chosen;
+                    let old = std::mem::replace(&mut screen, Screen::Decks);
+                    if let Screen::Menu { previous, .. } = old {
+                        screen = *previous;
+                    }
+                }
+            }
+            if let Screen::Settings { selected, .. } = &screen {
+                let adjust = match action {
+                    Action::Primary | Action::Right => Some(1),
+                    Action::Left => Some(-1),
+                    _ => None,
+                };
+                if *selected == FONT_SCALE_ITEM {
+                    if let Some(direction) = adjust {
                         let percent = i18n::adjust_font_scale(direction)?;
                         event(&format!("FONT_SCALE {percent}%"));
                         review_scroll = 0.0;
                         return Ok(());
                     }
                 }
+                if *selected == THEME_ITEM {
+                    if let Some(direction) = adjust {
+                        let kind = theme::cycle(direction)?;
+                        Ui::apply_theme();
+                        event(&format!("THEME {}", kind.key()));
+                        return Ok(());
+                    }
+                }
                 if matches!(action, Action::Primary) {
-                    action = [
-                        Action::Add,
-                        Action::Edit,
-                        Action::Browse,
-                        Action::Help,
-                        Action::Stats,
-                        Action::Undo,
-                        Action::Options,
-                        Action::Sync,
-                        Action::Login,
-                        Action::Logout,
-                        Action::Clock,
-                        Action::Language,
-                        Action::None,
-                        Action::Exit,
-                    ][*selected]
-                        .clone();
+                    action = SETTINGS_MENU[*selected].0;
                     let old = std::mem::replace(&mut screen, Screen::Decks);
-                    if let Screen::Menu { previous, .. } = old {
+                    if let Screen::Settings { previous, .. } = old {
                         screen = *previous;
                     }
                 }
+            }
+            let mut bury = None;
+            if let Screen::CardChoice {
+                card_id, selected, ..
+            } = &screen
+            {
+                let card_id = *card_id;
+                let selected = *selected;
+                match action {
+                    Action::Up | Action::Down | Action::Left | Action::Right => {
+                        let choice = if matches!(action, Action::Down | Action::Right) {
+                            1
+                        } else {
+                            0
+                        };
+                        let old = std::mem::replace(&mut screen, Screen::Decks);
+                        if let Screen::CardChoice {
+                            card_id, previous, ..
+                        } = old
+                        {
+                            screen = Screen::CardChoice {
+                                card_id,
+                                selected: choice,
+                                previous,
+                            };
+                        }
+                        return Ok(());
+                    }
+                    Action::Back => {
+                        let old = std::mem::replace(&mut screen, Screen::Decks);
+                        if let Screen::CardChoice { previous, .. } = old {
+                            screen = *previous;
+                        }
+                        card_scroll = 0;
+                        return Ok(());
+                    }
+                    Action::Primary => bury = Some((card_id, selected)),
+                    _ => {}
+                }
+            }
+            if let Some((card_id, selected)) = bury {
+                let mode = if selected == 0 { 2 } else { 0 };
+                let b = backend.as_mut().ok_or("collection unavailable")?;
+                b.bury_or_suspend(card_id, mode)?;
+                event(&format!("BURY card={card_id} mode={mode}"));
+                let deck_name = deck_name.clone();
+                screen = match b.next()? {
+                    Some(card) => Screen::Question { card, deck_name },
+                    None => Screen::Empty { deck_name },
+                };
+                card_scroll = 0;
+                return Ok(());
             }
             let mut full_mode = None;
             if let Screen::SyncChoice {
@@ -1182,7 +1333,7 @@ fn main() {
                 }
                 Action::Help | Action::Stats => {
                     let (title, text) = match action {
-                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy.\nScroll the top screen with Circle Pad, D-pad, C-stick or ZL/ZR.\nSELECT opens Menu. B returns. START closes and exits.\nMenu > Font scale changes card text size.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
+                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy.\nScroll the top screen with Circle Pad, D-pad, C-stick or ZL/ZR.\nSELECT opens Menu. B returns. START closes and exits.\nMenu > Settings has font scale, theme and account options.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
                         Action::Stats => (tr("Statistics"), backend.as_mut().ok_or("collection unavailable")?.statistics()?),
                         _ => unreachable!(),
                     };
@@ -1270,10 +1421,44 @@ fn main() {
                     event("UNDO_OK");
                     screen = Screen::Decks;
                 }
+                Action::Bury => {
+                    let card_id = match &screen {
+                        Screen::Question { card, .. } | Screen::Answer { card, .. } => {
+                            Some(card.id)
+                        }
+                        _ => None,
+                    };
+                    let previous = std::mem::replace(&mut screen, Screen::Decks);
+                    screen = match card_id {
+                        Some(card_id) => Screen::CardChoice {
+                            card_id,
+                            selected: 0,
+                            previous: Box::new(previous),
+                        },
+                        None => Screen::Info {
+                            title: tr("Bury / Suspend").into(),
+                            text: tr("Open a card to bury or suspend.").into(),
+                            previous: Box::new(previous),
+                        },
+                    };
+                    card_scroll = 0;
+                }
+                Action::FullSync => {
+                    screen = Screen::SyncChoice {
+                        upload_ok: true,
+                        download_ok: true,
+                        download: false,
+                        confirmed: false,
+                    };
+                    card_scroll = 0;
+                }
                 Action::Back => {
                     let old = std::mem::replace(&mut screen, Screen::Decks);
                     screen = match old {
-                        Screen::Info { previous, .. } | Screen::Menu { previous, .. } => *previous,
+                        Screen::Info { previous, .. }
+                        | Screen::Menu { previous, .. }
+                        | Screen::Settings { previous, .. }
+                        | Screen::CardChoice { previous, .. } => *previous,
                         Screen::Editor {
                             return_query: Some(query),
                             ..
@@ -1455,7 +1640,20 @@ fn main() {
                                 *field = next(*field, 2);
                             }
                             Screen::Menu { selected, .. } => {
-                                *selected = next(*selected, MENU.len());
+                                let length = MAIN_MENU.len();
+                                *selected = if matches!(action, Action::Down) {
+                                    (*selected + MENU_COLS).min(length - 1)
+                                } else {
+                                    selected.saturating_sub(MENU_COLS)
+                                };
+                            }
+                            Screen::Settings { selected, .. } => {
+                                let length = SETTINGS_MENU.len();
+                                *selected = if matches!(action, Action::Down) {
+                                    (*selected + MENU_COLS).min(length - 1)
+                                } else {
+                                    selected.saturating_sub(MENU_COLS)
+                                };
                             }
                             _ => {
                                 card_scroll = next(card_scroll, top_max + 1);
@@ -1479,6 +1677,18 @@ fn main() {
                                 scroll_pos = scroll_pos.min(decks.len().saturating_sub(ROWS));
                             }
                         }
+                    } else if let Screen::Menu { selected, .. } = &mut screen {
+                        *selected = if matches!(action, Action::Right) {
+                            (*selected + 1).min(MAIN_MENU.len() - 1)
+                        } else {
+                            selected.saturating_sub(1)
+                        };
+                    } else if let Screen::Settings { selected, .. } = &mut screen {
+                        *selected = if matches!(action, Action::Right) {
+                            (*selected + 1).min(SETTINGS_MENU.len() - 1)
+                        } else {
+                            selected.saturating_sub(1)
+                        };
                     } else if matches!(
                         screen,
                         Screen::Info { .. } | Screen::Browser(_) | Screen::Editor { .. }
@@ -1490,7 +1700,7 @@ fn main() {
                         };
                     }
                 }
-                Action::None | Action::Menu | Action::Exit => {}
+                Action::None | Action::Menu | Action::Settings | Action::Exit => {}
             }
             Ok(())
         })();
@@ -1551,6 +1761,8 @@ fn main() {
             Screen::Editor { .. } => "EDITOR",
             Screen::Options { .. } => "OPTIONS",
             Screen::Menu { .. } => "MENU",
+            Screen::Settings { .. } => "SETTINGS",
+            Screen::CardChoice { .. } => "CARD_CHOICE",
             Screen::Info { .. } => "INFO",
             Screen::Error(_) => "ERROR",
         };
@@ -1576,7 +1788,7 @@ fn main() {
         }
 
         Ui::frame_begin();
-        Ui::target_top(COLOR_BG_TOP);
+        Ui::target_top(current_theme().bg_top);
         top_max = 0;
         review_max_scroll = 0.0;
         match &screen {
@@ -1602,9 +1814,9 @@ fn main() {
                         6.0,
                         6.0,
                         if index == phase {
-                            COLOR_COUNT_NEW
+                            current_theme().new
                         } else {
-                            COLOR_PANEL_BORDER
+                            current_theme().border
                         },
                     );
                 }
@@ -1634,21 +1846,41 @@ fn main() {
                 top_layout.draw(&text, 360.0, 200.0, 60.0, 8, 0);
             }
             Screen::Decks => {
-                Ui::draw_text_centered(200.0, 32.0, 0.65, COLOR_TEXT_DARK, tr("Decks"));
-                Ui::draw_line(20.0, 60.0, 380.0, 60.0, 1.0, COLOR_PANEL_BORDER);
+                Ui::draw_text_centered(200.0, 32.0, 0.65, current_theme().text, tr("Decks"));
+                Ui::draw_line(20.0, 60.0, 380.0, 60.0, 1.0, current_theme().border);
                 if let Some(deck) = decks.get(selected) {
-                    Ui::fit_text(200.0, 86.0, 0.68, 360.0, COLOR_TEXT_DARK, &deck.leaf_name);
-                    Ui::fit_text(200.0, 116.0, 0.44, 360.0, COLOR_TEXT_MUTED, &deck.name);
+                    Ui::fit_text(
+                        200.0,
+                        86.0,
+                        0.68,
+                        360.0,
+                        current_theme().text,
+                        &deck.leaf_name,
+                    );
+                    Ui::fit_text(
+                        200.0,
+                        116.0,
+                        0.44,
+                        360.0,
+                        current_theme().text_muted,
+                        &deck.name,
+                    );
                     counts(deck.new_count, deck.learn_count, deck.review_count, 153.0);
                     Ui::draw_text_centered(
                         200.0,
                         210.0,
                         0.43,
-                        COLOR_TEXT_MUTED,
+                        current_theme().text_muted,
                         tr("A Study    SELECT Menu"),
                     );
                 } else {
-                    Ui::draw_text_centered(200.0, 100.0, 0.60, COLOR_TEXT_DARK, tr("No decks"));
+                    Ui::draw_text_centered(
+                        200.0,
+                        100.0,
+                        0.60,
+                        current_theme().text,
+                        tr("No decks"),
+                    );
                 }
             }
             Screen::Question { card, .. } | Screen::Answer { card, .. } => {
@@ -1673,7 +1905,7 @@ fn main() {
                 );
             }
             Screen::Browser(b) => {
-                Ui::draw_text_centered(200.0, 30.0, 0.60, COLOR_TEXT_DARK, tr("Preview"));
+                Ui::draw_text_centered(200.0, 30.0, 0.60, current_theme().text, tr("Preview"));
                 let text = format!("{}\n\n{}", b.preview.0, b.preview.1);
                 top_max = top_layout.draw(&text, 360.0, 200.0, 62.0, 7, card_scroll);
             }
@@ -1683,17 +1915,17 @@ fn main() {
                 } else {
                     (&String::from(tr("Tags")), draft.note.tags.join(" "))
                 };
-                Ui::fit_text(200.0, 30.0, 0.60, 360.0, COLOR_TEXT_DARK, label);
+                Ui::fit_text(200.0, 30.0, 0.60, 360.0, current_theme().text, label);
                 top_max = top_layout.draw(&value, 360.0, 200.0, 64.0, 7, card_scroll);
             }
             Screen::Options { options, .. } => {
-                Ui::draw_text_centered(200.0, 35.0, 0.60, COLOR_TEXT_DARK, tr("Deck options"));
+                Ui::draw_text_centered(200.0, 35.0, 0.60, current_theme().text, tr("Deck options"));
                 top_max = top_layout.draw(tr("Daily limits for this deck.\nThe shared preset stays unchanged.\nSave applies changes. Cancel keeps previous limits."), 360.0, 200.0, 70.0, 7, 0);
                 Ui::draw_text_centered(
                     200.0,
                     217.0,
                     0.42,
-                    COLOR_TEXT_MUTED,
+                    current_theme().text_muted,
                     if options.snapshot.fsrs {
                         tr("FSRS enabled")
                     } else {
@@ -1702,17 +1934,43 @@ fn main() {
                 );
             }
             Screen::Menu { .. } => {
-                Ui::draw_text_centered(200.0, 70.0, 0.65, COLOR_TEXT_DARK, tr("Menu"));
+                Ui::draw_text_centered(200.0, 70.0, 0.65, current_theme().text, tr("Menu"));
                 Ui::draw_text_centered(
                     200.0,
                     112.0,
                     0.48,
-                    COLOR_TEXT_MUTED,
+                    current_theme().text_muted,
                     tr("Select an action. B returns."),
                 );
             }
+            Screen::Settings { .. } => {
+                Ui::draw_text_centered(200.0, 70.0, 0.65, current_theme().text, tr("Settings"));
+                Ui::draw_text_centered(
+                    200.0,
+                    112.0,
+                    0.48,
+                    current_theme().text_muted,
+                    tr("Preferences, account and help."),
+                );
+            }
+            Screen::CardChoice { .. } => {
+                Ui::draw_text_centered(
+                    200.0,
+                    70.0,
+                    0.65,
+                    current_theme().text,
+                    tr("Bury / Suspend"),
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    112.0,
+                    0.48,
+                    current_theme().text_muted,
+                    tr("Choose an action for the current card."),
+                );
+            }
             Screen::Info { title, text, .. } => {
-                Ui::fit_text(200.0, 30.0, 0.60, 360.0, COLOR_TEXT_DARK, title);
+                Ui::fit_text(200.0, 30.0, 0.60, 360.0, current_theme().text, title);
                 top_max = top_layout.draw(text, 360.0, 200.0, 64.0, 7, card_scroll);
             }
             Screen::Empty { deck_name } => {
@@ -1720,7 +1978,7 @@ fn main() {
                     200.0,
                     65.0,
                     0.58,
-                    COLOR_TEXT_DARK,
+                    current_theme().text,
                     tr("No cards available now"),
                 );
                 top_max = top_layout.draw(
@@ -1733,11 +1991,11 @@ fn main() {
                 );
             }
             Screen::Error(err) => {
-                Ui::draw_text_centered(200.0, 30.0, 0.60, COLOR_COUNT_LEARN, tr("Error"));
+                Ui::draw_text_centered(200.0, 30.0, 0.60, current_theme().learn, tr("Error"));
                 top_max = top_layout.draw(err, 360.0, 200.0, 62.0, 7, card_scroll);
             }
         }
-        Ui::target_bottom(COLOR_BG_BOTTOM);
+        Ui::target_bottom(current_theme().bg_bottom);
         match &screen {
             Screen::SyncWait => {
                 header(
@@ -1829,7 +2087,7 @@ fn main() {
                     8.0,
                     3.0,
                     0.44,
-                    COLOR_TEXT_MUTED,
+                    current_theme().text_muted,
                     &Ui::ellipsize(deck_name, 0.44, 205.0),
                 );
                 Ui::draw_status_compact(314.0, 3.0, 0.42);
@@ -1839,7 +2097,7 @@ fn main() {
                     160.0,
                     187.0,
                     0.40,
-                    COLOR_TEXT_MUTED,
+                    current_theme().text_muted,
                     tr("Tap or press [A]"),
                 );
             }
@@ -1848,7 +2106,7 @@ fn main() {
                     8.0,
                     3.0,
                     0.44,
-                    COLOR_TEXT_MUTED,
+                    current_theme().text_muted,
                     &Ui::ellipsize(deck_name, 0.44, 205.0),
                 );
                 Ui::draw_status_compact(314.0, 3.0, 0.42);
@@ -1949,28 +2207,46 @@ fn main() {
             }
             Screen::Menu { selected, .. } => {
                 header(320.0, tr("Menu"));
-                for (i, label) in MENU
-                    .iter()
-                    .enumerate()
-                    .skip(selected / ROWS * ROWS)
-                    .take(ROWS)
-                {
-                    let label = if i == FONT_SCALE_MENU_INDEX {
-                        i18n::format("Font scale: {0}%", &[&i18n::font_scale().to_string()])
-                    } else {
-                        tr(label).to_owned()
-                    };
-                    row(43.0 + (i % ROWS) as f32 * 24.0, &label, i == *selected);
+                for i in 0..MAIN_MENU.len() {
+                    let (x, y) = menu_tile(i, MENU_ROWS_MAX);
+                    let style = if i == *selected { 0 } else { 6 };
+                    let label = Ui::ellipsize(&menu_label(i), 0.50, MENU_TILE_W - 12.0);
+                    Ui::draw_button(x, y, MENU_TILE_W, MENU_TILE_H, &label, None, style, false);
                 }
-                Ui::draw_scrollbar(
-                    304.0,
-                    43.0,
-                    16.0,
-                    144.0,
-                    MENU.len(),
-                    ROWS,
-                    selected / ROWS * ROWS,
+            }
+            Screen::Settings { selected, .. } => {
+                header(320.0, tr("Settings"));
+                let rows = (SETTINGS_MENU.len() + MENU_COLS - 1) / MENU_COLS;
+                for i in 0..SETTINGS_MENU.len() {
+                    let (x, y) = menu_tile(i, rows);
+                    let style = if i == *selected { 0 } else { 6 };
+                    let label = Ui::ellipsize(&settings_label(i), 0.50, MENU_TILE_W - 12.0);
+                    Ui::draw_button(x, y, MENU_TILE_W, MENU_TILE_H, &label, None, style, false);
+                }
+            }
+            Screen::CardChoice { selected, .. } => {
+                header(320.0, tr("Bury / Suspend"));
+                Ui::draw_button(
+                    12.0,
+                    70.0,
+                    146.0,
+                    48.0,
+                    tr("Bury"),
+                    None,
+                    if *selected == 0 { 0 } else { 6 },
+                    false,
                 );
+                Ui::draw_button(
+                    162.0,
+                    70.0,
+                    146.0,
+                    48.0,
+                    tr("Suspend"),
+                    None,
+                    if *selected == 1 { 0 } else { 6 },
+                    false,
+                );
+                button(60.0, 160.0, 200.0, tr("Cancel [B]"), None, 6);
             }
             Screen::Info { title, .. } => {
                 header(320.0, title);
@@ -1991,13 +2267,16 @@ fn main() {
             }
             Screen::Error(_) => {
                 header(320.0, tr("Error"));
-                Ui::draw_text_centered(160.0, 90.0, 0.50, COLOR_TEXT_DARK, tr("Retry [A]"));
-                Ui::draw_text_centered(160.0, 120.0, 0.50, COLOR_TEXT_DARK, tr("START: Exit"));
+                Ui::draw_text_centered(160.0, 90.0, 0.50, current_theme().text, tr("Retry [A]"));
+                Ui::draw_text_centered(160.0, 120.0, 0.50, current_theme().text, tr("START: Exit"));
             }
         }
         if !matches!(
             screen,
-            Screen::Question { .. } | Screen::Answer { .. } | Screen::SyncChoice { .. }
+            Screen::Question { .. }
+                | Screen::Answer { .. }
+                | Screen::SyncChoice { .. }
+                | Screen::CardChoice { .. }
         ) {
             footer(if clock::is_known() {
                 tr("Menu [SELECT]                      Options")

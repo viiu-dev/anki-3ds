@@ -19,9 +19,45 @@ extern "C" {
 
 #define C2D_RGBA(r, g, b, a) ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24))
 
+typedef struct {
+    uint32_t bg_top;
+    uint32_t bg_bottom;
+    uint32_t surface;
+    uint32_t surface_alt;
+    uint32_t surface_pressed;
+    uint32_t border;
+    uint32_t text;
+    uint32_t text_muted;
+    uint32_t text_faint;
+    uint32_t accent;
+    uint32_t on_accent;
+    uint32_t new_color;
+    uint32_t learn;
+    uint32_t review;
+    uint32_t cloze_bg;
+    uint32_t pitch;
+    uint32_t row_selected;
+    uint32_t tab_active_bg;
+    uint32_t tab_active_fg;
+    uint32_t tab_inactive_bg;
+    uint32_t tab_inactive_fg;
+    uint32_t scroll_track;
+    uint32_t scroll_thumb;
+    uint32_t again_bg;
+    uint32_t again_fg;
+    uint32_t hard_bg;
+    uint32_t hard_fg;
+    uint32_t good_bg;
+    uint32_t good_fg;
+    uint32_t easy_bg;
+    uint32_t easy_fg;
+    uint32_t shadow;
+} UiTheme;
+
 // `font_data` is the bundled TrueType font and must remain valid for the
 // lifetime of the UI. The renderer rasterizes CJK glyphs into a small atlas.
 bool ui_init(const void* font_data, size_t font_size);
+void ui_set_theme(const UiTheme* theme);
 void ui_fini(void);
 void ui_frame_begin(void);
 void ui_frame_end(void);
@@ -33,6 +69,7 @@ void ui_draw_rect(float x, float y, float w, float h, uint32_t color);
 void ui_draw_rect_gradient(float x, float y, float w, float h, uint32_t c_top, uint32_t c_bot);
 void ui_draw_line(float x0, float y0, float x1, float y1, float thickness, uint32_t color);
 void ui_draw_circle(float x, float y, float radius, uint32_t color);
+void ui_draw_rounded_rect(float x, float y, float w, float h, float radius, uint32_t color);
 void ui_draw_triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color);
 
 void ui_draw_text(float x, float y, float scale, uint32_t color, const char* str);
