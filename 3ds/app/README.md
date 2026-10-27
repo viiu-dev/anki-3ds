@@ -38,9 +38,9 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
   than the screen.
 - Font scale: Menu → Font scale offers 85%, 100%, 125%, 150%, 175%, 200% and
   250%. A advances the setting and Left/Right adjusts it. It scales card text,
-  furigana and line spacing, and is saved in `settings.json`. A high-resolution
-  `cjk.bcfnt` placed at `sdmc:/3ds/anki-3ds/cjk.bcfnt` is used automatically;
-  otherwise the console's shared CJK font is used.
+  furigana and line spacing, and is saved in `settings.json`. Card text is drawn
+  with the bundled Noto Sans JP font (SIL Open Font License), rasterized on
+  demand, so no `cjk.bcfnt` needs to be copied to the SD card.
 - Add/Edit: select a field for the Nintendo keyboard; X saves, B cancels.
 - Browse: upstream search syntax; X opens search.
 - Menu → Log in: enter your AnkiWeb email and masked password once. Login checks
@@ -86,8 +86,5 @@ unverified; full download retains a `.pre-sync-*` backup before replacement.
 credentials, endpoint, and CA. Release builds do not read that file. It must never
 be included in a hardware package. See [port status](../docs/FEASIBILITY.md).
 
-When testing under Azahar, its open-source fallback font has no glyph for the
-hiragana ん (U+3093), so that character appears as a missing-glyph box on both
-the base text and furigana. The app draws card text with the console's system
-font, which includes ん on hardware; this is an emulator font gap rather than a
-card rendering issue. Other kana and common kanji render normally.
+Card text uses the bundled Noto Sans JP font, so Japanese renders identically on
+hardware and under Azahar without depending on the console's regional font.

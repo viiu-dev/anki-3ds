@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
+use std::os::raw::c_void;
 
 use super::i18n::tr;
 use super::review_text::Block;
@@ -29,11 +30,18 @@ const CARD_SECTION_RULE_HEIGHT: f32 = 9.0;
 const CARD_LIST_GAP: f32 = 2.0;
 const CARD_Y_PADDING: f32 = 8.0;
 const CARD_RULE_HEIGHT: f32 = 12.0;
-const CARD_CJK_SCALE: f32 = 1.18;
+// Keep CJK glyphs comfortably inside their line box. The bundled font has
+// slightly taller ink than the system bitmap font, especially below the
+// baseline for kana such as く.
+const CARD_CJK_SCALE: f32 = 1.10;
 const CARD_HEADWORD_SCALE: f32 = 1.20;
 const CARD_HEADWORD_MAX_CHARS: usize = 28;
 const CARD_PITCH_HEIGHT: f32 = 6.0;
 const CARD_PITCH_GAP: f32 = 4.0;
+
+// Bundled SIL OFL font, so users never need to copy cjk.bcfnt to their SD
+// card. The renderer rasterizes only visible glyphs into a small atlas.
+const CARD_FONT: &[u8] = include_bytes!("../resources/NotoSansJP.ttf");
 
 #[inline]
 pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -62,7 +70,7 @@ extern "C" {
         cancel: *const c_char,
         accept: *const c_char,
     ) -> c_int;
-    fn ui_init() -> bool;
+    fn ui_init(font_data: *const c_void, font_size: usize) -> bool;
     fn ui_wifi_connected() -> bool;
     fn ui_fini();
     fn ui_frame_begin();
@@ -87,6 +95,9 @@ extern "C" {
         italic: bool,
     );
     fn ui_get_card_text_width(scale: f32, str: *const c_char) -> f32;
+    fn ui_prepare_card_text_checked(scale: f32, str: *const c_char) -> bool;
+    fn ui_commit_card_text();
+    fn ui_reset_card_text();
     fn ui_draw_status_compact(x_right: f32, y: f32, scale: f32);
     fn ui_draw_scroll_indicator(x_right: f32, y: f32, w: f32, h: f32, scroll: f32, max_scroll: f32);
 
@@ -224,7 +235,7 @@ impl Ui {
     }
 
     pub fn init() -> bool {
-        unsafe { ui_init() }
+        unsafe { ui_init(CARD_FONT.as_ptr().cast(), CARD_FONT.len()) }
     }
 
     pub fn fini() {
@@ -301,6 +312,22 @@ impl Ui {
         } else {
             0.0
         }
+    }
+
+    pub fn prepare_card_text(scale: f32, s: &str) -> bool {
+        if let Ok(c_str) = CString::new(display_text(s).as_bytes()) {
+            unsafe { ui_prepare_card_text_checked(scale, c_str.as_ptr()) }
+        } else {
+            false
+        }
+    }
+
+    pub fn commit_card_text() {
+        unsafe { ui_commit_card_text() }
+    }
+
+    pub fn reset_card_text() {
+        unsafe { ui_reset_card_text() }
     }
 
     pub fn draw_status_compact(x_right: f32, y: f32, scale: f32) {
@@ -614,6 +641,14 @@ impl RichTextLayout {
         };
         let scale = CARD_TEXT_SCALE * self.font_scale;
         let ruby_scale = scale * CARD_RUBY_SCALE;
+        if !self.prepare_visible(origin, scale, ruby_scale) {
+            // The atlas is a cache, not a hard limit. If a long card or a very
+            // large font filled it, start a fresh atlas and try this frame
+            // again before drawing anything.
+            Ui::reset_card_text();
+            let _ = self.prepare_visible(origin, scale, ruby_scale);
+        }
+        Ui::commit_card_text();
         let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0;
         for line in &self.lines {
             let top = origin + line.top;
@@ -760,6 +795,46 @@ impl RichTextLayout {
                 }
             }
         }
+    }
+
+    fn prepare_visible(&self, origin: f32, scale: f32, ruby_scale: f32) -> bool {
+        for line in &self.lines {
+            let top = origin + line.top;
+            if top > TOP_HEIGHT || top + line.height < 0.0 || line.rule {
+                continue;
+            }
+            if let Some(marker) = &line.marker {
+                if !Ui::prepare_card_text(scale, marker) {
+                    return false;
+                }
+            }
+            for piece in &line.pieces {
+                if let Some(marker) = &piece.pitch_marker {
+                    if let PitchMarker::Accent(number) = marker {
+                        if !Ui::prepare_card_text(scale * 0.62, &number.to_string()) {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+                let text_scale = scale
+                    * piece.scale
+                    * if piece.style.sub || piece.style.sup {
+                        0.75
+                    } else {
+                        1.0
+                    };
+                if !Ui::prepare_card_text(text_scale, &piece.text) {
+                    return false;
+                }
+                if let Some(reading) = &piece.ruby {
+                    if !Ui::prepare_card_text(ruby_scale * piece.scale, reading) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn draw_pitch_marker(

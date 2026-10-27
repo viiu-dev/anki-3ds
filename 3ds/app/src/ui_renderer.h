@@ -4,6 +4,7 @@
 #ifndef ANKI_3DS_UI_RENDERER_H
 #define ANKI_3DS_UI_RENDERER_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -18,7 +19,9 @@ extern "C" {
 
 #define C2D_RGBA(r, g, b, a) ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24))
 
-bool ui_init(void);
+// `font_data` is the bundled TrueType font and must remain valid for the
+// lifetime of the UI. The renderer rasterizes CJK glyphs into a small atlas.
+bool ui_init(const void* font_data, size_t font_size);
 void ui_fini(void);
 void ui_frame_begin(void);
 void ui_frame_end(void);
@@ -37,8 +40,13 @@ void ui_draw_text_centered(float x_center, float y, float scale, uint32_t color,
 void ui_draw_text_right(float x_right, float y, float scale, uint32_t color, const char* str);
 float ui_get_text_width(float scale, const char* str);
 
-// Card text uses the system font when available, so Japanese furigana and
-// base characters can be rendered. Bold is approximated by a second pass.
+// Card text uses the bundled TrueType font. Callers should prepare all
+// visible text first, then commit once, so a frame needs at most one atlas
+// upload. Bold is approximated by a second pass.
+void ui_prepare_card_text(float scale, const char* str);
+bool ui_prepare_card_text_checked(float scale, const char* str);
+void ui_commit_card_text(void);
+void ui_reset_card_text(void);
 void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic);
 float ui_get_card_text_width(float scale, const char* str);
 

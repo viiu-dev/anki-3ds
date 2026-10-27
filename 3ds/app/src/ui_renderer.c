@@ -3,44 +3,273 @@
 
 #include "ui_renderer.h"
 #include <3ds.h>
-#include <3ds/services/cfgu.h>
 #include <citro2d.h>
 #include <citro3d.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+
+// Glyphs are rasterized at their on-screen size. This atlas replaces the
+// console's low-resolution system glyph sheet and can be refreshed without
+// bundling a very large .bcfnt file.
+#define CARD_ATLAS_W 1024
+#define CARD_ATLAS_H 1024
+#define CARD_GLYPH_CACHE_MAX 4096
+// The existing layout was tuned against a roughly 30px system font.
+#define CARD_FONT_EM_PX 30.0f
+// Put the baseline inside the 19px/100% line box. Noto's CJK ink reaches
+// about 0.84em above the baseline and 0.08em below it.
+#define CARD_FONT_BASELINE 0.84f
+
+typedef struct {
+    uint32_t codepoint;
+    int px;
+    int glyph;
+    int atlas_x;
+    int atlas_y;
+    int width;
+    int height;
+    int offset_x;
+    int offset_y;
+    float advance;
+} CardGlyph;
 
 static C3D_RenderTarget* s_top_target = NULL;
 static C3D_RenderTarget* s_bottom_target = NULL;
 static C2D_TextBuf s_text_buf = NULL;
 static C2D_TextBuf s_measure_buf = NULL;
-static C2D_Font s_card_font = NULL;
-static bool s_card_font_checked = false;
 static bool s_initialized = false;
 
-static void ensure_card_font(void) {
-    if (s_card_font_checked) return;
-    s_card_font_checked = true;
-    s_card_font = C2D_FontLoad("sdmc:/3ds/anki-3ds/cjk.bcfnt");
-    if (!s_card_font) {
-        // JPN/USA/EUR/AUS share the standard font, which includes kana and kanji.
-        // C2D_FontLoadSystem returns NULL for the console's own region because the
-        // default font is already the right one; on CHN/KOR/TWN consoles it loads
-        // that shared standard font instead of the regional one. It checks the
-        // region through CFGU, so the service must be active while loading.
-        Result initialized = cfguInit();
-        s_card_font = C2D_FontLoadSystem(CFG_REGION_JPN);
-        if (R_SUCCEEDED(initialized)) {
-            cfguExit();
-        }
+static stbtt_fontinfo s_font;
+static bool s_font_loaded = false;
+static C3D_Tex s_card_atlas_tex;
+static bool s_card_atlas_ready = false;
+static uint8_t s_card_atlas[CARD_ATLAS_W * CARD_ATLAS_H * 4];
+static CardGlyph s_glyphs[CARD_GLYPH_CACHE_MAX];
+static int s_glyph_count = 0;
+static int s_atlas_x = 0;
+static int s_atlas_y = 0;
+static int s_atlas_row_h = 0;
+static bool s_atlas_dirty = false;
+static bool s_atlas_full = false;
+static uint8_t s_swizzle_map[64];
+static bool s_swizzle_ready = false;
+
+static void init_swizzle_map(void) {
+    if (s_swizzle_ready) return;
+    for (int i = 0; i < 64; i++) s_swizzle_map[i] = (uint8_t)i;
+    static const uint8_t table[][4] = {
+        {2, 8, 16, 4}, {3, 9, 17, 5}, {6, 10, 24, 20}, {7, 11, 25, 21},
+        {14, 26, 28, 22}, {15, 27, 29, 23}, {34, 40, 48, 36}, {35, 41, 49, 37},
+        {38, 42, 56, 52}, {39, 43, 57, 53}, {46, 58, 60, 54}, {47, 59, 61, 55},
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        uint8_t tmp = s_swizzle_map[table[i][0]];
+        s_swizzle_map[table[i][0]] = s_swizzle_map[table[i][1]];
+        s_swizzle_map[table[i][1]] = s_swizzle_map[table[i][2]];
+        s_swizzle_map[table[i][2]] = s_swizzle_map[table[i][3]];
+        s_swizzle_map[table[i][3]] = tmp;
     }
-    if (s_card_font) {
-        C2D_FontSetFilter(s_card_font, GPU_LINEAR, GPU_LINEAR);
+    uint8_t tmp = s_swizzle_map[12];
+    s_swizzle_map[12] = s_swizzle_map[18];
+    s_swizzle_map[18] = tmp;
+    tmp = s_swizzle_map[13];
+    s_swizzle_map[13] = s_swizzle_map[19];
+    s_swizzle_map[19] = tmp;
+    tmp = s_swizzle_map[44];
+    s_swizzle_map[44] = s_swizzle_map[50];
+    s_swizzle_map[50] = tmp;
+    tmp = s_swizzle_map[45];
+    s_swizzle_map[45] = s_swizzle_map[51];
+    s_swizzle_map[51] = tmp;
+    // The table above maps destination pixels to source pixels. Invert it
+    // so swizzled_offset() can map source pixels to their final location.
+    uint8_t source_to_dest[64];
+    for (int dest = 0; dest < 64; dest++) {
+        source_to_dest[s_swizzle_map[dest]] = (uint8_t)dest;
     }
+    for (int i = 0; i < 64; i++) s_swizzle_map[i] = source_to_dest[i];
+    s_swizzle_ready = true;
 }
 
-bool ui_init(void) {
+static size_t swizzled_offset(int x, int y) {
+    init_swizzle_map();
+    int tile_x = x >> 3;
+    int tile_y = y >> 3;
+    int tiles_per_row = CARD_ATLAS_W >> 3;
+    int tile_index = tile_y * tiles_per_row + tile_x;
+    int pixel = (y & 7) * 8 + (x & 7);
+    return ((size_t)tile_index * 64 + s_swizzle_map[pixel]) * 4;
+}
+
+static int card_font_px(float scale) {
+    int px = (int)lroundf(CARD_FONT_EM_PX * scale);
+    return px < 6 ? 6 : px;
+}
+
+static void reset_card_atlas(void) {
+    memset(s_card_atlas, 0, sizeof(s_card_atlas));
+    s_glyph_count = 0;
+    s_atlas_x = 0;
+    s_atlas_y = 0;
+    s_atlas_row_h = 0;
+    s_atlas_dirty = true;
+    s_atlas_full = false;
+}
+
+static CardGlyph* find_glyph(uint32_t codepoint, int px) {
+    for (int i = 0; i < s_glyph_count; i++) {
+        if (s_glyphs[i].codepoint == codepoint && s_glyphs[i].px == px) {
+            return &s_glyphs[i];
+        }
+    }
+    return NULL;
+}
+
+static uint32_t utf8_next(const unsigned char** cursor) {
+    const unsigned char* p = *cursor;
+    uint32_t cp = *p++;
+    if (cp < 0x80) {
+        *cursor = p;
+        return cp;
+    }
+    if ((cp & 0xE0) == 0xC0 && (p[0] & 0xC0) == 0x80) {
+        cp = ((cp & 0x1F) << 6) | (p[0] & 0x3F);
+        *cursor = p + 1;
+        return cp;
+    }
+    if ((cp & 0xF0) == 0xE0 && (p[0] & 0xC0) == 0x80 && (p[1] & 0xC0) == 0x80) {
+        cp = ((cp & 0x0F) << 12) | ((p[0] & 0x3F) << 6) | (p[1] & 0x3F);
+        *cursor = p + 2;
+        return cp;
+    }
+    if ((cp & 0xF8) == 0xF0 && (p[0] & 0xC0) == 0x80 && (p[1] & 0xC0) == 0x80 &&
+        (p[2] & 0xC0) == 0x80) {
+        cp = ((cp & 0x07) << 18) | ((p[0] & 0x3F) << 12) |
+             ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+        *cursor = p + 3;
+        return cp;
+    }
+    *cursor = p;
+    return 0xFFFD;
+}
+
+static CardGlyph* ensure_glyph(uint32_t codepoint, int px) {
+    CardGlyph* cached = find_glyph(codepoint, px);
+    if (cached) {
+        return cached;
+    }
+    if (s_glyph_count >= CARD_GLYPH_CACHE_MAX || s_atlas_full) {
+        s_atlas_full = true;
+        return NULL;
+    }
+
+    float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
+    int glyph = stbtt_FindGlyphIndex(&s_font, (int)codepoint);
+    int advance_units = 0;
+    int lsb = 0;
+    stbtt_GetGlyphHMetrics(&s_font, glyph, &advance_units, &lsb);
+    (void)lsb;
+
+    int width = 0;
+    int height = 0;
+    int offset_x = 0;
+    int offset_y = 0;
+    unsigned char* bitmap =
+        stbtt_GetGlyphBitmap(&s_font, em_scale, em_scale, glyph, &width, &height, &offset_x, &offset_y);
+
+    int cell_w = width + 2;
+    int cell_h = height + 2;
+    if (cell_w < 2) cell_w = 2;
+    if (cell_h < 2) cell_h = 2;
+    if (s_atlas_x + cell_w > CARD_ATLAS_W) {
+        s_atlas_x = 0;
+        s_atlas_y += s_atlas_row_h + 1;
+        s_atlas_row_h = 0;
+    }
+    if (s_atlas_y + cell_h > CARD_ATLAS_H) {
+        s_atlas_full = true;
+        if (bitmap) stbtt_FreeBitmap(bitmap, NULL);
+        return NULL;
+    }
+
+    CardGlyph* glyph_entry = &s_glyphs[s_glyph_count++];
+    glyph_entry->codepoint = codepoint;
+    glyph_entry->px = px;
+    glyph_entry->glyph = glyph;
+    glyph_entry->atlas_x = s_atlas_x + 1;
+    glyph_entry->atlas_y = s_atlas_y + 1;
+    glyph_entry->width = width;
+    glyph_entry->height = height;
+    glyph_entry->offset_x = offset_x;
+    glyph_entry->offset_y = offset_y;
+    glyph_entry->advance = advance_units * em_scale;
+
+    if (bitmap && width > 0 && height > 0) {
+        for (int row = 0; row < height; row++) {
+            const unsigned char* src = bitmap + (size_t)row * width;
+            for (int col = 0; col < width; col++) {
+                uint8_t alpha = src[col];
+                uint8_t* dst = s_card_atlas + swizzled_offset(
+                    glyph_entry->atlas_x + col, glyph_entry->atlas_y + row);
+                // 3DS RGBA8 textures are stored in ABGR byte order.
+                dst[0] = alpha;
+                dst[1] = 255;
+                dst[2] = 255;
+                dst[3] = 255;
+            }
+        }
+        stbtt_FreeBitmap(bitmap, NULL);
+    } else if (bitmap) {
+        stbtt_FreeBitmap(bitmap, NULL);
+    }
+
+    if (cell_h > s_atlas_row_h) {
+        s_atlas_row_h = cell_h;
+    }
+    s_atlas_x += cell_w + 1;
+    s_atlas_dirty = true;
+    return glyph_entry;
+}
+
+static void commit_card_atlas(void) {
+    if (!s_card_atlas_ready || !s_atlas_dirty) return;
+    C3D_TexUpload(&s_card_atlas_tex, s_card_atlas);
+    C3D_TexFlush(&s_card_atlas_tex);
+    s_atlas_dirty = false;
+}
+
+void ui_prepare_card_text(float scale, const char* str) {
+    (void)ui_prepare_card_text_checked(scale, str);
+}
+
+bool ui_prepare_card_text_checked(float scale, const char* str) {
+    if (!s_font_loaded || !str) return true;
+    int px = card_font_px(scale);
+    const unsigned char* cursor = (const unsigned char*)str;
+    while (*cursor) {
+        uint32_t cp = utf8_next(&cursor);
+        if (!ensure_glyph(cp, px)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ui_commit_card_text(void) {
+    commit_card_atlas();
+}
+
+void ui_reset_card_text(void) {
+    reset_card_atlas();
+}
+
+bool ui_init(const void* font_data, size_t font_size) {
     if (s_initialized) return true;
 
     osSetSpeedupEnable(true);
@@ -60,7 +289,24 @@ bool ui_init(void) {
     // block of the Old 3DS linear heap.
     s_text_buf = C2D_TextBufNew(8192);
     s_measure_buf = C2D_TextBufNew(2048);
-    ensure_card_font();
+
+    int font_offset = -1;
+    if (font_data && font_size > 0) {
+        font_offset = stbtt_GetFontOffsetForIndex((const unsigned char*)font_data, 0);
+    }
+    s_font_loaded = font_offset >= 0 &&
+        stbtt_InitFont(&s_font, (const unsigned char*)font_data, font_offset);
+    if (s_font_loaded) {
+        s_card_atlas_ready = C3D_TexInit(&s_card_atlas_tex, CARD_ATLAS_W, CARD_ATLAS_H, GPU_RGBA8);
+        if (s_card_atlas_ready) {
+            C3D_TexSetFilter(&s_card_atlas_tex, GPU_LINEAR, GPU_LINEAR);
+            C3D_TexSetWrap(&s_card_atlas_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+            reset_card_atlas();
+            commit_card_atlas();
+        } else {
+            s_font_loaded = false;
+        }
+    }
 
     s_initialized = true;
     return true;
@@ -77,11 +323,14 @@ void ui_fini(void) {
         C2D_TextBufDelete(s_measure_buf);
         s_measure_buf = NULL;
     }
-    if (s_card_font) {
-        C2D_FontFree(s_card_font);
-        s_card_font = NULL;
+    if (s_card_atlas_ready) {
+        C3D_TexDelete(&s_card_atlas_tex);
+        s_card_atlas_ready = false;
     }
-    s_card_font_checked = false;
+    s_font_loaded = false;
+    s_glyph_count = 0;
+    s_atlas_dirty = false;
+    s_atlas_full = false;
 
     C2D_Fini();
     C3D_Fini();
@@ -149,40 +398,118 @@ float ui_get_text_width(float scale, const char* str) {
     return w;
 }
 
-void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic) {
+static void draw_system_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic) {
     if (!str || !str[0] || !s_text_buf) return;
-    ensure_card_font();
     C2D_Text text;
-    if (s_card_font) {
-        C2D_TextFontParse(&text, s_card_font, s_text_buf, str);
-    } else {
-        C2D_TextParse(&text, s_text_buf, str);
-    }
+    C2D_TextParse(&text, s_text_buf, str);
     C2D_TextOptimize(&text);
     C2D_DrawText(&text, C2D_WithColor, x, y, 0.6f, scale, scale, color);
     if (bold) {
         C2D_DrawText(&text, C2D_WithColor, x + 0.7f, y, 0.6f, scale, scale, color);
     }
     if (italic) {
-        // Citro2D's system font has no italic face. A faint offset keeps the
-        // emphasis visible without loading another font into memory.
-        C2D_DrawText(&text, C2D_WithColor, x + 0.9f, y + 0.4f, 0.6f, scale, scale, (color & 0x00ffffff) | 0xb0000000);
+        C2D_DrawText(&text, C2D_WithColor, x + 0.9f, y + 0.4f, 0.6f, scale, scale,
+                     (color & 0x00ffffff) | 0xb0000000);
+    }
+}
+
+static void draw_card_glyph(const CardGlyph* glyph, float x, float y, uint32_t color) {
+    if (!glyph || glyph->width <= 0 || glyph->height <= 0 || !s_card_atlas_ready) return;
+    Tex3DS_SubTexture subtexture = {
+        .width = (u16)glyph->width,
+        .height = (u16)glyph->height,
+        .left = (float)glyph->atlas_x / (float)CARD_ATLAS_W,
+        .top = 1.0f - (float)glyph->atlas_y / (float)CARD_ATLAS_H,
+        .right = (float)(glyph->atlas_x + glyph->width) / (float)CARD_ATLAS_W,
+        .bottom = 1.0f - (float)(glyph->atlas_y + glyph->height) / (float)CARD_ATLAS_H,
+    };
+    C2D_Image image = { .tex = &s_card_atlas_tex, .subtex = &subtexture };
+    C2D_ImageTint tint;
+    C2D_PlainImageTint(&tint, color, 1.0f);
+    C2D_DrawImageAt(image, x + glyph->offset_x, y + glyph->offset_y, 0.6f, &tint, 1.0f, 1.0f);
+}
+
+void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic) {
+    if (!str || !str[0]) return;
+    if (!s_font_loaded || !s_card_atlas_ready) {
+        draw_system_card_text(x, y, scale, color, str, bold, italic);
+        return;
+    }
+
+    int px = card_font_px(scale);
+    bool glyphs_ready = true;
+    const unsigned char* cursor = (const unsigned char*)str;
+    while (*cursor) {
+        uint32_t cp = utf8_next(&cursor);
+        if (!ensure_glyph(cp, px)) {
+            glyphs_ready = false;
+            break;
+        }
+    }
+    if (!glyphs_ready) {
+        draw_system_card_text(x, y, scale, color, str, bold, italic);
+        return;
+    }
+    commit_card_atlas();
+
+    float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
+    float baseline = y + CARD_FONT_BASELINE * (float)px;
+    float pen_x = x;
+    int previous_glyph = -1;
+    cursor = (const unsigned char*)str;
+    while (*cursor) {
+        uint32_t cp = utf8_next(&cursor);
+        int glyph_index = stbtt_FindGlyphIndex(&s_font, (int)cp);
+        if (previous_glyph >= 0) {
+            pen_x += stbtt_GetGlyphKernAdvance(&s_font, previous_glyph, glyph_index) * em_scale;
+        }
+        CardGlyph* glyph = find_glyph(cp, px);
+        if (glyph) {
+            draw_card_glyph(glyph, pen_x, baseline, color);
+            if (bold) {
+                draw_card_glyph(glyph, pen_x + 0.7f, baseline, color);
+            }
+            if (italic) {
+                draw_card_glyph(glyph, pen_x + 0.9f, baseline + 0.4f,
+                                (color & 0x00ffffff) | 0xb0000000);
+            }
+            pen_x += glyph->advance;
+        }
+        previous_glyph = glyph_index;
     }
 }
 
 float ui_get_card_text_width(float scale, const char* str) {
-    if (!str || !str[0] || !s_measure_buf) return 0.0f;
-    ensure_card_font();
-    C2D_TextBufClear(s_measure_buf);
-    C2D_Text text;
-    if (s_card_font) {
-        C2D_TextFontParse(&text, s_card_font, s_measure_buf, str);
-    } else {
+    if (!str || !str[0]) return 0.0f;
+    if (!s_font_loaded) {
+        if (!s_measure_buf) return 0.0f;
+        C2D_TextBufClear(s_measure_buf);
+        C2D_Text text;
         C2D_TextParse(&text, s_measure_buf, str);
+        float w = 0.0f, h = 0.0f;
+        C2D_TextGetDimensions(&text, scale, scale, &w, &h);
+        return w;
     }
-    float w = 0.0f, h = 0.0f;
-    C2D_TextGetDimensions(&text, scale, scale, &w, &h);
-    return w;
+
+    int px = card_font_px(scale);
+    float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
+    float width = 0.0f;
+    int previous_glyph = -1;
+    const unsigned char* cursor = (const unsigned char*)str;
+    while (*cursor) {
+        uint32_t cp = utf8_next(&cursor);
+        int glyph_index = stbtt_FindGlyphIndex(&s_font, (int)cp);
+        if (previous_glyph >= 0) {
+            width += stbtt_GetGlyphKernAdvance(&s_font, previous_glyph, glyph_index) * em_scale;
+        }
+        int advance = 0;
+        int lsb = 0;
+        stbtt_GetGlyphHMetrics(&s_font, glyph_index, &advance, &lsb);
+        (void)lsb;
+        width += advance * em_scale;
+        previous_glyph = glyph_index;
+    }
+    return width;
 }
 
 void ui_draw_text_centered(float x_center, float y, float scale, uint32_t color, const char* str) {

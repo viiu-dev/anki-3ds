@@ -170,6 +170,15 @@ struct RubyState {
     style: Style,
 }
 
+/// An inline-block span used by AJT-style Japanese pitch-accent markup.
+/// The visible text lives in one child span and an empty, absolutely
+/// positioned sibling draws the high-pitch line and optional downstep.
+#[derive(Clone, Copy, Debug)]
+struct SpanGroup {
+    wrapper: bool,
+    start: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BlockKind {
     #[default]
@@ -186,6 +195,7 @@ struct Parser {
     block_kind: BlockKind,
     styles: Vec<(String, Style)>,
     style: Style,
+    span_groups: Vec<SpanGroup>,
     cloze_depth: usize,
     lists: Vec<ListState>,
     ruby: Option<RubyState>,
@@ -412,16 +422,88 @@ impl Parser {
             _ => {
                 let attributes = parse_attributes(inner, name_end);
                 if closing {
+                    if name == "span" {
+                        self.span_groups.pop();
+                    }
                     self.pop_style(&name);
                 } else {
+                    if name == "span" {
+                        self.begin_span(&attributes);
+                    }
                     let mut delta = Style::default();
                     apply_tag_style(&name, &attributes, &mut delta);
                     if has_style_effect(&name, &attributes) {
                         let mut style = self.style.clone();
                         style.apply(&delta);
-                        self.styles.push((name, style.clone()));
+                        self.styles.push((name.clone(), style.clone()));
                         self.style = style;
                     }
+                    if self_closing && name == "span" {
+                        self.span_groups.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    fn begin_span(&mut self, attributes: &[(String, String)]) {
+        let wrapper = is_pitch_wrapper(attributes);
+        if is_pitch_overlay(attributes) {
+            self.apply_pitch_overlay(attributes);
+        }
+        let start = self.current.len();
+        self.span_groups.push(SpanGroup { wrapper, start });
+        if wrapper {
+            // Adjacent text runs with identical styles are normally merged to
+            // keep the tree small. Start the group with an empty run so text
+            // inside the wrapper cannot merge with mora before it.
+            self.current.push(Inline::Text {
+                text: String::new(),
+                style: self.style.clone(),
+            });
+        }
+    }
+
+    fn apply_pitch_overlay(&mut self, attributes: &[(String, String)]) {
+        let Some(css) = attribute(attributes, "style") else {
+            return;
+        };
+        let mut effect = Style::default();
+        apply_css(&mut effect, css);
+        let high = effect.pitch.high;
+        let downstep = effect.pitch.downstep;
+        let upstep = effect.pitch.upstep;
+        if !high && !downstep && !upstep {
+            return;
+        }
+        let Some(start) = self
+            .span_groups
+            .iter()
+            .rev()
+            .find(|group| group.wrapper)
+            .map(|group| group.start)
+        else {
+            return;
+        };
+        if start >= self.current.len() {
+            return;
+        }
+        let mut last_text = None;
+        for (offset, inline) in self.current[start..].iter_mut().enumerate() {
+            if let Some(style) = inline_style_mut(inline) {
+                if high {
+                    style.pitch.high = true;
+                }
+                if upstep {
+                    style.pitch.upstep = true;
+                }
+                last_text = Some(start + offset);
+            }
+        }
+        if downstep {
+            if let Some(index) = last_text {
+                if let Some(style) = inline_style_mut(&mut self.current[index]) {
+                    style.pitch.downstep = true;
                 }
             }
         }
@@ -776,6 +858,7 @@ fn parse_color(value: &str) -> Option<[u8; 3]> {
         "red" => [220, 40, 30],
         "green" => [30, 140, 50],
         "blue" => [30, 80, 210],
+        "royalblue" => [65, 105, 225],
         "yellow" => [255, 235, 60],
         "orange" => [235, 140, 30],
         "purple" => [130, 60, 170],
@@ -827,6 +910,53 @@ fn parse_attributes(inner: &str, name_end: usize) -> Vec<(String, String)> {
         }
     }
     attributes
+}
+
+fn attribute<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn inline_style_mut(inline: &mut Inline) -> Option<&mut Style> {
+    match inline {
+        Inline::Text { style, .. }
+        | Inline::Ruby { style, .. }
+        | Inline::PitchWord { style, .. } => Some(style),
+        Inline::Marker(_) | Inline::Break => None,
+    }
+}
+
+fn css_property<'a>(css: &'a str, name: &str) -> Option<&'a str> {
+    css.split(';').find_map(|declaration| {
+        let (key, value) = declaration.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim().trim_end_matches("!important").trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn is_pitch_wrapper(attributes: &[(String, String)]) -> bool {
+    let Some(css) = attribute(attributes, "style") else {
+        return false;
+    };
+    css_property(css, "display").is_some_and(|value| value.eq_ignore_ascii_case("inline-block"))
+        && css_property(css, "position").is_some_and(|value| value.eq_ignore_ascii_case("relative"))
+}
+
+fn is_pitch_overlay(attributes: &[(String, String)]) -> bool {
+    let Some(css) = attribute(attributes, "style") else {
+        return false;
+    };
+    if !css_property(css, "position").is_some_and(|value| value.eq_ignore_ascii_case("absolute")) {
+        return false;
+    }
+    let mut effect = Style::default();
+    apply_css(&mut effect, css);
+    effect.pitch.high || effect.pitch.downstep || effect.pitch.upstep
 }
 
 fn push_text_with_furigana(output: &mut Vec<Inline>, text: &str, style: Style) {
@@ -1337,6 +1467,78 @@ mod tests {
         assert!(!content
             .iter()
             .any(|inline| matches!(inline, Inline::Marker(_))));
+    }
+
+    #[test]
+    fn ajt_pitch_overlays_apply_to_the_preceding_group() {
+        fn runs(html: &str) -> Vec<(String, bool, bool, Option<[u8; 3]>)> {
+            let blocks = parse_html(html);
+            let Block::Paragraph(content) = &blocks[0] else {
+                panic!("expected paragraph");
+            };
+            content
+                .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Text { text, style } if !text.is_empty() => Some((
+                        text.clone(),
+                        style.pitch.high,
+                        style.pitch.downstep,
+                        style.color,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            runs(
+                r#"ワ<span style="display:inline-block;position:relative;"><span style="display:inline;">タシ</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;"></span></span>"#
+            ),
+            vec![
+                ("ワ".into(), false, false, None),
+                ("タシ".into(), true, false, None),
+            ]
+        );
+
+        assert_eq!(
+            runs(
+                r#"ア<span style="display:inline-block;position:relative;padding-right:0.1em;margin-right:0.1em;"><span style="display:inline;">ナ</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;right:-0.1em;height:0.4em;border-right-width:0.1em;border-right-style:solid;"></span></span>タ"#
+            ),
+            vec![
+                ("ア".into(), false, false, None),
+                ("ナ".into(), true, true, None),
+                ("タ".into(), false, false, None),
+            ]
+        );
+
+        assert_eq!(
+            runs(
+                r#"<span style="color: royalblue;">ス</span><span style="display:inline-block;position:relative;padding-right:0.1em;margin-right:0.1em;"><span style="display:inline;">キ</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;right:-0.1em;height:0.4em;border-right-width:0.1em;border-right-style:solid;"></span></span>"#
+            ),
+            vec![
+                ("ス".into(), false, false, Some([65, 105, 225])),
+                ("キ".into(), true, true, None),
+            ]
+        );
+
+        assert_eq!(
+            runs(
+                r#"ニ<span style="display:inline-block;position:relative;"><span style="display:inline;">ホンコ<span style="color: red;">°</span></span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;"></span></span>"#
+            ),
+            vec![
+                ("ニ".into(), false, false, None),
+                ("ホンコ".into(), true, false, None),
+                ("°".into(), true, false, Some([220, 40, 30])),
+            ]
+        );
+
+        assert_eq!(
+            runs(r#"ベ<span style="text-decoration:overline;">ンキョー</span>"#),
+            vec![
+                ("ベ".into(), false, false, None),
+                ("ンキョー".into(), true, false, None),
+            ]
+        );
     }
 
     #[test]

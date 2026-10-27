@@ -12,6 +12,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ui_renderer.c");
     println!("cargo:rerun-if-changed=src/clock.c");
     println!("cargo:rerun-if-changed=src/ui_renderer.h");
+    println!("cargo:rerun-if-changed=src/stb_truetype.h");
+    println!("cargo:rerun-if-changed=resources/NotoSansJP.ttf");
 
     let mut cc = cc::Build::new();
     cc.compiler(format!("{devkitarm}/bin/arm-none-eabi-gcc"))
