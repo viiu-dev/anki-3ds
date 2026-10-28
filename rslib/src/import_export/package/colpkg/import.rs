@@ -125,6 +125,9 @@ fn maybe_restore_media_file(
 }
 
 fn restore_media_file(meta: &Meta, zip_file: &mut ZipFile<File>, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
     let mut tempfile = new_tempfile_in_parent_of(path)?;
     let filename = PathBuf::from(zip_file.name()?.as_ref());
     meta.copy(zip_file, &mut tempfile)

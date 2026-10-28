@@ -53,9 +53,22 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
 - Settings → Log in: enter your AnkiWeb email and masked password once. Login
   checks authentication without uploading or downloading a collection. The saved
   login works after restarting. Settings → Log out removes it from this SD card.
-- Sync reuses the saved login, or asks for credentials when needed. B cancels;
-  START cancels and exits after cleanup. Full sync requires a direction when both
-  collections contain data, then asks twice before replacement.
+- Sync reuses the saved login, or asks for credentials when needed. The text
+  collection syncs first and returns to the deck list; media (images and audio)
+  continues in the background and can be studied while it runs. A small footer
+  shows the current file count, and Settings → Media sync shows the last result;
+  A there stops a running sync or starts a media-only sync. Failures remain
+  visible in Settings until the next attempt. Deck options, FSRS, leech rules and
+  buried/suspended state live in the collection database, so they sync both
+  ways. B cancels the collection sync; START cancels and exits after cleanup.
+  Full sync requires a direction when both collections contain data, then asks
+  twice before replacement.
+- Card images referenced by a card render on the top screen, scaled to fit with
+  their aspect ratio preserved and included in the vertical scroll. PNG, JPEG,
+  GIF, BMP, WebP and SVG are supported.
+- Card audio appears as tappable Audio buttons on the bottom screen; press L to
+  replay/cycle. Settings → Auto-play audio plays the first clip when a card is
+  revealed. MP3, Ogg Vorbis, Opus and WAV audio are decoded on the console.
 - SELECT opens a two-column Menu of the common review actions (Undo,
   Bury/Suspend, Edit/Add note, Browse, Sync, Statistics, deck options). Settings
   holds the preferences, account and help, so the whole menu fits one page.
@@ -86,9 +99,8 @@ A network error keeps the token; an upstream authentication rejection removes it
 and the next attempt asks for credentials. Two flushed slots preserve the previous
 login during replacement; physical SD power-loss durability is unverified.
 
-Media playback, media synchronization and full CSS layout are unsupported.
-Common inline formatting, lists, ruby/furigana and cloze highlights are
-rendered. SD removal and power-loss recovery remain
+Full CSS layout is unsupported. Common inline formatting, lists, ruby/furigana
+and cloze highlights are rendered. SD removal and power-loss recovery remain
 unverified; full download retains a `.pre-sync-*` backup before replacement.
 
 `emulator` is a development feature: it accepts `sync-test.json` for disposable

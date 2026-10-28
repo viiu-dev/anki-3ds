@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time;
 
-use anki_io::read_dir_files;
 use tracing::debug;
 
+use crate::media::files::combined_folder_mtime;
 use crate::media::files::filename_if_normalized;
-use crate::media::files::mtime_as_i64;
+use crate::media::files::media_file_entries;
 use crate::media::files::sha1_of_file;
 use crate::media::files::NONSYNCABLE_FILENAME;
 use crate::prelude::*;
@@ -53,10 +53,10 @@ where
         }
     }
 
-    pub(crate) fn register_changes(&mut self, ctx: &MediaDatabase) -> Result<()> {
+    pub(crate) fn register_changes(&mut self, ctx: &MediaDatabase) -> Result<Vec<String>> {
         ctx.transact(|ctx| {
             // folder mtime unchanged?
-            let dirmod = mtime_as_i64(self.media_folder)?;
+            let dirmod = combined_folder_mtime(self.media_folder)?;
 
             let mut meta = ctx.get_meta()?;
             debug!(
@@ -64,9 +64,11 @@ where
                 db_mod = meta.folder_mtime,
                 "begin change check"
             );
-            if dirmod == meta.folder_mtime {
+            // Horizon's FAT layer reports a zero directory mtime, so treat it
+            // as unavailable and scan instead of skipping every media change.
+            if dirmod != 0 && dirmod == meta.folder_mtime {
                 debug!("skip check");
-                return Ok(());
+                return Ok(Vec::new());
             } else {
                 meta.folder_mtime = dirmod;
             }
@@ -78,14 +80,14 @@ where
             let (changed, removed) = self.media_folder_changes(mtimes)?;
 
             self.add_updated_entries(ctx, changed)?;
-            self.remove_deleted_files(ctx, removed)?;
+            self.remove_deleted_files(ctx, &removed)?;
 
             ctx.set_meta(&meta)?;
 
             // unconditional fire at end of op for accurate counts
             self.fire_progress_cb()?;
 
-            Ok(())
+            Ok(removed)
         })
     }
 
@@ -98,18 +100,11 @@ where
         let mut added_or_changed = vec![];
 
         // loop through on-disk files
-        for dentry in read_dir_files(self.media_folder)? {
-            let dentry = dentry?;
-
-            // if the filename is not valid unicode, skip it
-            let fname_os = dentry.file_name();
-            let disk_fname = match fname_os.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
+        for (disk_fname, disk_path) in media_file_entries(self.media_folder)? {
+            self.fire_progress_cb()?;
 
             // make sure the filename is normalized
-            let fname = match filename_if_normalized(disk_fname) {
+            let fname = match filename_if_normalized(&disk_fname) {
                 Some(fname) => fname,
                 None => {
                     // not normalized; skip it
@@ -124,7 +119,7 @@ where
             }
 
             // ignore large files and zero byte files
-            let metadata = dentry.metadata()?;
+            let metadata = disk_path.metadata()?;
             if metadata.len() > MAX_INDIVIDUAL_MEDIA_FILE_SIZE as u64 {
                 continue;
             }
@@ -149,7 +144,7 @@ where
             }
 
             // add entry to the list
-            let data = sha1_of_file(&dentry.path())?;
+            let data = sha1_of_file(&disk_path)?;
             let sha1 = Some(data);
             added_or_changed.push(FilesystemEntry {
                 fname: fname.to_string(),
@@ -167,6 +162,7 @@ where
             self.checked += 1;
             if self.checked % 10 == 0 {
                 self.fire_progress_cb()?;
+                std::thread::yield_now();
             }
         }
 
@@ -210,6 +206,7 @@ where
             self.checked += 1;
             if self.checked % 10 == 0 {
                 self.fire_progress_cb()?;
+                std::thread::yield_now();
             }
         }
 
@@ -217,10 +214,10 @@ where
     }
 
     /// Remove deleted files from the media DB.
-    fn remove_deleted_files(&mut self, ctx: &MediaDatabase, removed: Vec<String>) -> Result<()> {
+    fn remove_deleted_files(&mut self, ctx: &MediaDatabase, removed: &[String]) -> Result<()> {
         for fname in removed {
             ctx.set_entry(&MediaEntry {
-                fname,
+                fname: fname.clone(),
                 sha1: None,
                 mtime: 0,
                 sync_required: true,
@@ -229,6 +226,7 @@ where
             self.checked += 1;
             if self.checked % 10 == 0 {
                 self.fire_progress_cb()?;
+                std::thread::yield_now();
             }
         }
 

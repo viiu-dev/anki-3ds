@@ -6,6 +6,8 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
 use super::i18n::tr;
 use super::review_text::Block;
@@ -24,9 +26,8 @@ const CARD_LINE_HEIGHT: f32 = 19.0;
 // readings stay legible at the 3DS's small bitmap glyph sizes.
 const CARD_RUBY_SCALE: f32 = 0.78;
 const CARD_RUBY_HEIGHT: f32 = 14.0;
-const CARD_BLOCK_GAP: f32 = 6.0;
-const CARD_SECTION_GAP: f32 = 13.0;
-const CARD_SECTION_RULE_HEIGHT: f32 = 9.0;
+const CARD_BLOCK_GAP: f32 = 4.0;
+const CARD_SECTION_GAP: f32 = 5.0;
 const CARD_LIST_GAP: f32 = 2.0;
 const CARD_Y_PADDING: f32 = 8.0;
 const CARD_RULE_HEIGHT: f32 = 12.0;
@@ -91,10 +92,22 @@ extern "C" {
         bold: bool,
         italic: bool,
     );
+    fn ui_draw_triangle(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, color: u32);
     fn ui_get_card_text_width(scale: f32, str: *const c_char) -> f32;
     fn ui_prepare_card_text_checked(scale: f32, str: *const c_char) -> bool;
     fn ui_commit_card_text();
     fn ui_reset_card_text();
+    fn ui_media_image(path: *const c_char, width: *mut c_int, height: *mut c_int) -> c_int;
+    fn ui_media_refresh();
+    fn ui_media_draw(id: c_int, x: f32, y: f32, w: f32, h: f32);
+    fn ui_media_prefetch(path: *const c_char) -> bool;
+    fn ui_media_prefetch_clear();
+    fn ui_audio_play(path: *const c_char) -> bool;
+    fn ui_audio_decode(path: *const c_char) -> bool;
+    fn ui_audio_prefetch(path: *const c_char) -> bool;
+    fn ui_audio_prefetch_clear();
+    fn ui_audio_stop();
+    fn ui_audio_is_playing() -> bool;
     fn ui_draw_status_compact(x_right: f32, y: f32, scale: f32);
     fn ui_draw_scroll_indicator(x_right: f32, y: f32, w: f32, h: f32, scroll: f32, max_scroll: f32);
 
@@ -271,6 +284,10 @@ impl Ui {
         unsafe { ui_draw_line(x0, y0, x1, y1, thickness, color) }
     }
 
+    pub fn draw_triangle(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, color: u32) {
+        unsafe { ui_draw_triangle(x0, y0, x1, y1, x2, y2, color) }
+    }
+
     pub fn draw_text(x: f32, y: f32, scale: f32, color: u32, s: &str) {
         if let Ok(c_str) = CString::new(display_text(s).as_bytes()) {
             unsafe { ui_draw_text(x, y, scale, color, c_str.as_ptr()) }
@@ -333,6 +350,120 @@ impl Ui {
 
     pub fn reset_card_text() {
         unsafe { ui_reset_card_text() }
+    }
+
+    pub fn media_image(path: &str) -> ImageLoad {
+        let Some(_guard) = try_lock_codec() else {
+            return ImageLoad::Busy;
+        };
+        if let Some(found) = Self::media_image_locked(path) {
+            return ImageLoad::Ready(found.0, found.1, found.2);
+        }
+        fallback_media_path(path)
+            .and_then(|root| Self::media_image_locked(&root))
+            .map_or(ImageLoad::Missing, |(id, width, height)| {
+                ImageLoad::Ready(id, width, height)
+            })
+    }
+
+    fn media_image_locked(path: &str) -> Option<(i32, i32, i32)> {
+        let c_str = CString::new(path.as_bytes()).ok()?;
+        let mut width = 0;
+        let mut height = 0;
+        let id = unsafe { ui_media_image(c_str.as_ptr(), &mut width, &mut height) };
+        (id >= 0).then_some((id, width, height))
+    }
+
+    pub fn media_draw(id: i32, x: f32, y: f32, w: f32, h: f32) {
+        unsafe { ui_media_draw(id, x, y, w, h) }
+    }
+
+    pub fn media_prefetch(path: &str) -> bool {
+        let _guard = lock_codec();
+        if Self::media_prefetch_locked(path) {
+            return true;
+        }
+        fallback_media_path(path).is_some_and(|root| Self::media_prefetch_locked(&root))
+    }
+
+    fn media_prefetch_locked(path: &str) -> bool {
+        CString::new(path.as_bytes())
+            .map(|c_str| unsafe { ui_media_prefetch(c_str.as_ptr()) })
+            .unwrap_or(false)
+    }
+
+    pub fn media_prefetch_clear() {
+        let _guard = lock_codec();
+        unsafe { ui_media_prefetch_clear() }
+    }
+
+    /// Forget cached "file is missing" results after background media sync
+    /// has written new files.
+    pub fn media_refresh() {
+        unsafe { ui_media_refresh() }
+    }
+
+    pub fn audio_play(path: &str) -> AudioAttempt {
+        let Some(_guard) = try_lock_codec() else {
+            return AudioAttempt::Busy;
+        };
+        if Self::audio_play_locked(path) {
+            return AudioAttempt::Done(true);
+        }
+        AudioAttempt::Done(
+            fallback_media_path(path).is_some_and(|root| Self::audio_play_locked(&root)),
+        )
+    }
+
+    fn audio_play_locked(path: &str) -> bool {
+        CString::new(path.as_bytes())
+            .map(|c_str| unsafe { ui_audio_play(c_str.as_ptr()) })
+            .unwrap_or(false)
+    }
+
+    pub fn audio_decode(path: &str) -> AudioAttempt {
+        let Some(_guard) = try_lock_codec() else {
+            return AudioAttempt::Busy;
+        };
+        if Self::audio_decode_locked(path) {
+            return AudioAttempt::Done(true);
+        }
+        AudioAttempt::Done(
+            fallback_media_path(path).is_some_and(|root| Self::audio_decode_locked(&root)),
+        )
+    }
+
+    fn audio_decode_locked(path: &str) -> bool {
+        CString::new(path.as_bytes())
+            .map(|c_str| unsafe { ui_audio_decode(c_str.as_ptr()) })
+            .unwrap_or(false)
+    }
+
+    pub fn audio_prefetch(path: &str) -> bool {
+        let _guard = lock_codec();
+        if Self::audio_prefetch_locked(path) {
+            return true;
+        }
+        fallback_media_path(path).is_some_and(|root| Self::audio_prefetch_locked(&root))
+    }
+
+    fn audio_prefetch_locked(path: &str) -> bool {
+        CString::new(path.as_bytes())
+            .map(|c_str| unsafe { ui_audio_prefetch(c_str.as_ptr()) })
+            .unwrap_or(false)
+    }
+
+    pub fn audio_prefetch_clear() {
+        let _guard = lock_codec();
+        unsafe { ui_audio_prefetch_clear() }
+    }
+
+    pub fn audio_stop() {
+        unsafe { ui_audio_stop() }
+    }
+
+    pub fn audio_is_playing() -> bool {
+        unsafe { ui_audio_is_playing() }
     }
 
     pub fn draw_status_compact(x_right: f32, y: f32, scale: f32) {
@@ -496,23 +627,76 @@ struct CardMetrics {
     content_left: f32,
 }
 
+struct CardImage {
+    texture: i32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+const MEDIA_IMAGE_SLOTS: usize = 8;
+
+fn image_name(path: &str) -> &str {
+    path.rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(path)
+}
+
+static CODEC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock_codec() -> std::sync::MutexGuard<'static, ()> {
+    CODEC_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn try_lock_codec() -> Option<std::sync::MutexGuard<'static, ()>> {
+    CODEC_LOCK.try_lock().ok()
+}
+
+pub enum ImageLoad {
+    Ready(i32, i32, i32),
+    Missing,
+    Busy,
+}
+
+pub enum AudioAttempt {
+    Done(bool),
+    Busy,
+}
+
+fn fallback_media_path(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let root = format!("{}/{name}", super::backend::MEDIA_DIR);
+    (root != path).then_some(root)
+}
+
 /// Cached rich-card layout. HTML is parsed and measured only when the card or
 /// the selected font scale changes; drawing then uses the cached lines.
 #[derive(Default)]
 pub struct RichTextLayout {
     html: String,
+    image_paths: Vec<String>,
     width: f32,
     font_scale: f32,
     lines: Vec<CardLine>,
+    images: Vec<CardImage>,
     content_height: f32,
     ready: bool,
 }
 
 impl RichTextLayout {
-    pub fn set_text(&mut self, html: &str, width: f32, font_scale: f32) {
+    /// Discard the measured layout so the next `set_text` call re-reads media
+    /// that background sync has just written.
+    pub fn invalidate(&mut self) {
+        self.ready = false;
+    }
+
+    pub fn set_text(&mut self, html: &str, images: &[String], width: f32, font_scale: f32) {
         let font_scale = font_scale.clamp(0.5, 2.5);
         if self.ready
             && self.html == html
+            && self.image_paths == images
             && (self.width - width).abs() < 0.01
             && (self.font_scale - font_scale).abs() < 0.001
         {
@@ -520,6 +704,9 @@ impl RichTextLayout {
         }
         self.html.clear();
         self.html.push_str(html);
+        self.image_paths.clear();
+        self.image_paths.extend(images.iter().cloned());
+        self.images.clear();
         self.width = width;
         self.font_scale = font_scale;
 
@@ -527,7 +714,6 @@ impl RichTextLayout {
         let nominal = CARD_LINE_HEIGHT * font_scale;
         let block_gap = CARD_BLOCK_GAP * font_scale;
         let section_gap = CARD_SECTION_GAP * font_scale;
-        let section_rule_height = CARD_SECTION_RULE_HEIGHT * font_scale;
         let list_gap = CARD_LIST_GAP * font_scale;
         let rule_height = CARD_RULE_HEIGHT * font_scale;
         let mut lines = Vec::new();
@@ -579,20 +765,6 @@ impl RichTextLayout {
                 }
                 Block::Section(content) => {
                     cursor += between;
-                    if !first && !lines.last().is_some_and(|line| line.rule) {
-                        lines.push(CardLine {
-                            top: cursor,
-                            height: section_rule_height,
-                            ruby_height: 0.0,
-                            upper: 0.0,
-                            width,
-                            pitch_height: 0.0,
-                            marker: None,
-                            pieces: Vec::new(),
-                            rule: true,
-                        });
-                        cursor += section_rule_height;
-                    }
                     let block_scale = if first {
                         headword_multiplier(&content)
                     } else {
@@ -625,9 +797,48 @@ impl RichTextLayout {
             }
             first = false;
         }
+        let max_width = (width - 8.0).max(32.0);
+        let max_height = TOP_HEIGHT - 60.0;
+        let mut busy = false;
+        for path in images {
+            if self.images.len() >= MEDIA_IMAGE_SLOTS {
+                break;
+            }
+            let (texture, image_w, image_h) = match Ui::media_image(path) {
+                ImageLoad::Ready(texture, image_w, image_h) => (texture, image_w, image_h),
+                ImageLoad::Missing => {
+                    let diag = super::media_diag(path);
+                    super::log_media_once(
+                        &format!("image|{path}|{diag}"),
+                        &format!("IMAGE load fail file={} {diag}", image_name(path)),
+                    );
+                    continue;
+                }
+                ImageLoad::Busy => {
+                    busy = true;
+                    continue;
+                }
+            };
+            if image_w <= 0 || image_h <= 0 {
+                continue;
+            }
+            let scale = (max_width / image_w as f32)
+                .min(max_height / image_h as f32)
+                .min(4.0);
+            let draw_w = image_w as f32 * scale;
+            let draw_h = image_h as f32 * scale;
+            cursor += CARD_BLOCK_GAP * font_scale;
+            self.images.push(CardImage {
+                texture,
+                top: cursor,
+                width: draw_w,
+                height: draw_h,
+            });
+            cursor += draw_h;
+        }
         self.content_height = cursor;
         self.lines = lines;
-        self.ready = true;
+        self.ready = !busy;
     }
 
     pub fn max_scroll(&self) -> f32 {
@@ -635,7 +846,7 @@ impl RichTextLayout {
     }
 
     pub fn draw(&self, scroll: f32) {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() && self.images.is_empty() {
             return;
         }
         let total = self.content_height + 2.0 * CARD_Y_PADDING;
@@ -801,6 +1012,14 @@ impl RichTextLayout {
                     );
                 }
             }
+        }
+        for image in &self.images {
+            let top = origin + image.top;
+            if top > TOP_HEIGHT || top + image.height < 0.0 {
+                continue;
+            }
+            let x = (TOP_WIDTH - image.width) / 2.0;
+            Ui::media_draw(image.texture, x, top, image.width, image.height);
         }
     }
 

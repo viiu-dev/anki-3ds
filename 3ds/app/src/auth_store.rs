@@ -97,7 +97,11 @@ fn read(directory: &Path) -> io::Result<Option<(usize, SavedAuth)>> {
 }
 
 pub fn load(directory: &Path) -> io::Result<Option<SyncAuth>> {
-    read(directory)?.map(|(_, saved)| saved.auth()).transpose()
+    match read(directory) {
+        Ok(previous) => previous.map(|(_, saved)| saved.auth()).transpose(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn save(directory: &Path, auth: &SyncAuth) -> io::Result<()> {
@@ -201,14 +205,14 @@ mod tests {
         assert!(clear(path).is_err());
     }
     #[test]
-    fn corrupt_slot_recovers_and_errors_do_not_echo_secrets() {
+    fn corrupt_slots_fall_back_to_logged_out() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path();
         save(path, &auth("valid")).unwrap();
         fs::write(path.join(SLOTS[1]), b"private malformed data").unwrap();
         assert_eq!(load(path).unwrap().unwrap().hkey, "valid");
         fs::write(path.join(SLOTS[0]), b"private malformed data").unwrap();
-        assert!(!load(path).err().unwrap().to_string().contains("private"));
+        assert!(load(path).unwrap().is_none());
         save(path, &auth("new")).unwrap();
         assert_eq!(load(path).unwrap().unwrap().hkey, "new");
     }

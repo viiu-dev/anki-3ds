@@ -25,6 +25,10 @@ pub struct NativeSoc {
     layout: Layout,
 }
 
+// The buffer is only handed to socInit/socExit; ownership is moved between
+// threads, never shared.
+unsafe impl Send for NativeSoc {}
+
 impl NativeSoc {
     pub fn new() -> io::Result<Self> {
         if SOC_ACTIVE

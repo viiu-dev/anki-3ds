@@ -40,7 +40,7 @@ pub struct ThrottlingProgressHandler<P: Into<Progress> + Default> {
 }
 
 impl<P: Into<Progress> + Default + Clone> ThrottlingProgressHandler<P> {
-    pub(crate) fn new(shared_state: Arc<Mutex<ProgressState>>) -> Self {
+    pub fn new(shared_state: Arc<Mutex<ProgressState>>) -> Self {
         let initial = P::default();
         {
             let mut guard = shared_state.lock().unwrap();

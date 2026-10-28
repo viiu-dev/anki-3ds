@@ -11,6 +11,7 @@ use tempfile::tempdir;
 
 use crate::collection::CollectionBuilder;
 use crate::import_export::package::import_colpkg;
+use crate::media::files::locate_existing;
 use crate::media::MediaManager;
 use crate::prelude::*;
 
@@ -67,9 +68,18 @@ fn roundtrip() -> Result<()> {
             1
         );
         // confirm media imported correctly
-        assert_eq!(read_file(import_media_dir.join("1"))?, b"1");
-        assert_eq!(read_file(import_media_dir.join("2"))?, b"2");
-        assert_eq!(read_file(import_media_dir.join("3"))?, b"3");
+        assert_eq!(
+            read_file(locate_existing(&import_media_dir, "1").unwrap())?,
+            b"1"
+        );
+        assert_eq!(
+            read_file(locate_existing(&import_media_dir, "2").unwrap())?,
+            b"2"
+        );
+        assert_eq!(
+            read_file(locate_existing(&import_media_dir, "3").unwrap())?,
+            b"3"
+        );
     }
 
     Ok(())

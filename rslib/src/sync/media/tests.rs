@@ -13,6 +13,9 @@ use reqwest::multipart;
 use reqwest::Client;
 
 use crate::error::Result;
+use crate::media::files::locate_existing;
+use crate::media::files::media_file_count;
+use crate::media::files::MediaNameIndex;
 use crate::media::MediaManager;
 use crate::prelude::AnkiError;
 use crate::progress::ThrottlingProgressHandler;
@@ -109,7 +112,7 @@ async fn sanity_check() -> Result<()> {
         let media1 = ctx.media1();
         ctx.sync_media1().await?;
         // may be non-zero when testing on external endpoint
-        let starting_file_count = fs::read_dir(&media1.media_folder).unwrap().count() as u32;
+        let starting_file_count = media_file_count(&media1.media_folder).unwrap() as u32;
         let resp = client
             .media_sanity_check(
                 SanityCheckRequest {
@@ -179,7 +182,7 @@ async fn media_roundtrip() -> Result<()> {
         ctx.sync_media2().await?;
         ctx.sleep();
         // may be non-zero when testing on external endpoint
-        let starting_file_count = fs::read_dir(&media1.media_folder).unwrap().count();
+        let starting_file_count = media_file_count(&media1.media_folder).unwrap();
         // add some files
         fs::write(media1.media_folder.join("manual1"), "manual1").unwrap();
         media1.add_file("auto1", b"auto1").unwrap();
@@ -189,27 +192,31 @@ async fn media_roundtrip() -> Result<()> {
         ctx.sync_media2().await?;
         // modify a file and remove the other
         ctx.sleep();
-        fs::write(media2.media_folder.join("manual1"), "changed1").unwrap();
-        fs::remove_file(media2.media_folder.join("manual2")).unwrap();
+        let manual1 =
+            locate_existing(&media2.media_folder, "manual1").expect("synced file on disk");
+        fs::write(&manual1, "changed1").unwrap();
+        let manual2 =
+            locate_existing(&media2.media_folder, "manual2").expect("synced file on disk");
+        fs::remove_file(&manual2).unwrap();
         ctx.sync_media2().await?;
         ctx.sync_media1().await?;
         assert_eq!(
-            fs::read_to_string(media1.media_folder.join("manual1")).unwrap(),
+            fs::read_to_string(locate_existing(&media1.media_folder, "manual1").unwrap()).unwrap(),
             "changed1"
         );
         // remove remaining files
         ctx.sleep();
-        fs::remove_file(media1.media_folder.join("manual1")).unwrap();
-        fs::remove_file(media2.media_folder.join("auto1")).unwrap();
+        fs::remove_file(locate_existing(&media1.media_folder, "manual1").unwrap()).unwrap();
+        fs::remove_file(locate_existing(&media2.media_folder, "auto1").unwrap()).unwrap();
         ctx.sync_media1().await?;
         ctx.sync_media2().await?;
         ctx.sync_media1().await?;
         assert_eq!(
-            fs::read_dir(media1.media_folder).unwrap().count(),
+            media_file_count(&media1.media_folder).unwrap(),
             starting_file_count
         );
         assert_eq!(
-            fs::read_dir(media2.media_folder).unwrap().count(),
+            media_file_count(&media2.media_folder).unwrap(),
             starting_file_count
         );
         Ok(())
@@ -281,13 +288,58 @@ async fn parallel_requests() -> Result<()> {
         ctx.sync_media1().await?;
         ctx.sync_media2().await?;
         assert_eq!(
-            fs::read_to_string(media1.media_folder.join("diff")).unwrap(),
+            fs::read_to_string(locate_existing(&media1.media_folder, "diff").unwrap()).unwrap(),
             "1"
         );
         assert_eq!(
-            fs::read_to_string(media2.media_folder.join("diff")).unwrap(),
+            fs::read_to_string(locate_existing(&media2.media_folder, "diff").unwrap()).unwrap(),
             "1"
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn media_index_tracks_worker_changes() -> Result<()> {
+    with_active_server(|client| async move {
+        let ctx = SyncTestContext::new(client.clone());
+        let media2 = ctx.media2();
+        let index = MediaNameIndex::new();
+        ctx.sleep();
+        // file uploaded by the other client arrives as a download
+        media2.add_file("indexed", b"indexed").unwrap();
+        ctx.sync_media2().await?;
+        let media1 = ctx.media1();
+        let mut syncer = MediaSyncer::new(media1, ignore_progress(), client.clone()).unwrap();
+        syncer.set_index(Some(index.clone()));
+        syncer.set_parallel_downloads(false);
+        syncer.sync(None).await?;
+        assert!(index.contains("indexed"));
+        assert!(!index.is_unmigrated("indexed"));
+        // file deleted on the other client is dropped from the index
+        let gone = locate_existing(&media2.media_folder, "indexed").expect("synced file on disk");
+        fs::remove_file(&gone).unwrap();
+        ctx.sync_media2().await?;
+        let media1 = ctx.media1();
+        let mut syncer = MediaSyncer::new(media1, ignore_progress(), client.clone()).unwrap();
+        syncer.set_index(Some(index.clone()));
+        syncer.set_parallel_downloads(false);
+        syncer.sync(None).await?;
+        assert!(!index.contains("indexed"));
+        assert!(locate_existing(&ctx.media1().media_folder, "indexed").is_none());
+        // files moved into shards by migration stay indexed but lose the
+        // unmigrated marker
+        let media1 = ctx.media1();
+        fs::write(media1.media_folder.join("migrated"), "migrated").unwrap();
+        index.insert("migrated", true);
+        let mut keep_going = || true;
+        for fname in media1.migrate_to_shards(&mut keep_going).unwrap() {
+            index.mark_migrated(&fname);
+        }
+        assert!(index.contains("migrated"));
+        assert!(!index.is_unmigrated("migrated"));
+        assert!(locate_existing(&media1.media_folder, "migrated").is_some());
         Ok(())
     })
     .await

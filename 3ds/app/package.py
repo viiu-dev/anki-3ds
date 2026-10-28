@@ -60,6 +60,8 @@ files = {
     "licenses/curl.txt": root / "out/3ds/https-sources/curl-8.22.0/COPYING",
     "licenses/mbedtls.txt": root / "out/3ds/https-sources/mbedtls-3.6.7/LICENSE",
     "licenses/NotoSansJP-OFL.txt": root / "3ds/app/resources/licenses/NotoSansJP-OFL.txt",
+    "licenses/libwebp.txt": root / "3ds/third_party/libwebp/COPYING",
+    "licenses/nanosvg.txt": root / "3ds/third_party/nanosvg/LICENSE.txt",
     "manifest.json": out / "manifest.json",
 }
 destination = out / f"anki-3ds-{version}.zip"

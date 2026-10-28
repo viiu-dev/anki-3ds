@@ -1,6 +1,7 @@
 // Copyright: Anki 3DS contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use anki::collection::Collection;
@@ -28,6 +29,8 @@ use regex::Regex;
 use super::i18n::tr;
 
 pub const PATH: &str = "sdmc:/3ds/anki-3ds/prototype.anki2";
+pub const MEDIA_DIR: &str = "sdmc:/3ds/anki-3ds/prototype.media";
+pub const MEDIA_DB: &str = "sdmc:/3ds/anki-3ds/prototype.mdb";
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Standard Anki templates mark the boundary after the repeated FrontSide.
@@ -42,6 +45,14 @@ static ANSWER_DIVIDER: LazyLock<Regex> = LazyLock::new(|| {
 /// console needs because `strip_html` deletes tags instead of spacing them.
 /// Review cards use the rich renderer, but Browse previews still use this
 /// plain-text conversion.
+static IMG_SRC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<img\b[^>]*?\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
+        .expect("static img-src pattern")
+});
+
+static SOUND_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)\[sound:([^\]]+)\]").expect("static sound-tag pattern"));
+
 static LINE_BREAKS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?xsi)
@@ -60,7 +71,159 @@ static LINE_BREAKS: LazyLock<Regex> = LazyLock::new(|| {
 
 pub struct Backend {
     collection: Collection,
+    media_index: std::sync::Arc<anki::media::files::MediaNameIndex>,
 }
+#[derive(Clone)]
+pub struct MediaRef {
+    pub filename: String,
+    pub audio: bool,
+}
+
+impl MediaRef {
+    pub fn path(&self) -> String {
+        anki::media::files::sharded_path(std::path::Path::new(MEDIA_DIR), &self.filename)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "ogg", "oga", "opus", "wav", "wave"];
+
+fn is_audio_file(filename: &str) -> bool {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    AUDIO_EXTENSIONS.contains(&ext.as_str())
+}
+
+fn media_names(field: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for captures in IMG_SRC.captures_iter(field) {
+        if let Some(src) = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .or_else(|| captures.get(3))
+        {
+            let src = src.as_str();
+            if !src.starts_with("data:") && !src.contains("://") {
+                if let Some(name) = clean_media_ref(src) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    for captures in SOUND_TAG.captures_iter(field) {
+        if let Some(name) = captures.get(1).and_then(|m| clean_media_ref(m.as_str())) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Turn a media reference from rendered HTML into the filename on disk:
+/// HTML entities and percent escapes decoded, path stripped to its last part.
+fn clean_media_ref(raw: &str) -> Option<String> {
+    let decoded = super::review_text::decode_entities(raw);
+    let decoded = percent_decode(&decoded);
+    let name = decoded
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(decoded.as_str())
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    if name.is_empty() {
+        return None;
+    }
+    let normalized = anki::media::files::normalize_filename(name).into_owned();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push(hi * 16 + lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn clear_stale_locks() {
+    static CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CLEARED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    for path in [PATH, MEDIA_DB] {
+        let lock = format!("{path}.lock");
+        match std::fs::remove_dir_all(&lock) {
+            Ok(()) => super::event(&format!("STALE_LOCK_CLEARED {lock}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => super::event(&format!("STALE_LOCK_ERROR {lock}: {error}")),
+        }
+    }
+}
+
+pub fn media_db_recoverable(error: &anki::error::AnkiError) -> bool {
+    let anki::error::AnkiError::DbError { source } = error else {
+        return false;
+    };
+    let info = source.info.as_str();
+    info.contains("extended_code: 266")
+        || info.contains("SystemIoFailure")
+        || info.contains("DatabaseCorrupt")
+        || info.contains("NotADatabase")
+}
+
+pub fn reset_media_db() {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let path = format!("{MEDIA_DB}{suffix}");
+        match std::fs::remove_file(&path) {
+            Ok(()) => super::event(&format!("MEDIA_DB_REMOVED {path}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => super::event(&format!("MEDIA_DB_REMOVE_ERROR {path}: {error}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(format!("{MEDIA_DB}.lock"));
+}
+
+pub fn open_media_manager() -> std::result::Result<anki::media::MediaManager, String> {
+    match anki::media::MediaManager::new(MEDIA_DIR, MEDIA_DB) {
+        Ok(manager) => Ok(manager),
+        Err(error) if media_db_recoverable(&error) => {
+            super::event(&format!("MEDIA_DB_RESET {}", super::error_text(&error)));
+            reset_media_db();
+            anki::media::MediaManager::new(MEDIA_DIR, MEDIA_DB)
+                .map_err(|error| super::error_text(&error))
+        }
+        Err(error) => Err(super::error_text(&error)),
+    }
+}
+
 pub struct OfferedCard {
     queued: QueuedCard,
     pub id: i64,
@@ -68,6 +231,8 @@ pub struct OfferedCard {
     pub question_html: String,
     pub answer_html: String,
     pub cloze_answer_html: Option<String>,
+    pub question_media: Vec<MediaRef>,
+    pub answer_media: Vec<MediaRef>,
     pub new_count: u32,
     pub learn_count: u32,
     pub review_count: u32,
@@ -78,15 +243,34 @@ impl Backend {
     pub fn open_with_progress(
         progress: std::sync::Arc<std::sync::Mutex<anki::progress::ProgressState>>,
     ) -> Result<Self> {
+        clear_stale_locks();
         anki_3ds_sync_transport::storage::recover(std::path::Path::new(PATH))?;
         anki_3ds_sqlite_vfs::register().map_err(|code| format!("VFS: {code}"))?;
         let mut collection = CollectionBuilder::new(PATH)
+            .set_media_paths(MEDIA_DIR, MEDIA_DB)
             .set_shared_progress_state(progress)
             .set_tr(anki::prelude::I18n::new(&[super::i18n::language()]))
             .set_check_integrity(true)
             .build()?;
         collection.set_configured_utc_offset(-super::clock::offset())?;
-        Ok(Self { collection })
+        if super::media_sync::worker_active() {
+            super::event("MEDIA_INIT_SKIPPED worker_active");
+        } else if let Err(error) = open_media_manager() {
+            super::event(&format!("MEDIA_INIT_ERROR {error}"));
+        }
+        let media_index = anki::media::files::MediaNameIndex::new();
+        if let Ok(entries) = anki::media::files::media_file_entries(std::path::Path::new(MEDIA_DIR))
+        {
+            let root = std::path::Path::new(MEDIA_DIR);
+            for (fname, path) in entries {
+                media_index.insert(&fname, path.parent() == Some(root));
+            }
+        }
+        super::event(&format!("MEDIA_INDEX {}", media_index.len()));
+        Ok(Self {
+            collection,
+            media_index,
+        })
     }
 
     pub fn sync(
@@ -118,12 +302,23 @@ impl Backend {
             }
             Mode::Normal => {
                 let output = block_on(self.collection.normal_sync_with_client(client));
-                let result = output.map(|o| {
-                    if let (Some(endpoint),Some(auth))=(o.new_endpoint,auth.as_mut()) {auth.endpoint=ammonia::Url::parse(&endpoint).ok();}
-                    match o.required {
-                    anki::sync::collection::normal::SyncActionRequired::FullSyncRequired {upload_ok,download_ok} => Outcome::FullRequired {upload_ok,download_ok},
-                    _ => Outcome::Complete,
-                }}).map_err(|e| -> Box<dyn std::error::Error> {Box::new(e)});
+                let result = output
+                    .map(|o| {
+                        if let (Some(endpoint), Some(auth)) = (o.new_endpoint, auth.as_mut()) {
+                            auth.endpoint = ammonia::Url::parse(&endpoint).ok();
+                        }
+                        match o.required {
+                            anki::sync::collection::normal::SyncActionRequired::FullSyncRequired {
+                                upload_ok,
+                                download_ok,
+                            } => Outcome::FullRequired {
+                                upload_ok,
+                                download_ok,
+                            },
+                            _ => Outcome::Complete,
+                        }
+                    })
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
                 return (Some(self), result);
             }
             Mode::Upload => block_on(self.collection.full_upload_with_client(client)),
@@ -132,10 +327,103 @@ impl Backend {
         let result = result
             .map(|_| Outcome::Complete)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
-        match Self::open_with_progress(progress) {
+        match Self::open_with_progress(progress.clone()) {
             Ok(backend) => (Some(backend), result),
             Err(e) => (None, Err(e)),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn media_manager(&self) -> Result<anki::media::MediaManager> {
+        self.collection
+            .media()
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+    }
+
+    /// Media filenames referenced by cards that are queued for study today,
+    /// so background sync can fetch them before the rest of the deck's media.
+    pub fn priority_media(&mut self, limit: usize) -> Vec<String> {
+        let Ok(queued) = SchedulerService::get_queued_cards(
+            &mut self.collection,
+            GetQueuedCardsRequest {
+                fetch_limit: limit as u32,
+                intraday_learning_only: false,
+            },
+        ) else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        let mut seen = HashSet::new();
+        for queued in queued.cards {
+            let Some(card) = queued.card else {
+                continue;
+            };
+            let Ok(Some(note)) = self.collection.storage.get_note(card.note_id.into()) else {
+                continue;
+            };
+            for field in note.fields() {
+                for name in media_names(field) {
+                    if seen.insert(name.clone()) && !self.media_index.contains(&name) {
+                        files.push(name);
+                    }
+                }
+            }
+        }
+        files
+    }
+
+    pub fn media_exists(&self, filename: &str) -> bool {
+        self.media_index.contains(filename)
+    }
+
+    pub fn media_index_handle(&self) -> std::sync::Arc<anki::media::files::MediaNameIndex> {
+        self.media_index.clone()
+    }
+
+    pub fn media_path(&self, filename: &str) -> String {
+        if self.media_index.is_unmigrated(filename) {
+            format!("{MEDIA_DIR}/{filename}")
+        } else {
+            anki::media::files::sharded_path(std::path::Path::new(MEDIA_DIR), filename)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    pub fn card_missing_files(&self, card: &OfferedCard, answer: bool) -> Vec<String> {
+        let media = if answer {
+            &card.answer_media
+        } else {
+            &card.question_media
+        };
+        media
+            .iter()
+            .filter(|item| !self.media_index.contains(&item.filename))
+            .map(|item| item.filename.clone())
+            .collect()
+    }
+
+    pub fn card_media_missing(&self, card: &OfferedCard, answer: bool) -> bool {
+        let media = if answer {
+            &card.answer_media
+        } else {
+            &card.question_media
+        };
+        media
+            .iter()
+            .any(|item| !self.media_index.contains(&item.filename))
+    }
+
+    pub fn card_all_files(&self, card: &OfferedCard) -> Vec<String> {
+        let mut files: Vec<String> = card
+            .question_media
+            .iter()
+            .chain(card.answer_media.iter())
+            .map(|item| item.filename.clone())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
     }
 
     pub fn set_language(&mut self, card: Option<&mut OfferedCard>) -> Result<()> {
@@ -194,7 +482,9 @@ impl Backend {
         let id = queued_card.id;
         super::event(&format!(
             "OFFER card={id} now={} due={} queue={} new={new_count} learning={learn_count} review={review_count}",
-            TimestampSecs::now().0, queued_card.due, queued_card.queue
+            TimestampSecs::now().0,
+            queued_card.due,
+            queued_card.queue
         ));
         let rendered = CardRenderingService::render_existing_card(
             &mut self.collection,
@@ -207,8 +497,14 @@ impl Backend {
         if rendered.is_empty {
             return Err("the card rendered to nothing".into());
         }
-        let question_html = self.to_html(&render_nodes(rendered.question_nodes))?;
-        let answer_html_full = self.to_html(&render_nodes(rendered.answer_nodes))?;
+        let question_nodes = render_nodes(rendered.question_nodes);
+        let answer_nodes = render_nodes(rendered.answer_nodes);
+        let question_html = self.to_html(&question_nodes)?;
+        let answer_html_full = self.to_html(&answer_nodes)?;
+        let mut question_media = self.media_refs(&question_nodes, true)?;
+        question_media.extend(self.image_refs(&question_nodes));
+        let mut answer_media = self.media_refs(&answer_nodes, false)?;
+        answer_media.extend(self.image_refs(&answer_nodes));
         let cloze_answer_html = super::review_text::mark_clozes(&answer_html_full);
         let answer_html = self.answer_html(&answer_html_full);
         let intervals = SchedulerService::describe_next_states(
@@ -225,6 +521,8 @@ impl Backend {
             question_html,
             answer_html,
             cloze_answer_html,
+            question_media,
+            answer_media,
             queued,
             new_count,
             learn_count,
@@ -239,6 +537,80 @@ impl Backend {
             .map(|m| &html[m.end()..])
             .unwrap_or(html)
             .to_owned()
+    }
+
+    fn image_refs(&self, html: &str) -> Vec<MediaRef> {
+        let tags = html.to_ascii_lowercase().matches("<img").count();
+        let mut matched = 0;
+        let mut refs = Vec::new();
+        for captures in IMG_SRC.captures_iter(html) {
+            matched += 1;
+            let Some(src) = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .or_else(|| captures.get(3))
+                .map(|m| m.as_str())
+            else {
+                continue;
+            };
+            let skipped = if src.starts_with("data:") {
+                Some("inline_data")
+            } else if src.contains("://") {
+                Some("remote_url")
+            } else {
+                None
+            };
+            if let Some(reason) = skipped {
+                super::event(&format!(
+                    "IMAGE_REF_SKIP reason={reason} src={}",
+                    src.chars().take(60).collect::<String>()
+                ));
+                continue;
+            }
+            match clean_media_ref(src) {
+                Some(filename) => refs.push(MediaRef {
+                    filename,
+                    audio: false,
+                }),
+                None => super::event(&format!(
+                    "IMAGE_REF_SKIP reason=bad_name src={}",
+                    src.chars().take(160).collect::<String>()
+                )),
+            }
+        }
+        if tags > matched {
+            let snippet = html
+                .to_ascii_lowercase()
+                .find("<img")
+                .map(|start| html[start..].chars().take(160).collect::<String>())
+                .unwrap_or_default();
+            super::event(&format!(
+                "IMAGE_REF_SKIP reason=no_src tags={tags} matched={matched} html={snippet}"
+            ));
+        }
+        refs
+    }
+
+    fn media_refs(&mut self, html: &str, question_side: bool) -> Result<Vec<MediaRef>> {
+        let response = CardRenderingService::extract_av_tags(
+            &mut self.collection,
+            anki_proto::card_rendering::ExtractAvTagsRequest {
+                text: html.to_owned(),
+                question_side,
+            },
+        )?;
+        Ok(response
+            .av_tags
+            .into_iter()
+            .filter_map(|tag| match tag.value {
+                Some(anki_proto::card_rendering::av_tag::Value::SoundOrVideo(filename)) => {
+                    let filename = clean_media_ref(&filename)?;
+                    let audio = is_audio_file(&filename);
+                    Some(MediaRef { filename, audio })
+                }
+                _ => None,
+            })
+            .collect())
     }
 
     fn answer_text(&mut self, html: &str) -> Result<String> {
@@ -316,7 +688,7 @@ impl Backend {
     pub fn search(&mut self, query: &str) -> Result<Vec<i64>> {
         Ok(self
             .collection
-            .search_cards(query, anki::search::SortMode::NoOrder)?
+            .search_cards(query.trim(), anki::search::SortMode::NoOrder)?
             .into_iter()
             .map(|id| id.0)
             .collect())

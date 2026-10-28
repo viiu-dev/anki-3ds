@@ -8,6 +8,9 @@ pub struct MediaSyncProgress {
     pub downloaded_deletions: usize,
     pub uploaded_files: usize,
     pub uploaded_deletions: usize,
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub unpacked_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

@@ -5,7 +5,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::io;
 use std::sync::LazyLock;
 
 use anki_i18n::without_unicode_isolation;
@@ -20,8 +19,11 @@ use crate::error::DbErrorKind;
 use crate::latex::extract_latex_expanding_clozes;
 use crate::media::files::data_for_file;
 use crate::media::files::filename_if_normalized;
+use crate::media::files::locate_existing;
+use crate::media::files::media_file_entries;
 use crate::media::files::normalize_nfc_filename;
 use crate::media::files::sha1_of_data;
+use crate::media::files::sharded_path;
 use crate::media::files::trash_folder;
 use crate::media::MediaManager;
 use crate::prelude::*;
@@ -260,35 +262,31 @@ impl MediaChecker<'_> {
 
         for dentry in self.media.media_folder.read_dir()? {
             let dentry = dentry?;
-
-            // if the filename is not valid unicode, skip it
-            let fname_os = dentry.file_name();
-            let disk_fname = match fname_os.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if fname_os == ".DS_Store" {
-                continue;
-            }
-
-            // skip folders
             if dentry.file_type()?.is_dir() {
-                out.dirs.push(disk_fname.to_string());
+                if let Some(name) = dentry.file_name().to_str() {
+                    if name != ".DS_Store" {
+                        out.dirs.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        for (disk_fname, disk_path) in media_file_entries(&self.media.media_folder)? {
+            if disk_fname == ".DS_Store" {
                 continue;
             }
 
             // ignore large files and zero byte files
-            let metadata = dentry.metadata()?;
+            let metadata = disk_path.metadata()?;
             if metadata.len() > MAX_INDIVIDUAL_MEDIA_FILE_SIZE as u64 {
-                out.oversize.push(disk_fname.to_string());
+                out.oversize.push(disk_fname);
                 continue;
             }
             if metadata.len() == 0 {
                 continue;
             }
 
-            files_sorted.push(disk_fname.to_owned());
+            files_sorted.push(disk_fname);
         }
 
         // if there are case-insensitive dupes, have the lowercase entries show
@@ -344,14 +342,15 @@ impl MediaChecker<'_> {
         // e.g given a.jpg (hash 1) and a.JPG (hash 1), a.JPG gets renamed to
         // a.jpg, but then removing a.JPG on windows would be the same
         // as removing a.jpg
-        let orig_path = &self.media.media_folder.join(original_fname);
-        let new_path = &self.media.media_folder.join(fname.as_ref());
+        let orig_path = locate_existing(&self.media.media_folder, original_fname)
+            .unwrap_or_else(|| self.media.media_folder.join(original_fname));
+        let new_path = &sharded_path(&self.media.media_folder, fname.as_ref());
         #[cfg(target_os = "horizon")]
         let same_file = Ok::<_, std::io::Error>(
-            anki_io::canonical_sd_file(orig_path)? == anki_io::canonical_sd_file(new_path)?,
+            anki_io::canonical_sd_file(&orig_path)? == anki_io::canonical_sd_file(new_path)?,
         );
         #[cfg(not(target_os = "horizon"))]
-        let same_file = same_file::is_same_file(orig_path, new_path);
+        let same_file = same_file::is_same_file(&orig_path, new_path);
         if !matches!(same_file, Ok(true)) {
             fs::remove_file(orig_path)?;
         }
@@ -405,14 +404,15 @@ impl MediaChecker<'_> {
 
             self.increment_progress()?;
 
-            let orig_path = self.media.media_folder.join(dentry.file_name());
+            let fname_os = dentry.file_name();
+            let fname = fname_os.to_string_lossy();
+            let orig_path = sharded_path(&self.media.media_folder, fname.as_ref());
             // if the original filename doesn't exist, we can just rename
-            if let Err(e) = fs::metadata(&orig_path) {
-                if e.kind() == io::ErrorKind::NotFound {
-                    fs::rename(dentry.path(), &orig_path)?;
-                } else {
-                    return Err(e.into());
+            if locate_existing(&self.media.media_folder, fname.as_ref()).is_none() {
+                if let Some(parent) = orig_path.parent() {
+                    anki_io::create_dir_all(parent)?;
                 }
+                fs::rename(dentry.path(), &orig_path)?;
             } else {
                 // ensure we don't overwrite different data
                 let fname_os = dentry.file_name();
@@ -523,8 +523,7 @@ impl MediaChecker<'_> {
             // files stored on AnkiWeb are in normalized form.
             if matches!(fname, Cow::Borrowed(_)) {
                 if let Cow::Owned(normname) = normalize_nfc_filename(fname.as_ref().into()) {
-                    let path = self.media.media_folder.join(&normname);
-                    if path.exists() {
+                    if locate_existing(&self.media.media_folder, &normname).is_some() {
                         fname = normname.into();
                     }
                 }
@@ -559,7 +558,11 @@ impl MediaChecker<'_> {
         };
         let checksum = hex::encode(sha1_of_data(&data));
         let external_fname = format!("paste-{checksum}.{ext}");
-        write_file(self.media.media_folder.join(&external_fname), data)?;
+        let external_path = sharded_path(&self.media.media_folder, &external_fname);
+        if let Some(parent) = external_path.parent() {
+            anki_io::create_dir_all(parent)?;
+        }
+        write_file(&external_path, data)?;
         self.inlined_image_count += 1;
         Ok(external_fname.into())
     }
@@ -623,6 +626,7 @@ pub(crate) mod test {
         include_bytes!("../../tests/support/mediacheck.anki2");
 
     use std::collections::HashMap;
+    use std::io;
     use std::path::Path;
 
     use anki_io::create_dir;
@@ -691,7 +695,7 @@ pub(crate) mod test {
         );
 
         assert!(fs::metadata(mgr.media_folder.join("foo[.jpg")).is_err());
-        assert!(fs::metadata(mgr.media_folder.join("foo.jpg")).is_ok());
+        assert!(crate::media::files::locate_existing(&mgr.media_folder, "foo.jpg").is_some());
 
         assert_eq!(
             report,
@@ -730,6 +734,16 @@ Unused: unused.jpg
         files
     }
 
+    fn media_file_names(dir: &Path) -> Vec<String> {
+        let mut files = crate::media::files::media_file_entries(dir)
+            .unwrap()
+            .into_iter()
+            .map(|(fname, _)| fname)
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
     #[test]
     fn trash_handling() -> Result<()> {
         let (_dir, mgr, mut col) = common_setup()?;
@@ -742,7 +756,7 @@ Unused: unused.jpg
         // file should have been moved to media folder
         assert_eq!(files_in_dir(&trash_folder), Vec::<String>::new());
         assert_eq!(
-            files_in_dir(&mgr.media_folder),
+            media_file_names(&mgr.media_folder),
             vec!["test.jpg".to_string()]
         );
 
@@ -755,7 +769,7 @@ Unused: unused.jpg
 
         assert_eq!(files_in_dir(&trash_folder), Vec::<String>::new());
         assert_eq!(
-            files_in_dir(&mgr.media_folder),
+            media_file_names(&mgr.media_folder),
             vec!["test.jpg".to_string()]
         );
 
@@ -767,7 +781,7 @@ Unused: unused.jpg
 
         assert_eq!(files_in_dir(&trash_folder), Vec::<String>::new());
         assert_eq!(
-            files_in_dir(&mgr.media_folder),
+            media_file_names(&mgr.media_folder),
             vec![
                 "test-109f4b3c50d7b0df729d299bc6f8e9ef9066971f.jpg".to_string(),
                 "test.jpg".into()
@@ -827,7 +841,7 @@ Unused: unused.jpg
                 }
             );
             assert!(fs::metadata(mgr.media_folder.join("ぱぱ.jpg")).is_err());
-            assert!(fs::metadata(mgr.media_folder.join("ぱぱ.jpg")).is_ok());
+            assert!(crate::media::files::locate_existing(&mgr.media_folder, "ぱぱ.jpg").is_some());
         }
 
         Ok(())
@@ -876,10 +890,10 @@ Unused: unused.jpg
         let output = checker.check()?;
         assert_eq!(output.inlined_image_count, 1);
         assert_eq!(
-            &read_to_string(
-                mgr.media_folder
-                    .join("paste-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33.jpg")
-            )?,
+            &read_to_string(crate::media::files::sharded_path(
+                &mgr.media_folder,
+                "paste-0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33.jpg"
+            ))?,
             "foo"
         );
         Ok(())

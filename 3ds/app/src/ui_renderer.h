@@ -100,6 +100,22 @@ void ui_draw_deck_row(float y, float w, const char* name, int level, bool has_ch
 void ui_draw_scrollbar(float x, float y, float w, float h, int total_items, int visible_items, int scroll_pos);
 void ui_draw_button(float x, float y, float w, float h, const char* text, const char* subtext, int style, bool pressed);
 
+int ui_media_image(const char* path, int* width, int* height);
+void ui_media_draw(int id, float x, float y, float w, float h);
+void ui_media_reset(void);
+void ui_media_refresh(void);
+bool ui_media_prefetch(const char* path);
+void ui_media_prefetch_clear(void);
+
+bool ui_audio_play(const char* path);
+bool ui_audio_decode(const char* path);
+bool ui_audio_prefetch(const char* path);
+void ui_audio_prefetch_clear(void);
+bool ui_audio_is_playing(void);
+void ui_audio_stop(void);
+void ui_audio_init(void);
+void ui_audio_fini(void);
+
 void ui_draw_icon_help(float x, float y, float size);
 void ui_draw_icon_stats(float x, float y, float size);
 void ui_draw_icon_gear(float x, float y, float size);

@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
@@ -23,6 +24,8 @@ static FONT_SCALE: AtomicU16 = AtomicU16::new(DEFAULT_FONT_SCALE);
 
 pub fn init() {
     load_font_scale();
+    load_autoplay_audio();
+    load_download_connections();
     let system_spanish =
         Cfgu::new().ok().and_then(|c| c.language().ok()) == Some(Language::Spanish);
     let spanish = match std::fs::read_to_string(PATH).ok().as_deref().map(str::trim) {
@@ -97,6 +100,10 @@ pub fn adjust_font_scale(direction: i32) -> io::Result<u16> {
 }
 
 fn save_font_scale(percent: u16) -> io::Result<()> {
+    write_setting("font_scale", serde_json::json!(percent))
+}
+
+fn write_setting(key: &str, value: serde_json::Value) -> io::Result<()> {
     let mut document = fs::read_to_string(SETTINGS_PATH)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -104,7 +111,7 @@ fn save_font_scale(percent: u16) -> io::Result<()> {
     if !document.is_object() {
         document = serde_json::json!({});
     }
-    document["font_scale"] = serde_json::json!(percent);
+    document[key] = value;
     let text = serde_json::to_string_pretty(&document).map_err(io::Error::other)? + "\n";
     if let Some(parent) = std::path::Path::new(SETTINGS_PATH).parent() {
         fs::create_dir_all(parent)?;
@@ -118,6 +125,75 @@ fn save_font_scale(percent: u16) -> io::Result<()> {
             fs::write(SETTINGS_PATH, text.as_bytes())
         }
     }
+}
+
+static AUTOPLAY_AUDIO: AtomicBool = AtomicBool::new(false);
+
+pub fn autoplay_audio() -> bool {
+    AUTOPLAY_AUDIO.load(Ordering::Relaxed)
+}
+
+pub fn toggle_autoplay_audio() -> io::Result<bool> {
+    let value = !autoplay_audio();
+    write_setting("autoplay_audio", serde_json::json!(value))?;
+    AUTOPLAY_AUDIO.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_autoplay_audio() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("autoplay_audio").and_then(|v| v.as_bool()));
+    if let Some(value) = value {
+        AUTOPLAY_AUDIO.store(value, Ordering::Relaxed);
+    }
+}
+
+const MAX_DOWNLOAD_CONNECTIONS: u8 = 4;
+static DOWNLOAD_CONNECTIONS: AtomicU8 = AtomicU8::new(1);
+
+/// Number of parallel media download connections (1-4).
+pub fn download_connections() -> usize {
+    usize::from(
+        DOWNLOAD_CONNECTIONS
+            .load(Ordering::Relaxed)
+            .clamp(1, MAX_DOWNLOAD_CONNECTIONS),
+    )
+}
+
+pub fn cycle_download_connections(direction: i32) -> io::Result<u8> {
+    let current = download_connections() as i32;
+    let next = if direction < 0 {
+        if current <= 1 {
+            i32::from(MAX_DOWNLOAD_CONNECTIONS)
+        } else {
+            current - 1
+        }
+    } else if current >= i32::from(MAX_DOWNLOAD_CONNECTIONS) {
+        1
+    } else {
+        current + 1
+    };
+    let value = next as u8;
+    write_setting("download_connections", serde_json::json!(value))?;
+    DOWNLOAD_CONNECTIONS.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_download_connections() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("download_connections").and_then(|v| v.as_u64()))
+        .and_then(|value| u8::try_from(value).ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_DOWNLOAD_CONNECTIONS);
+    DOWNLOAD_CONNECTIONS.store(value, Ordering::Relaxed);
 }
 
 pub fn tr(message: &'static str) -> &'static str {

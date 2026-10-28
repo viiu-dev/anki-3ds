@@ -141,6 +141,7 @@ fn native_run() -> ProbeResult<()> {
     extern "C" {
         fn curl_global_cleanup();
     }
+    anki_3ds_sync_transport::cleanup_https_session();
     unsafe { curl_global_cleanup() };
     log("curl_global_cleanup=1");
     soc.close()?;

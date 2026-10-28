@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use anki_io::atomic_rename;
 use anki_io::filename_is_safe;
 use anki_io::new_tempfile_in;
-use anki_io::read_dir_files;
 use anki_io::FileIoError;
 use anki_io::FileOp;
 use prost::Message;
@@ -93,7 +92,7 @@ impl SafeMediaEntry {
     }
 
     pub(super) fn file_path(&self, media_folder: &Path) -> PathBuf {
-        media_folder.join(&self.name)
+        crate::media::files::sharded_path(media_folder, &self.name)
     }
 
     pub(super) fn fetch_file<'a>(
@@ -135,7 +134,11 @@ impl SafeMediaEntry {
             let (_, sha1) = copier.copy(&mut file, &mut tempfile)?;
             self.sha1 = Some(sha1);
         }
-        atomic_rename(tempfile, &self.file_path(target_folder), false)?;
+        let target = self.file_path(target_folder);
+        if let Some(parent) = target.parent() {
+            anki_io::create_dir_all(parent)?;
+        }
+        atomic_rename(tempfile, &target, false)?;
 
         Ok(())
     }
@@ -264,17 +267,15 @@ impl MediaIter {
         Self(Box::new(iter))
     }
 
-    /// Iterator over all files in the given path, without traversing
-    /// subfolders.
+    /// Iterator over all media files in the given folder, including sharded
+    /// ones.
     pub fn from_folder(path: &Path) -> Result<Self> {
-        let path2 = path.to_owned();
-        Ok(Self::new(read_dir_files(path)?.map(move |res| match res {
-            Ok(entry) => MediaIterEntry::try_from(entry.path().as_path()),
-            Err(err) => Err(MediaIterError::IoError {
-                filename: path2.to_string_lossy().into(),
-                source: err,
-            }),
-        })))
+        let entries = crate::media::files::media_file_entries(path)?;
+        Ok(Self::new(
+            entries
+                .into_iter()
+                .map(|(_, full)| MediaIterEntry::try_from(full.as_path())),
+        ))
     }
 
     /// Iterator over all given files in the given folder.
@@ -285,8 +286,7 @@ impl MediaIter {
     ) -> Self {
         Self::new(
             list.into_iter()
-                .map(move |file| folder.join(file))
-                .filter(|path| path.exists())
+                .filter_map(move |file| crate::media::files::locate_existing(&folder, &file))
                 .map(|path| MediaIterEntry::try_from(path.as_path())),
         )
     }

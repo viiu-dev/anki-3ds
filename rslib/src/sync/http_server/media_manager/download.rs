@@ -8,6 +8,8 @@ use anki_io::FileIoSnafu;
 use anki_io::FileOp;
 use snafu::ResultExt;
 
+use crate::media::files::locate_existing;
+use crate::media::files::sharded_path;
 use crate::sync::error::HttpResult;
 use crate::sync::error::OrHttpErr;
 use crate::sync::http_server::media_manager::ServerMediaManager;
@@ -25,7 +27,8 @@ impl ServerMediaManager {
     fn gather_file_data(&mut self, entries: &[MediaEntry]) -> HttpResult<Vec<(String, Vec<u8>)>> {
         let mut out = vec![];
         for entry in entries {
-            let path = self.media_folder.join(&entry.nfc_filename);
+            let path = locate_existing(&self.media_folder, &entry.nfc_filename)
+                .unwrap_or_else(|| sharded_path(&self.media_folder, &entry.nfc_filename));
             match fs::read(&path) {
                 Ok(data) => out.push((entry.nfc_filename.clone(), data)),
                 Err(err) if err.kind() == ErrorKind::NotFound => {

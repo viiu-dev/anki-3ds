@@ -32,6 +32,7 @@ def inputs():
             "3ds/app",
             "3ds/sync-transport",
             "3ds/sqlite-vfs",
+            "3ds/third_party",
             "3ds/coarsetime-horizon.patch",
             "3ds/toolchain.sh",
             "3ds/cc.sh",

@@ -8,6 +8,7 @@ pub mod soc;
 #[path = "../../app/src/auth_store.rs"]
 mod auth_store_tests;
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::io::Read;
@@ -17,6 +18,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use ammonia::Url;
@@ -42,6 +44,19 @@ use anki::sync::error::HttpResult;
 use anki::sync::login::HostKeyRequest;
 use anki::sync::login::HostKeyResponse;
 use anki::sync::login::SyncAuth;
+use anki::sync::media::begin::SyncBeginRequest;
+use anki::sync::media::begin::SyncBeginResponse;
+use anki::sync::media::changes::MediaChangesRequest;
+use anki::sync::media::changes::MediaChangesResponse;
+use anki::sync::media::download::DownloadFilesRequest;
+use anki::sync::media::protocol::JsonResult;
+use anki::sync::media::protocol::MediaDownloadEvent;
+use anki::sync::media::protocol::MediaSyncMethod;
+use anki::sync::media::protocol::MediaSyncProtocol;
+use anki::sync::media::protocol::ParallelDownloadSession;
+use anki::sync::media::sanity::MediaSanityCheckResponse;
+use anki::sync::media::sanity::SanityCheckRequest as MediaSanityCheckRequest;
+use anki::sync::media::upload::MediaUploadResponse;
 use anki::sync::request::header_and_stream::SyncHeader;
 use anki::sync::request::SyncRequest;
 use anki::sync::response::SyncResponse;
@@ -117,6 +132,7 @@ extern "C" fn update_progress(context: *mut std::ffi::c_void, done: u64, total: 
 
 extern "C" {
     fn anki_3ds_https_post(
+        slot: std::os::raw::c_int,
         host: *const std::os::raw::c_char,
         path: *const std::os::raw::c_char,
         header_anki_sync: *const std::os::raw::c_char,
@@ -129,6 +145,37 @@ extern "C" {
     ) -> std::os::raw::c_int;
 
     fn anki_3ds_http_response_free(resp: *mut RawHttpResponse);
+
+    fn anki_3ds_https_global_init() -> std::os::raw::c_int;
+
+    fn anki_3ds_https_cleanup();
+}
+
+pub const HTTPS_SLOT_COUNT: usize = 5;
+
+static HTTPS_LOCKS: [std::sync::Mutex<()>; HTTPS_SLOT_COUNT] = [
+    std::sync::Mutex::new(()),
+    std::sync::Mutex::new(()),
+    std::sync::Mutex::new(()),
+    std::sync::Mutex::new(()),
+    std::sync::Mutex::new(()),
+];
+
+fn lock_https(slot: usize) -> std::sync::MutexGuard<'static, ()> {
+    HTTPS_LOCKS[slot.min(HTTPS_SLOT_COUNT - 1)]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Initialize libcurl's global state. Call once, before worker threads are
+/// spawned, because `curl_global_init` is not thread-safe.
+pub fn init_https_session() {
+    unsafe { anki_3ds_https_global_init() };
+}
+
+pub fn cleanup_https_session() {
+    let _guards: Vec<_> = (0..HTTPS_SLOT_COUNT).map(lock_https).collect();
+    unsafe { anki_3ds_https_cleanup() }
 }
 
 #[derive(Error, Debug)]
@@ -152,6 +199,7 @@ pub struct NativeSyncClient {
     pub connect_timeout: Duration,
     pub cancel: Arc<AtomicBool>,
     pub ca_file: String,
+    pub slot: usize,
 }
 
 impl Default for NativeSyncClient {
@@ -164,6 +212,7 @@ impl Default for NativeSyncClient {
             connect_timeout: Duration::from_secs(15),
             cancel: Arc::new(AtomicBool::new(false)),
             ca_file: "sdmc:/3ds/anki-3ds/cacert.pem".into(),
+            slot: 0,
         }
     }
 }
@@ -188,7 +237,14 @@ impl NativeSyncClient {
             connect_timeout: Duration::from_secs(15),
             cancel: Arc::new(AtomicBool::new(false)),
             ca_file: "sdmc:/3ds/anki-3ds/cacert.pem".into(),
+            slot: 0,
         }
+    }
+
+    pub fn with_slot(&self, slot: usize) -> Self {
+        let mut client = self.clone();
+        client.slot = slot % HTTPS_SLOT_COUNT;
+        client
     }
 
     /// Read UTC from the authenticated HTTPS origin; no account or collection
@@ -281,8 +337,10 @@ impl NativeSyncClient {
             total_ms: 0,
         };
 
+        let _https = lock_https(self.slot);
         let rc = unsafe {
             anki_3ds_https_post(
+                self.slot as std::os::raw::c_int,
                 c_host.as_ptr(),
                 c_path.as_ptr(),
                 c_header.as_ptr(),
@@ -350,6 +408,14 @@ impl NativeSyncClient {
     }
 
     pub async fn request<I, O>(
+        &self,
+        method: impl AsSyncEndpoint,
+        request: SyncRequest<I>,
+    ) -> HttpResult<SyncResponse<O>> {
+        self.request_sync(method, request)
+    }
+
+    pub fn request_sync<I, O>(
         &self,
         method: impl AsSyncEndpoint,
         request: SyncRequest<I>,
@@ -539,6 +605,145 @@ impl SyncProtocol for NativeSyncClient {
 
     async fn download(&self, req: SyncRequest<EmptyInput>) -> HttpResult<SyncResponse<Vec<u8>>> {
         self.request(SyncMethod::Download, req).await
+    }
+}
+
+#[async_trait]
+impl MediaSyncProtocol for NativeSyncClient {
+    async fn begin(
+        &self,
+        req: SyncRequest<SyncBeginRequest>,
+    ) -> HttpResult<SyncResponse<JsonResult<SyncBeginResponse>>> {
+        self.request(MediaSyncMethod::Begin, req).await
+    }
+
+    async fn media_changes(
+        &self,
+        req: SyncRequest<MediaChangesRequest>,
+    ) -> HttpResult<SyncResponse<JsonResult<MediaChangesResponse>>> {
+        self.request(MediaSyncMethod::MediaChanges, req).await
+    }
+
+    async fn upload_changes(
+        &self,
+        req: SyncRequest<Vec<u8>>,
+    ) -> HttpResult<SyncResponse<JsonResult<MediaUploadResponse>>> {
+        self.request(MediaSyncMethod::UploadChanges, req).await
+    }
+
+    async fn download_files(
+        &self,
+        req: SyncRequest<DownloadFilesRequest>,
+    ) -> HttpResult<SyncResponse<Vec<u8>>> {
+        self.request(MediaSyncMethod::DownloadFiles, req).await
+    }
+
+    fn download_files_parallel(
+        &self,
+        batches: &[Vec<String>],
+        connections: usize,
+    ) -> Option<ParallelDownloadSession> {
+        use anki::sync::request::IntoSyncRequest;
+        if batches.is_empty() {
+            return None;
+        }
+        let connections = connections
+            .clamp(1, anki::sync::media::MAX_MEDIA_CONNECTIONS)
+            .min(batches.len());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(connections.max(2));
+        let queue = Arc::new(Mutex::new(
+            batches.iter().cloned().collect::<VecDeque<Vec<String>>>(),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        let mut handles = Vec::with_capacity(connections);
+        for index in 0..connections {
+            let client = self.with_slot(index + 1);
+            let queue = queue.clone();
+            let sender = sender.clone();
+            let stop_clone = Arc::clone(&stop);
+            let handle = std::thread::Builder::new()
+                .name(format!("media-download-{index}"))
+                .stack_size(256 * 1024)
+                .spawn(move || loop {
+                    if stop_clone.load(Ordering::Acquire) || client.is_cancelled() {
+                        break;
+                    }
+                    let files = {
+                        let mut queue = queue.lock().unwrap_or_else(|p| p.into_inner());
+                        match queue.pop_front() {
+                            Some(files) => files,
+                            None => break,
+                        }
+                    };
+                    let mut attempt = 0u32;
+                    let event = loop {
+                        if stop_clone.load(Ordering::Acquire) || client.is_cancelled() {
+                            break None;
+                        }
+                        let request = match (DownloadFilesRequest { files: files.clone() })
+                            .try_into_sync_request()
+                        {
+                            Ok(request) => request,
+                            Err(error) => {
+                                break Some(MediaDownloadEvent::Failed {
+                                    error: error.to_string(),
+                                })
+                            }
+                        };
+                        let response: HttpResult<SyncResponse<Vec<u8>>> =
+                            client.request_sync(MediaSyncMethod::DownloadFiles, request);
+                        match response {
+                            Ok(response) => {
+                                break Some(MediaDownloadEvent::Downloaded { data: response.data })
+                            }
+                            Err(error) => {
+                                attempt += 1;
+                                if attempt > 2 || client.is_cancelled() {
+                                    break Some(MediaDownloadEvent::Failed {
+                                        error: error.to_string(),
+                                    });
+                                }
+                                std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+                            }
+                        }
+                    };
+                    match event {
+                        Some(MediaDownloadEvent::Failed { error }) => {
+                            let _ = sender.send(MediaDownloadEvent::Failed { error });
+                            break;
+                        }
+                        Some(event) => {
+                            if sender.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                })
+                .ok();
+            match handle {
+                Some(handle) => handles.push(handle),
+                None => {
+                    stop.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+        Some(ParallelDownloadSession::new(
+            receiver, stop, cancel, handles,
+        ))
+    }
+
+    async fn media_sanity_check(
+        &self,
+        req: SyncRequest<MediaSanityCheckRequest>,
+    ) -> HttpResult<SyncResponse<JsonResult<MediaSanityCheckResponse>>> {
+        self.request(MediaSyncMethod::MediaSanity, req).await
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
     }
 }
 

@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 #[cfg(feature = "emulator")]
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::time::Instant;
 
 use anki_3ds_sync_transport::soc::NativeSoc;
@@ -71,7 +72,9 @@ fn apply(correction: &Correction) {
         anki_set_clock_correction(correction.seconds);
     }
     OFFSET.store(minutes, Ordering::Relaxed);
-    *VERIFIED.lock().unwrap() = correction
+    *VERIFIED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = correction
         .verified_local
         .map(|verified| (verified, unsafe { anki_local_time() }, Instant::now()));
 }
@@ -96,7 +99,7 @@ pub fn needs_refresh() -> bool {
     let local = unsafe { anki_local_time() };
     VERIFIED
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .is_none_or(|(verified, baseline, started)| {
             !super::time_correction::fresh(Some(*verified), local)
@@ -148,12 +151,7 @@ impl Job {
                     let mut soc = NativeSoc::new().map_err(|e| e.to_string())?;
                     let time = client.server_time().map_err(|e| e.to_string());
                     let local = unsafe { anki_local_time() };
-                    extern "C" {
-                        fn curl_global_cleanup();
-                    }
-                    unsafe {
-                        curl_global_cleanup();
-                    }
+                    anki_3ds_sync_transport::cleanup_https_session();
                     let cleanup = soc.close().map_err(|e| e.to_string());
                     drop(ps);
                     cleanup?;
@@ -198,8 +196,26 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.receiver.try_recv() {
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                    let _ = worker.join();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        super::event("CLOCK_EXIT_TIMEOUT");
+                        let _ = self.receiver.recv();
+                        let _ = worker.join();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
         }
     }
 }

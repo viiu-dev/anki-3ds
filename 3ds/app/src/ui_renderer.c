@@ -14,6 +14,36 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_THREAD_LOCALS
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#define STBI_ONLY_GIF
+#include "stb_image.h"
+
+#include "src/webp/decode.h"
+#include "src/webp/demux.h"
+#include "nanosvg.h"
+#include "nanosvgrast.h"
+#include <opus/opusfile.h>
+#include <tremor/ivorbisfile.h>
+
+#define MEDIA_IMAGE_SLOTS 8
+#define MEDIA_PATH_MAX 512
+#define MEDIA_IMAGE_MAX 256
+#define MEDIA_FILE_MAX (8u * 1024u * 1024u)
+#define MEDIA_PIXEL_MAX (4u * 1024u * 1024u)
+#define MEDIA_SVG_MAX (2u * 1024u * 1024u)
+#define MEDIA_MISSING_SLOTS 24
+
+#define DR_MP3_IMPLEMENTATION
+#define DR_MP3_NO_SIMD
+#include "dr_mp3.h"
+
+#define AUDIO_PCM_BYTES (1024 * 1024)
+#define AUDIO_CHANNEL 0
+
 // Glyphs are rasterized at their on-screen size. This atlas replaces the
 // console's low-resolution system glyph sheet and can be refreshed without
 // bundling a very large .bcfnt file.
@@ -136,14 +166,1002 @@ static void init_swizzle_map(void) {
     s_swizzle_ready = true;
 }
 
-static size_t swizzled_offset(int x, int y) {
+static size_t swizzled_offset_w(int x, int y, int width) {
     init_swizzle_map();
     int tile_x = x >> 3;
     int tile_y = y >> 3;
-    int tiles_per_row = CARD_ATLAS_W >> 3;
+    int tiles_per_row = width >> 3;
     int tile_index = tile_y * tiles_per_row + tile_x;
     int pixel = (y & 7) * 8 + (x & 7);
     return ((size_t)tile_index * 64 + s_swizzle_map[pixel]) * 4;
+}
+
+static size_t swizzled_offset(int x, int y) {
+    return swizzled_offset_w(x, y, CARD_ATLAS_W);
+}
+
+typedef struct {
+    char path[MEDIA_PATH_MAX];
+    C3D_Tex tex;
+    bool ready;
+    int image_w;
+    int image_h;
+    int tex_w;
+    int tex_h;
+    uint64_t used;
+} MediaImage;
+
+static MediaImage s_media_images[MEDIA_IMAGE_SLOTS];
+static uint8_t s_media_scratch[MEDIA_IMAGE_MAX * MEDIA_IMAGE_MAX * 4];
+static uint64_t s_media_clock;
+static char s_media_missing[MEDIA_MISSING_SLOTS][MEDIA_PATH_MAX];
+static uint32_t s_media_missing_next;
+
+static bool media_missing(const char* path) {
+    for (int i = 0; i < MEDIA_MISSING_SLOTS; i++) {
+        if (s_media_missing[i][0] && strcmp(s_media_missing[i], path) == 0) return true;
+    }
+    return false;
+}
+
+static void media_mark_missing(const char* path) {
+    if (strlen(path) >= sizeof(s_media_missing[0])) return;
+    snprintf(s_media_missing[s_media_missing_next], sizeof(s_media_missing[0]), "%s", path);
+    s_media_missing_next = (s_media_missing_next + 1) % MEDIA_MISSING_SLOTS;
+}
+
+void ui_media_prefetch_clear(void);
+
+static bool s_capture_pixels_active = false;
+static uint8_t* s_captured_pixels = NULL;
+static int s_captured_w = 0;
+static int s_captured_h = 0;
+
+void ui_media_reset(void) {
+    for (int i = 0; i < MEDIA_IMAGE_SLOTS; i++) {
+        if (s_media_images[i].ready) {
+            C3D_TexDelete(&s_media_images[i].tex);
+            s_media_images[i].ready = false;
+        }
+        s_media_images[i].path[0] = '\0';
+    }
+    ui_media_prefetch_clear();
+    free(s_captured_pixels);
+    s_captured_pixels = NULL;
+    for (int i = 0; i < MEDIA_MISSING_SLOTS; i++) s_media_missing[i][0] = '\0';
+    s_media_missing_next = 0;
+}
+
+void ui_media_refresh(void) {
+    for (int i = 0; i < MEDIA_MISSING_SLOTS; i++) s_media_missing[i][0] = '\0';
+    s_media_missing_next = 0;
+}
+
+static int next_pow2(int value) {
+    int result = 8;
+    while (result < value && result < 1024) result <<= 1;
+    return result;
+}
+
+static uint8_t* read_media_file(const char* path, size_t* out_size) {
+    FILE* file = fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size <= 0 || (unsigned long)size > MEDIA_FILE_MAX) {
+        fclose(file);
+        return NULL;
+    }
+    rewind(file);
+    uint8_t* data = (uint8_t*)malloc((size_t)size + 1);
+    if (!data) {
+        fclose(file);
+        return NULL;
+    }
+    size_t got = fread(data, 1, (size_t)size, file);
+    fclose(file);
+    if (got != (size_t)size) {
+        free(data);
+        return NULL;
+    }
+    data[size] = 0;
+    *out_size = (size_t)size;
+    return data;
+}
+
+static bool bytes_are_webp(const uint8_t* data, size_t size) {
+    return size >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WEBP", 4) == 0;
+}
+
+static bool bytes_contain(const uint8_t* data, size_t size, const char* needle) {
+    size_t length = strlen(needle);
+    if (length == 0 || size < length) return false;
+    for (size_t i = 0; i + length <= size; i++) {
+        if (memcmp(data + i, needle, length) == 0) return true;
+    }
+    return false;
+}
+
+static bool bytes_are_svg(const uint8_t* data, size_t size) {
+    size_t start = 0;
+    if (size >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) start = 3;
+    while (start < size && (data[start] == ' ' || data[start] == '\t'
+        || data[start] == '\r' || data[start] == '\n')) {
+        start++;
+    }
+    if (start + 4 <= size && strncasecmp((const char*)data + start, "<svg", 4) == 0) {
+        return true;
+    }
+    size_t window = size < 8192 ? size : 8192;
+    return bytes_contain(data, window, "<svg") || bytes_contain(data, window, "<SVG");
+}
+
+static void fit_dimensions(int src_w, int src_h, int* dst_w, int* dst_h) {
+    int w = src_w;
+    int h = src_h;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > MEDIA_IMAGE_MAX || h > MEDIA_IMAGE_MAX) {
+        if (w >= h) {
+            h = (int)((int64_t)h * MEDIA_IMAGE_MAX / w);
+            w = MEDIA_IMAGE_MAX;
+        } else {
+            w = (int)((int64_t)w * MEDIA_IMAGE_MAX / h);
+            h = MEDIA_IMAGE_MAX;
+        }
+    }
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    *dst_w = w;
+    *dst_h = h;
+}
+
+static void resample_rgba(
+    const uint8_t* src,
+    int src_w,
+    int src_h,
+    size_t src_stride,
+    uint8_t* dst,
+    int dst_w,
+    int dst_h
+) {
+    for (int y = 0; y < dst_h; y++) {
+        int sy = (int)((int64_t)y * src_h / dst_h);
+        if (sy >= src_h) sy = src_h - 1;
+        const uint8_t* src_row = src + (size_t)sy * src_stride;
+        uint8_t* dst_row = dst + (size_t)y * (size_t)dst_w * 4;
+        for (int x = 0; x < dst_w; x++) {
+            int sx = (int)((int64_t)x * src_w / dst_w);
+            if (sx >= src_w) sx = src_w - 1;
+            const uint8_t* pixel = src_row + (size_t)sx * 4;
+            dst_row[(size_t)x * 4 + 0] = pixel[0];
+            dst_row[(size_t)x * 4 + 1] = pixel[1];
+            dst_row[(size_t)x * 4 + 2] = pixel[2];
+            dst_row[(size_t)x * 4 + 3] = pixel[3];
+        }
+    }
+}
+
+static bool upload_media_pixels(
+    MediaImage* image,
+    const uint8_t* pixels,
+    int src_w,
+    int src_h,
+    size_t stride,
+    int dst_w,
+    int dst_h
+) {
+    if (!pixels || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return false;
+    if (s_capture_pixels_active) {
+        size_t bytes = (size_t)dst_w * (size_t)dst_h * 4;
+        uint8_t* tight = (uint8_t*)malloc(bytes ? bytes : 1);
+        if (!tight) return false;
+        resample_rgba(pixels, src_w, src_h, stride, tight, dst_w, dst_h);
+        free(s_captured_pixels);
+        s_captured_pixels = tight;
+        s_captured_w = dst_w;
+        s_captured_h = dst_h;
+        return true;
+    }
+    if (!image) return false;
+    int tex_w = next_pow2(dst_w);
+    int tex_h = next_pow2(dst_h);
+    if (tex_w * tex_h * 4 > (int)sizeof(s_media_scratch)) return false;
+    memset(s_media_scratch, 0, (size_t)tex_w * tex_h * 4);
+    for (int y = 0; y < dst_h; y++) {
+        int sy = (int)((int64_t)y * src_h / dst_h);
+        if (sy >= src_h) sy = src_h - 1;
+        for (int x = 0; x < dst_w; x++) {
+            int sx = (int)((int64_t)x * src_w / dst_w);
+            if (sx >= src_w) sx = src_w - 1;
+            const uint8_t* src = pixels + (size_t)sy * stride + (size_t)sx * 4;
+            uint8_t* dst = s_media_scratch + swizzled_offset_w(x, y, tex_w);
+            dst[0] = src[3];
+            dst[1] = src[2];
+            dst[2] = src[1];
+            dst[3] = src[0];
+        }
+    }
+    if (!C3D_TexInit(&image->tex, (u16)tex_w, (u16)tex_h, GPU_RGBA8)) return false;
+    C3D_TexSetFilter(&image->tex, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&image->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexUpload(&image->tex, s_media_scratch);
+    C3D_TexFlush(&image->tex);
+    image->ready = true;
+    image->image_w = dst_w;
+    image->image_h = dst_h;
+    image->tex_w = tex_w;
+    image->tex_h = tex_h;
+    return true;
+}
+
+static bool decode_webp_image(
+    MediaImage* image,
+    const uint8_t* data,
+    size_t size,
+    int* out_w,
+    int* out_h
+) {
+    WebPDecoderConfig config;
+    if (!WebPInitDecoderConfig(&config)) return false;
+    if (WebPGetFeatures(data, size, &config.input) != VP8_STATUS_OK) return false;
+    int src_w = config.input.width;
+    int src_h = config.input.height;
+    if (src_w <= 0 || src_h <= 0) return false;
+    if ((uint64_t)src_w * (uint64_t)src_h > MEDIA_PIXEL_MAX) return false;
+    int dst_w, dst_h;
+    fit_dimensions(src_w, src_h, &dst_w, &dst_h);
+
+    const uint8_t* frame = data;
+    size_t frame_size = size;
+    WebPDemuxer* demux = NULL;
+    WebPIterator iterator;
+    bool has_iterator = false;
+    if (config.input.has_animation) {
+        WebPData webp = { .bytes = data, .size = size };
+        demux = WebPDemux(&webp);
+        if (demux && WebPDemuxGetFrame(demux, 1, &iterator)) {
+            frame = iterator.fragment.bytes;
+            frame_size = iterator.fragment.size;
+            has_iterator = true;
+        }
+    }
+
+    config.options.use_scaling = 1;
+    config.options.scaled_width = dst_w;
+    config.options.scaled_height = dst_h;
+    config.options.no_fancy_upsampling = 1;
+    config.output.colorspace = MODE_RGBA;
+    bool ok = WebPDecode(frame, frame_size, &config) == VP8_STATUS_OK;
+    if (!ok) {
+        WebPFreeDecBuffer(&config.output);
+        config.options.use_scaling = 0;
+        ok = WebPDecode(frame, frame_size, &config) == VP8_STATUS_OK;
+    }
+    if (ok) {
+        ok = upload_media_pixels(
+            image,
+            config.output.u.RGBA.rgba,
+            config.output.width,
+            config.output.height,
+            config.output.u.RGBA.stride,
+            dst_w,
+            dst_h);
+    }
+    WebPFreeDecBuffer(&config.output);
+    if (has_iterator) WebPDemuxReleaseIterator(&iterator);
+    if (demux) WebPDemuxDelete(demux);
+    if (ok) {
+        *out_w = dst_w;
+        *out_h = dst_h;
+    }
+    return ok;
+}
+
+static bool decode_svg_image(
+    MediaImage* image,
+    char* text,
+    size_t size,
+    int* out_w,
+    int* out_h
+) {
+    if (size > MEDIA_SVG_MAX) return false;
+    NSVGimage* svg = nsvgParse(text, "px", 96.0f);
+    if (!svg) return false;
+    if (!isfinite(svg->width) || !isfinite(svg->height)
+        || svg->width <= 0.0f || svg->height <= 0.0f
+        || svg->width > 100000.0f || svg->height > 100000.0f) {
+        nsvgDelete(svg);
+        return false;
+    }
+    int shapes = 0;
+    for (NSVGshape* shape = svg->shapes; shape; shape = shape->next) {
+        if (++shapes > 2000) {
+            nsvgDelete(svg);
+            return false;
+        }
+    }
+    int dst_w, dst_h;
+    fit_dimensions((int)(svg->width + 0.5f), (int)(svg->height + 0.5f), &dst_w, &dst_h);
+    float scale_x = (float)dst_w / svg->width;
+    float scale_y = (float)dst_h / svg->height;
+    float scale = scale_x < scale_y ? scale_x : scale_y;
+    NSVGrasterizer* rasterizer = nsvgCreateRasterizer();
+    if (!rasterizer) {
+        nsvgDelete(svg);
+        return false;
+    }
+    size_t bytes = (size_t)dst_w * (size_t)dst_h * 4;
+    uint8_t* pixels = (uint8_t*)malloc(bytes);
+    bool ok = false;
+    if (pixels) {
+        memset(pixels, 0, bytes);
+        nsvgRasterize(rasterizer, svg, 0.0f, 0.0f, scale, pixels, dst_w, dst_h, dst_w * 4);
+        ok = upload_media_pixels(image, pixels, dst_w, dst_h, (size_t)dst_w * 4, dst_w, dst_h);
+        free(pixels);
+    }
+    nsvgDeleteRasterizer(rasterizer);
+    nsvgDelete(svg);
+    if (ok) {
+        *out_w = dst_w;
+        *out_h = dst_h;
+    }
+    return ok;
+}
+
+static bool decode_raster_image(
+    MediaImage* image,
+    const uint8_t* data,
+    size_t size,
+    int* out_w,
+    int* out_h
+) {
+    int src_w = 0, src_h = 0, channels = 0;
+    if (!stbi_info_from_memory(data, (int)size, &src_w, &src_h, &channels)) return false;
+    if (src_w <= 0 || src_h <= 0) return false;
+    if ((uint64_t)src_w * (uint64_t)src_h > MEDIA_PIXEL_MAX) return false;
+    int dst_w, dst_h;
+    fit_dimensions(src_w, src_h, &dst_w, &dst_h);
+    unsigned char* pixels = stbi_load_from_memory(data, (int)size, &src_w, &src_h, &channels, 4);
+    if (!pixels) return false;
+    bool ok = upload_media_pixels(
+        image,
+        pixels,
+        src_w,
+        src_h,
+        (size_t)src_w * 4,
+        dst_w,
+        dst_h);
+    stbi_image_free(pixels);
+    if (ok) {
+        *out_w = dst_w;
+        *out_h = dst_h;
+    }
+    return ok;
+}
+
+static bool decode_media_data(
+    MediaImage* image,
+    const uint8_t* data,
+    size_t size,
+    int* out_w,
+    int* out_h
+) {
+    if (bytes_are_webp(data, size)) {
+        return decode_webp_image(image, data, size, out_w, out_h);
+    } else if (bytes_are_svg(data, size)) {
+        return decode_svg_image(image, (char*)data, size, out_w, out_h);
+    } else {
+        return decode_raster_image(image, data, size, out_w, out_h);
+    }
+}
+
+#define MEDIA_PREFETCH_SLOTS 4
+
+typedef struct {
+    char path[MEDIA_PATH_MAX];
+    uint8_t* pixels;
+    int width;
+    int height;
+    uint64_t used;
+} MediaPrefetch;
+
+static MediaPrefetch s_prefetch[MEDIA_PREFETCH_SLOTS];
+static uint64_t s_prefetch_clock;
+
+static int media_image_slot(void) {
+    for (int i = 0; i < MEDIA_IMAGE_SLOTS; i++) {
+        if (!s_media_images[i].ready) {
+            return i;
+        }
+    }
+    int slot = 0;
+    for (int i = 1; i < MEDIA_IMAGE_SLOTS; i++) {
+        if (s_media_images[i].used < s_media_images[slot].used) slot = i;
+    }
+    C3D_TexDelete(&s_media_images[slot].tex);
+    s_media_images[slot].ready = false;
+    return slot;
+}
+
+void ui_media_prefetch_clear(void) {
+    for (int i = 0; i < MEDIA_PREFETCH_SLOTS; i++) {
+        free(s_prefetch[i].pixels);
+        s_prefetch[i].pixels = NULL;
+        s_prefetch[i].path[0] = '\0';
+        s_prefetch[i].width = 0;
+        s_prefetch[i].height = 0;
+        s_prefetch[i].used = 0;
+    }
+}
+
+bool ui_media_prefetch(const char* path) {
+    if (!path || !path[0]) return false;
+    for (int i = 0; i < MEDIA_IMAGE_SLOTS; i++) {
+        if (s_media_images[i].ready && strcmp(s_media_images[i].path, path) == 0) {
+            return true;
+        }
+    }
+    int hit = -1;
+    for (int i = 0; i < MEDIA_PREFETCH_SLOTS; i++) {
+        if (s_prefetch[i].pixels && strcmp(s_prefetch[i].path, path) == 0) {
+            hit = i;
+            break;
+        }
+    }
+    if (hit >= 0) {
+        s_prefetch[hit].used = ++s_prefetch_clock;
+        return true;
+    }
+    size_t size = 0;
+    uint8_t* data = read_media_file(path, &size);
+    if (!data) return false;
+    s_capture_pixels_active = true;
+    free(s_captured_pixels);
+    s_captured_pixels = NULL;
+    s_captured_w = 0;
+    s_captured_h = 0;
+    int width = 0, height = 0;
+    bool ok = decode_media_data(NULL, data, size, &width, &height);
+    s_capture_pixels_active = false;
+    free(data);
+    if (!ok || !s_captured_pixels) {
+        free(s_captured_pixels);
+        s_captured_pixels = NULL;
+        return false;
+    }
+    int slot = -1;
+    for (int i = 0; i < MEDIA_PREFETCH_SLOTS; i++) {
+        if (!s_prefetch[i].pixels) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < MEDIA_PREFETCH_SLOTS; i++) {
+            if (s_prefetch[i].used < s_prefetch[slot].used) slot = i;
+        }
+        free(s_prefetch[slot].pixels);
+    }
+    snprintf(s_prefetch[slot].path, sizeof(s_prefetch[slot].path), "%s", path);
+    s_prefetch[slot].pixels = s_captured_pixels;
+    s_prefetch[slot].width = s_captured_w;
+    s_prefetch[slot].height = s_captured_h;
+    s_prefetch[slot].used = ++s_prefetch_clock;
+    s_captured_pixels = NULL;
+    return true;
+}
+
+int ui_media_image(const char* path, int* out_width, int* out_height) {
+    if (!path || !path[0]) return -1;
+    for (int i = 0; i < MEDIA_IMAGE_SLOTS; i++) {
+        if (s_media_images[i].ready && strcmp(s_media_images[i].path, path) == 0) {
+            s_media_images[i].used = ++s_media_clock;
+            if (out_width) *out_width = s_media_images[i].image_w;
+            if (out_height) *out_height = s_media_images[i].image_h;
+            return i;
+        }
+    }
+    for (int i = 0; i < MEDIA_PREFETCH_SLOTS; i++) {
+        if (s_prefetch[i].pixels && strcmp(s_prefetch[i].path, path) == 0) {
+            int slot = media_image_slot();
+            MediaImage* image = &s_media_images[slot];
+            bool ok = upload_media_pixels(
+                image,
+                s_prefetch[i].pixels,
+                s_prefetch[i].width,
+                s_prefetch[i].height,
+                (size_t)s_prefetch[i].width * 4,
+                s_prefetch[i].width,
+                s_prefetch[i].height);
+            int width = s_prefetch[i].width;
+            int height = s_prefetch[i].height;
+            free(s_prefetch[i].pixels);
+            s_prefetch[i].pixels = NULL;
+            s_prefetch[i].path[0] = '\0';
+            if (!ok) {
+                if (image->ready) {
+                    C3D_TexDelete(&image->tex);
+                    image->ready = false;
+                }
+                media_mark_missing(path);
+                return -1;
+            }
+            image->used = ++s_media_clock;
+            snprintf(image->path, sizeof(image->path), "%s", path);
+            if (out_width) *out_width = width;
+            if (out_height) *out_height = height;
+            return slot;
+        }
+    }
+    if (media_missing(path)) return -1;
+    int slot = media_image_slot();
+
+    size_t size = 0;
+    uint8_t* data = read_media_file(path, &size);
+    if (!data) {
+        media_mark_missing(path);
+        return -1;
+    }
+    MediaImage* image = &s_media_images[slot];
+    int width = 0, height = 0;
+    bool ok = decode_media_data(image, data, size, &width, &height);
+    free(data);
+    if (!ok) {
+        if (image->ready) {
+            C3D_TexDelete(&image->tex);
+            image->ready = false;
+        }
+        media_mark_missing(path);
+        return -1;
+    }
+    image->used = ++s_media_clock;
+    snprintf(image->path, sizeof(image->path), "%s", path);
+    if (out_width) *out_width = width;
+    if (out_height) *out_height = height;
+    return slot;
+}
+
+void ui_media_draw(int id, float x, float y, float w, float h) {
+    if (id < 0 || id >= MEDIA_IMAGE_SLOTS) return;
+    MediaImage* image = &s_media_images[id];
+    if (!image->ready || image->image_w <= 0 || image->image_h <= 0) return;
+    if (w <= 0.0f || h <= 0.0f) return;
+    Tex3DS_SubTexture subtexture = {
+        .width = (u16)w,
+        .height = (u16)h,
+        .left = 0.0f,
+        .top = 1.0f,
+        .right = (float)image->image_w / (float)image->tex_w,
+        .bottom = 1.0f - (float)image->image_h / (float)image->tex_h,
+    };
+    C2D_Image c2d = { .tex = &image->tex, .subtex = &subtexture };
+    C2D_DrawImageAt(c2d, x, y, 0.55f, NULL, 1.0f, 1.0f);
+}
+
+static int16_t* s_audio_pcm = NULL;
+static size_t s_audio_capacity = 0;
+static int16_t* s_prefetch_pcm = NULL;
+static char s_prefetch_audio_path[MEDIA_PATH_MAX];
+static ndspWaveBuf s_audio_wave;
+static bool s_audio_ready = false;
+
+static uint16_t audio_le16(const uint8_t* data) {
+    return (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
+}
+
+static uint32_t audio_le32(const uint8_t* data) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8)
+        | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static int16_t audio_clamp16(int32_t value) {
+    if (value > 32767) return 32767;
+    if (value < -32768) return -32768;
+    return (int16_t)value;
+}
+
+static void audio_set_mix(int channels) {
+    (void)channels;
+    float mix[12] = {0.0f};
+    mix[0] = 1.0f;
+    mix[1] = 1.0f;
+    ndspChnSetMix(AUDIO_CHANNEL, mix);
+}
+
+static bool audio_buffer_ensure(void) {
+    if (s_audio_pcm) return true;
+    size_t size = AUDIO_PCM_BYTES;
+    while (size >= 128 * 1024) {
+        s_audio_pcm = (int16_t*)linearAlloc(size);
+        if (s_audio_pcm) {
+            s_audio_capacity = size;
+            break;
+        }
+        size /= 2;
+    }
+    if (!s_audio_pcm) {
+        return false;
+    }
+    memset(s_audio_pcm, 0, s_audio_capacity);
+    return true;
+}
+
+static bool audio_ndsp_ensure(void) {
+    if (s_audio_ready) return true;
+    if (R_FAILED(ndspInit())) {
+        return false;
+    }
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+    ndspChnReset(AUDIO_CHANNEL);
+    ndspChnSetInterp(AUDIO_CHANNEL, NDSP_INTERP_LINEAR);
+    ndspChnSetFormat(AUDIO_CHANNEL, NDSP_FORMAT_STEREO_PCM16);
+    ndspChnSetRate(AUDIO_CHANNEL, 44100.0f);
+    audio_set_mix(2);
+    s_audio_ready = true;
+    return true;
+}
+
+static bool audio_ensure(void) {
+    return audio_buffer_ensure() && audio_ndsp_ensure();
+}
+
+void ui_audio_init(void) {
+    audio_ensure();
+}
+
+void ui_audio_fini(void) {
+    if (s_audio_pcm) {
+        ndspChnWaveBufClear(AUDIO_CHANNEL);
+        ndspChnSetPaused(AUDIO_CHANNEL, true);
+        linearFree(s_audio_pcm);
+        s_audio_pcm = NULL;
+        s_audio_capacity = 0;
+    }
+    free(s_prefetch_pcm);
+    s_prefetch_pcm = NULL;
+    s_prefetch_audio_path[0] = '\0';
+    if (s_audio_ready) ndspExit();
+    s_audio_ready = false;
+}
+
+void ui_audio_stop(void) {
+    if (!s_audio_ready) return;
+    ndspChnWaveBufClear(AUDIO_CHANNEL);
+    ndspChnSetPaused(AUDIO_CHANNEL, true);
+}
+
+static bool audio_start(int channels, int rate, size_t samples) {
+    if (channels < 1 || channels > 2 || rate < 4000 || rate > 192000 || samples == 0) {
+        return false;
+    }
+    if (samples % (size_t)channels != 0) return false;
+    size_t frames = samples / (size_t)channels;
+    if (frames == 0) return false;
+    ui_audio_stop();
+    memset(&s_audio_wave, 0, sizeof(s_audio_wave));
+    s_audio_wave.data_vaddr = s_audio_pcm;
+    s_audio_wave.nsamples = (u32)frames;
+    s_audio_wave.looping = false;
+    ndspChnSetFormat(
+        AUDIO_CHANNEL,
+        channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
+    ndspChnSetRate(AUDIO_CHANNEL, (float)rate);
+    audio_set_mix(channels);
+    DSP_FlushDataCache(s_audio_pcm, (u32)(samples * sizeof(int16_t)));
+    ndspChnWaveBufAdd(AUDIO_CHANNEL, &s_audio_wave);
+    ndspChnSetPaused(AUDIO_CHANNEL, false);
+    return true;
+}
+
+static bool audio_decode_mp3(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+    drmp3 mp3;
+    if (!drmp3_init_file(&mp3, path, NULL)) return false;
+    int channels = mp3.channels;
+    int rate = (int)mp3.sampleRate;
+    if (channels < 1 || channels > 2) {
+        drmp3_uninit(&mp3);
+        return false;
+    }
+    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t total = 0;
+    while (total < capacity) {
+        drmp3_uint64 want = (capacity - total) / (size_t)channels;
+        if (want == 0) break;
+        drmp3_uint64 got = drmp3_read_pcm_frames_s16(&mp3, want, s_audio_pcm + total);
+        if (got == 0) break;
+        total += (size_t)got * (size_t)channels;
+    }
+    drmp3_uninit(&mp3);
+    if (total == 0) return false;
+    *out_channels = channels;
+    *out_rate = rate;
+    *out_samples = total;
+    return true;
+}
+
+static bool audio_decode_vorbis(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+    FILE* source = fopen(path, "rb");
+    if (!source) return false;
+    OggVorbis_File file;
+    if (ov_open(source, &file, NULL, 0) != 0) {
+        fclose(source);
+        return false;
+    }
+    vorbis_info* info = ov_info(&file, -1);
+    if (!info || info->channels < 1) {
+        ov_clear(&file);
+        return false;
+    }
+    int channels = info->channels > 2 ? 2 : info->channels;
+    int rate = (int)info->rate;
+    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t total = 0;
+    int16_t temp[4096];
+    bool ok = false;
+    for (;;) {
+        int bitstream = 0;
+        long bytes = ov_read(&file, (char*)temp, (int)sizeof(temp), &bitstream);
+        if (bytes == 0) {
+            ok = true;
+            break;
+        }
+        if (bytes < 0) {
+            if (bytes == OV_HOLE) continue;
+            break;
+        }
+        size_t values = (size_t)bytes / sizeof(int16_t);
+        size_t frames = values / (size_t)info->channels;
+        for (size_t frame = 0; frame < frames && total + (size_t)channels <= capacity; frame++) {
+            for (int channel = 0; channel < channels; channel++) {
+                s_audio_pcm[total++] = temp[frame * (size_t)info->channels + (size_t)channel];
+            }
+        }
+        if (total + (size_t)channels > capacity) {
+            ok = true;
+            break;
+        }
+    }
+    ov_clear(&file);
+    if (!ok || total == 0) return false;
+    *out_channels = channels;
+    *out_rate = rate;
+    *out_samples = total;
+    return true;
+}
+
+static bool audio_decode_opus(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+    int error = 0;
+    OggOpusFile* file = op_open_file(path, &error);
+    if (!file) return false;
+    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t total = 0;
+    bool ok = false;
+    for (;;) {
+        int frames = op_read_stereo(file, s_audio_pcm + total, (int)(capacity - total));
+        if (frames == 0) {
+            ok = true;
+            break;
+        }
+        if (frames < 0) break;
+        total += (size_t)frames * 2;
+        if (total + 2 > capacity) {
+            ok = true;
+            break;
+        }
+    }
+    op_free(file);
+    if (!ok || total == 0) return false;
+    *out_channels = 2;
+    *out_rate = 48000;
+    *out_samples = total;
+    return true;
+}
+
+typedef struct {
+    uint16_t format;
+    uint16_t channels;
+    uint32_t rate;
+    uint16_t block_align;
+    uint16_t bits;
+    const uint8_t* data;
+    size_t data_size;
+} WavInfo;
+
+static bool audio_parse_wav(const uint8_t* data, size_t size, WavInfo* wav) {
+    if (size < 12 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) {
+        return false;
+    }
+    memset(wav, 0, sizeof(*wav));
+    bool have_format = false;
+    size_t pos = 12;
+    while (pos + 8 <= size) {
+        const uint8_t* chunk = data + pos;
+        uint32_t length = audio_le32(chunk + 4);
+        pos += 8;
+        if (length > size - pos) length = (uint32_t)(size - pos);
+        if (memcmp(chunk, "fmt ", 4) == 0 && length >= 16) {
+            wav->format = audio_le16(chunk + 8);
+            wav->channels = audio_le16(chunk + 10);
+            wav->rate = audio_le32(chunk + 12);
+            wav->block_align = audio_le16(chunk + 20);
+            wav->bits = audio_le16(chunk + 22);
+            if (wav->format == 0xFFFE && length >= 40) wav->format = audio_le16(chunk + 32);
+            have_format = true;
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            wav->data = chunk + 8;
+            wav->data_size = length;
+            if (have_format) break;
+        }
+        pos += length + (length & 1);
+    }
+    return have_format && wav->data && wav->channels > 0 && wav->rate > 0
+        && (wav->format == 1 || wav->format == 3);
+}
+
+static bool audio_decode_wav(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+    size_t size = 0;
+    uint8_t* data = read_media_file(path, &size);
+    if (!data) return false;
+    WavInfo wav;
+    bool parsed = audio_parse_wav(data, size, &wav);
+    if (!parsed) {
+        free(data);
+        return false;
+    }
+    int source_channels = wav.channels;
+    int channels = source_channels > 2 ? 2 : source_channels;
+    int bytes_per_sample = wav.bits / 8;
+    int frame_size = wav.block_align ? wav.block_align : source_channels * bytes_per_sample;
+    if (bytes_per_sample < 1 || bytes_per_sample > 4 || frame_size < source_channels * bytes_per_sample) {
+        free(data);
+        return false;
+    }
+    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t total = 0;
+    size_t frames = wav.data_size / (size_t)frame_size;
+    for (size_t frame = 0; frame < frames && total + (size_t)channels <= capacity; frame++) {
+        const uint8_t* source = wav.data + frame * (size_t)frame_size;
+        for (int channel = 0; channel < channels; channel++) {
+            const uint8_t* sample = source + (size_t)channel * (size_t)bytes_per_sample;
+            int32_t value = 0;
+            if (wav.format == 3 && wav.bits == 32) {
+                float decoded = 0.0f;
+                memcpy(&decoded, sample, sizeof(decoded));
+                if (decoded > 1.0f) decoded = 1.0f;
+                if (decoded < -1.0f) decoded = -1.0f;
+                value = (int32_t)(decoded * 32767.0f);
+            } else if (wav.bits == 8) {
+                value = ((int32_t)sample[0] - 128) * 256;
+            } else if (wav.bits == 16) {
+                value = (int16_t)audio_le16(sample);
+            } else if (wav.bits == 24) {
+                value = (int32_t)((uint32_t)sample[0] << 8 | (uint32_t)sample[1] << 16 | (uint32_t)sample[2] << 24) >> 16;
+            } else if (wav.bits == 32) {
+                value = (int32_t)audio_le32(sample) >> 16;
+            } else {
+                free(data);
+                return false;
+            }
+            s_audio_pcm[total++] = audio_clamp16(value);
+        }
+    }
+    free(data);
+    if (total == 0) return false;
+    *out_channels = channels;
+    *out_rate = (int)wav.rate;
+    *out_samples = total;
+    return true;
+}
+
+static bool audio_extension_is(const char* path, const char* first, const char* second) {
+    const char* dot = strrchr(path, '.');
+    if (!dot) return false;
+    dot++;
+    return strcasecmp(dot, first) == 0 || (second && strcasecmp(dot, second) == 0);
+}
+
+static bool audio_decode_path(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+    if (audio_extension_is(path, "ogg", "oga")) {
+        return audio_decode_vorbis(path, out_channels, out_rate, out_samples);
+    } else if (audio_extension_is(path, "opus", "spx")) {
+        return audio_decode_opus(path, out_channels, out_rate, out_samples);
+    } else if (audio_extension_is(path, "wav", "wave")) {
+        return audio_decode_wav(path, out_channels, out_rate, out_samples);
+    } else {
+        return audio_decode_mp3(path, out_channels, out_rate, out_samples);
+    }
+}
+
+static int s_prefetch_channels = 0;
+static int s_prefetch_rate = 0;
+static size_t s_prefetch_samples = 0;
+
+void ui_audio_prefetch_clear(void) {
+    free(s_prefetch_pcm);
+    s_prefetch_pcm = NULL;
+    s_prefetch_channels = 0;
+    s_prefetch_rate = 0;
+    s_prefetch_samples = 0;
+    s_prefetch_audio_path[0] = '\0';
+}
+
+bool ui_audio_prefetch(const char* path) {
+    if (!path || !path[0]) return false;
+    if (s_prefetch_pcm && strcmp(s_prefetch_audio_path, path) == 0) return true;
+    if (!audio_buffer_ensure()) return false;
+    int16_t* saved_pcm = s_audio_pcm;
+    size_t saved_capacity = s_audio_capacity;
+    int16_t* buffer = (int16_t*)malloc(AUDIO_PCM_BYTES);
+    if (!buffer) return false;
+    s_audio_pcm = buffer;
+    s_audio_capacity = AUDIO_PCM_BYTES;
+    int channels = 0;
+    int rate = 0;
+    size_t samples = 0;
+    bool ok = audio_decode_path(path, &channels, &rate, &samples);
+    s_audio_pcm = saved_pcm;
+    s_audio_capacity = saved_capacity;
+    if (!ok || samples == 0) {
+        free(buffer);
+        return false;
+    }
+    free(s_prefetch_pcm);
+    s_prefetch_pcm = buffer;
+    s_prefetch_channels = channels;
+    s_prefetch_rate = rate;
+    s_prefetch_samples = samples;
+    snprintf(s_prefetch_audio_path, sizeof(s_prefetch_audio_path), "%s", path);
+    return true;
+}
+
+bool ui_audio_is_playing(void) {
+    return s_audio_ready && ndspChnIsPlaying(AUDIO_CHANNEL);
+}
+
+bool ui_audio_decode(const char* path) {
+    if (!path || !path[0]) return false;
+    if (!audio_buffer_ensure()) return false;
+    int channels = 0;
+    int rate = 0;
+    size_t samples = 0;
+    return audio_decode_path(path, &channels, &rate, &samples);
+}
+
+bool ui_audio_play(const char* path) {
+    if (!path || !path[0]) return false;
+    if (!audio_buffer_ensure()) return false;
+    if (s_prefetch_pcm && strcmp(s_prefetch_audio_path, path) == 0
+        && s_prefetch_samples > 0
+        && s_prefetch_samples * sizeof(int16_t) <= s_audio_capacity
+        && audio_ndsp_ensure()) {
+        memcpy(s_audio_pcm, s_prefetch_pcm, s_prefetch_samples * sizeof(int16_t));
+        if (audio_start(s_prefetch_channels, s_prefetch_rate, s_prefetch_samples)) {
+            return true;
+        }
+    }
+    int channels = 0;
+    int rate = 0;
+    size_t samples = 0;
+    bool ok = audio_decode_path(path, &channels, &rate, &samples);
+    if (!ok) {
+        if (audio_extension_is(path, "mp3", NULL)) {
+            ok = audio_decode_vorbis(path, &channels, &rate, &samples)
+                || audio_decode_opus(path, &channels, &rate, &samples);
+        } else if (!audio_extension_is(path, "ogg", "oga") && !audio_extension_is(path, "opus", "spx")
+            && !audio_extension_is(path, "wav", "wave")) {
+            ok = audio_decode_vorbis(path, &channels, &rate, &samples)
+                || audio_decode_opus(path, &channels, &rate, &samples)
+                || audio_decode_wav(path, &channels, &rate, &samples);
+        }
+    }
+    if (!ok) return false;
+    if (!audio_ndsp_ensure()) return false;
+    return audio_start(channels, rate, samples);
 }
 
 static int card_font_px(float scale) {
@@ -347,12 +1365,17 @@ bool ui_init(const void* font_data, size_t font_size) {
         }
     }
 
+    ui_audio_init();
+
     s_initialized = true;
     return true;
 }
 
 void ui_fini(void) {
     if (!s_initialized) return;
+
+    ui_audio_fini();
+    ui_media_reset();
 
     if (s_text_buf) {
         C2D_TextBufDelete(s_text_buf);
@@ -919,7 +1942,14 @@ void ui_draw_button(float x, float y, float w, float h, const char* text, const 
         ui_draw_text_centered(x + (w / 2.0f), y + 5.0f, 0.40f, top_clr, top_line);
         ui_draw_text_centered(x + (w / 2.0f), y + 19.0f, 0.46f, fg, bottom_line);
     } else {
-        ui_draw_text_centered(x + (w / 2.0f), y + (h / 2.0f) - 6.0f, 0.50f, fg, text);
+        float scale = 0.50f;
+        float text_width = ui_get_text_width(scale, text);
+        float available = w - 12.0f;
+        if (available > 0.0f && text_width > available) {
+            scale *= available / text_width;
+            if (scale < 0.30f) scale = 0.30f;
+        }
+        ui_draw_text_centered(x + (w / 2.0f), y + (h / 2.0f) - 6.0f, scale, fg, text);
     }
 }
 

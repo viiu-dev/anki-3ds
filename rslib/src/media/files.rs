@@ -2,16 +2,21 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::fs::FileTimes;
 use std::io;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time;
 
 use anki_io::create_dir;
+use anki_io::create_dir_all;
 use anki_io::open_file;
 use anki_io::set_file_times;
 use anki_io::write_file;
@@ -70,6 +75,238 @@ pub(crate) static NONSYNCABLE_FILENAME: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Shard subdirectory for a media file, from a hash of its filename.
+pub fn shard_dir_name(fname: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in fname.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:02x}", (hash >> 24) as u8)
+}
+
+/// Full path of a media file inside its shard subdirectory.
+pub fn sharded_path(folder: &Path, fname: &str) -> PathBuf {
+    folder.join(shard_dir_name(fname)).join(fname)
+}
+
+/// Existing media file, preferring its shard copy.
+pub fn locate_existing(folder: &Path, fname: &str) -> Option<PathBuf> {
+    let sharded = sharded_path(folder, fname);
+    if sharded.is_file() {
+        return Some(sharded);
+    }
+    let root = folder.join(fname);
+    if root.is_file() {
+        return Some(root);
+    }
+    None
+}
+
+fn open_media_file(folder: &Path, fname: &str) -> std::result::Result<fs::File, FileIoError> {
+    match anki_io::open_file(sharded_path(folder, fname)) {
+        Err(e) if e.is_not_found() => anki_io::open_file(folder.join(fname)),
+        res => res,
+    }
+}
+
+/// Bare filenames and full paths for every media file, including sharded
+/// ones. A name present in both the root and a shard resolves to the shard.
+pub fn media_file_entries(folder: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let root_entries: Vec<fs::DirEntry> = fs::read_dir(folder)?.collect::<io::Result<_>>()?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for entry in &root_entries {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(sub) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for entry in sub.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                if seen.insert(name.to_owned()) {
+                    out.push((name.to_owned(), path));
+                }
+            }
+        }
+    }
+    for entry in &root_entries {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if seen.insert(name.to_owned()) {
+                out.push((name.to_owned(), path));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Count of media files, including sharded ones.
+pub fn media_file_count(folder: &Path) -> Result<usize> {
+    Ok(media_file_entries(folder)?.len())
+}
+
+#[derive(Default)]
+struct MediaNameIndexInner {
+    files: HashSet<String>,
+    unmigrated: HashSet<String>,
+}
+
+/// Concurrent set of media filenames present on disk, shared between the
+/// background sync worker and the UI thread. The worker pushes additions,
+/// removals and migration updates; readers only do in-memory lookups.
+#[derive(Default)]
+pub struct MediaNameIndex {
+    inner: Mutex<MediaNameIndexInner>,
+}
+
+impl MediaNameIndex {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn insert(&self, fname: &str, unmigrated: bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.files.insert(fname.to_owned());
+        if unmigrated {
+            inner.unmigrated.insert(fname.to_owned());
+        } else {
+            inner.unmigrated.remove(fname);
+        }
+    }
+
+    pub fn remove(&self, fname: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.files.remove(fname);
+        inner.unmigrated.remove(fname);
+    }
+
+    pub fn mark_migrated(&self, fname: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unmigrated
+            .remove(fname);
+    }
+
+    pub fn contains(&self, fname: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .files
+            .contains(fname)
+    }
+
+    pub fn is_unmigrated(&self, fname: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unmigrated
+            .contains(fname)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .files
+            .len()
+    }
+}
+
+/// Latest modification time of the folder or any shard subdirectory.
+pub(crate) fn combined_folder_mtime(folder: &Path) -> io::Result<i64> {
+    let mut latest = mtime_as_i64(folder)?;
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(mtime) = mtime_as_i64(&path) {
+                    latest = latest.max(mtime);
+                }
+            }
+        }
+    }
+    Ok(latest)
+}
+
+fn remove_superseded_root_copy(folder: &Path, fname: &str) {
+    let root = folder.join(fname);
+    if root != sharded_path(folder, fname) {
+        let _ = fs::remove_file(root);
+    }
+}
+
+fn files_have_same_contents(first: &Path, second: &Path) -> Result<bool> {
+    let first_meta = fs::metadata(first)?;
+    let second_meta = fs::metadata(second)?;
+    if first_meta.len() != second_meta.len() {
+        return Ok(false);
+    }
+    Ok(sha1_of_file(first)? == sha1_of_file(second)?)
+}
+
+/// Move root files into shard subdirectories, returning the moved count.
+/// Stops with [AnkiError::Interrupted] when `keep_going` reports false.
+pub fn migrate_media_to_shards(
+    folder: &Path,
+    keep_going: &mut impl FnMut() -> bool,
+) -> Result<Vec<String>> {
+    let mut moved = Vec::new();
+    let mut created: HashSet<String> = HashSet::new();
+    let root_entries: Vec<fs::DirEntry> = fs::read_dir(folder)?.collect::<io::Result<_>>()?;
+    for entry in &root_entries {
+        if !keep_going() {
+            return Err(AnkiError::Interrupted);
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if NONSYNCABLE_FILENAME.is_match(name) {
+            continue;
+        }
+        let shard = shard_dir_name(name);
+        let dest = folder.join(&shard).join(name);
+        if dest == path {
+            continue;
+        }
+        if dest.exists() {
+            if files_have_same_contents(&path, &dest)? {
+                fs::remove_file(&path)?;
+                moved.push(name.to_owned());
+            }
+            continue;
+        }
+        if created.insert(shard.clone()) {
+            create_dir_all(folder.join(&shard))?;
+        }
+        match fs::rename(&path, &dest) {
+            Ok(()) => moved.push(name.to_owned()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(moved)
+}
+
 /// True if character may cause problems on one or more platforms.
 fn disallowed_char(char: char) -> bool {
     match char {
@@ -91,7 +328,7 @@ fn nonbreaking_space(char: char) -> bool {
 /// - Any problem characters are removed.
 /// - Windows device names like CON and PRN have '_' appended
 /// - The filename is limited to 120 bytes.
-pub(crate) fn normalize_filename(fname: &str) -> Cow<'_, str> {
+pub fn normalize_filename(fname: &str) -> Cow<'_, str> {
     let mut output = Cow::Borrowed(fname);
 
     if !is_nfc(output.as_ref()) {
@@ -175,24 +412,23 @@ where
 {
     let normalized_name = normalize_filename(desired_name);
 
-    let mut target_path = folder.as_ref().join(normalized_name.as_ref());
-
-    let existing_file_hash = existing_file_sha1(&target_path)?;
-
-    if matches!(existing_file_hash, Some(hash) if hash == sha1) {
-        #[cfg(target_os = "horizon")]
-        let canonical = anki_io::canonical_sd_file(&target_path);
-        #[cfg(not(target_os = "horizon"))]
-        let canonical = fs::canonicalize(&target_path);
-        if let Some(normalised_existing_name) = canonical.ok().and_then(|p| {
-            p.file_name()?
-                .to_str()
-                .and_then(filename_if_normalized)
-                .map(Cow::into_owned)
-        }) {
-            // existing file has same checksum and normalised name, nothing to
-            // do
-            return Ok(normalised_existing_name.into());
+    if let Some(existing) = locate_existing(folder.as_ref(), normalized_name.as_ref()) {
+        let existing_file_hash = existing_file_sha1(&existing)?;
+        if matches!(existing_file_hash, Some(hash) if hash == sha1) {
+            #[cfg(target_os = "horizon")]
+            let canonical = anki_io::canonical_sd_file(&existing);
+            #[cfg(not(target_os = "horizon"))]
+            let canonical = fs::canonicalize(&existing);
+            if let Some(normalised_existing_name) = canonical.ok().and_then(|p| {
+                p.file_name()?
+                    .to_str()
+                    .and_then(filename_if_normalized)
+                    .map(Cow::into_owned)
+            }) {
+                // existing file has same checksum and normalised name, nothing
+                // to do
+                return Ok(normalised_existing_name.into());
+            }
         }
     }
 
@@ -206,17 +442,25 @@ where
         );
     }
 
-    if existing_file_hash.is_none() {
+    if locate_existing(folder.as_ref(), normalized_name.as_ref()).is_none() {
         // no file with that name that's also in lowercase exists yet
+        let target_path = sharded_path(folder.as_ref(), normalized_name.as_ref());
+        if let Some(parent) = target_path.parent() {
+            create_dir_all(parent)?;
+        }
         write_file(&target_path, data)?;
+        remove_superseded_root_copy(folder.as_ref(), normalized_name.as_ref());
         return Ok(normalized_name);
     }
 
     // give it a unique name based on its hash
     let hashed_name = add_hash_suffix_to_file_stem(normalized_name.as_ref(), &sha1);
-    target_path.set_file_name(&hashed_name);
-
+    let target_path = sharded_path(folder.as_ref(), &hashed_name);
+    if let Some(parent) = target_path.parent() {
+        create_dir_all(parent)?;
+    }
     write_file(&target_path, data)?;
+    remove_superseded_root_copy(folder.as_ref(), &hashed_name);
     Ok(hashed_name.into())
 }
 
@@ -355,17 +599,11 @@ where
     let trash_folder = trash_folder(media_folder)?;
 
     for file in files {
-        let src_path = media_folder.join(file.as_ref());
+        let src_path = match locate_existing(media_folder, file.as_ref()) {
+            Some(path) => path,
+            None => return Ok(()),
+        };
         let dst_path = trash_folder.join(file.as_ref());
-
-        // if the file doesn't exist, nothing to do
-        if let Err(e) = fs::metadata(&src_path) {
-            if e.kind() == io::ErrorKind::NotFound {
-                return Ok(());
-            } else {
-                return Err(e.into());
-            }
-        }
 
         // move file to trash, clobbering any existing file with the same name
         fs::rename(&src_path, &dst_path)?;
@@ -421,9 +659,13 @@ pub(crate) fn add_file_from_ankiweb(
 
     // if the filename is already valid, we can write the file directly
     let (renamed_from, path) = if let Cow::Borrowed(_) = normalized {
-        let path = media_folder.join(normalized.as_ref());
+        let path = sharded_path(media_folder, normalized.as_ref());
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)?;
+        }
         debug!(fname = normalized.as_ref(), "write");
         write_file(&path, data)?;
+        remove_superseded_root_copy(media_folder, normalized.as_ref());
         (None, path)
     } else {
         // ankiweb sent us a non-normalized filename, so we'll rename it
@@ -435,7 +677,7 @@ pub(crate) fn add_file_from_ankiweb(
         );
         (
             Some(fname.to_string()),
-            media_folder.join(new_name.as_ref()),
+            sharded_path(media_folder, new_name.as_ref()),
         )
     };
 
@@ -449,8 +691,69 @@ pub(crate) fn add_file_from_ankiweb(
     })
 }
 
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha1,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Like [add_file_from_ankiweb], but streams the file straight to its final
+/// path while checksumming, so a large download is never held in memory.
+pub(crate) fn add_file_from_ankiweb_streaming(
+    media_folder: &Path,
+    fname: &str,
+    reader: &mut impl Read,
+) -> Result<AddedFile> {
+    let normalized = normalize_filename(fname);
+    if let Cow::Borrowed(_) = normalized {
+        let path = sharded_path(media_folder, normalized.as_ref());
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)?;
+        }
+        let (sha1, mtime) = write_file_hashing(&path, reader)?;
+        remove_superseded_root_copy(media_folder, normalized.as_ref());
+        debug!(fname = normalized.as_ref(), "write");
+        Ok(AddedFile {
+            fname: normalized.to_string(),
+            sha1,
+            mtime,
+            renamed_from: None,
+        })
+    } else {
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data)?;
+        add_file_from_ankiweb(media_folder, fname, &data)
+    }
+}
+
+fn write_file_hashing(path: &Path, reader: &mut impl Read) -> Result<(Sha1Hash, i64)> {
+    let file = fs::File::create(path)?;
+    let mut writer = HashingWriter {
+        inner: io::BufWriter::with_capacity(64 * 1024, file),
+        hasher: Sha1::new(),
+    };
+    io::copy(reader, &mut writer)?;
+    let HashingWriter { mut inner, hasher } = writer;
+    inner.flush()?;
+    drop(inner);
+    let sha1: Sha1Hash = hasher.finalize().into();
+    let mtime = mtime_as_i64(path)?;
+    Ok((sha1, mtime))
+}
+
 pub(crate) fn data_for_file(media_folder: &Path, fname: &str) -> Result<Option<Vec<u8>>> {
-    let mut file = match open_file(media_folder.join(fname)) {
+    let mut file = match open_media_file(media_folder, fname) {
         Err(e) if e.is_not_found() => return Ok(None),
         res => res?,
     };
@@ -565,9 +868,10 @@ mod test {
             "caf\u{e9}-8f0bc65da355c6cb184de9d17bfe1baaeefbd443.mp3"
         );
 
-        let mut written_files = std::fs::read_dir(dpath)
+        let mut written_files = crate::media::files::media_file_entries(dpath)
             .unwrap()
-            .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+            .into_iter()
+            .map(|(fname, _)| fname)
             .collect::<Vec<_>>();
         written_files.sort();
         assert_eq!(
@@ -582,6 +886,52 @@ mod test {
 
         // remove
         remove_files(dpath, written_files.as_slice()).unwrap();
+    }
+
+    #[test]
+    fn sharding_roundtrip() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("media");
+        std::fs::create_dir(&folder).unwrap();
+
+        let name = "some-audio-file.mp3";
+        let shard = crate::media::files::shard_dir_name(name);
+        assert_eq!(shard.len(), 2);
+        assert!(shard.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        let path = crate::media::files::sharded_path(&folder, name);
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), shard.as_str());
+
+        assert!(crate::media::files::locate_existing(&folder, name).is_none());
+
+        std::fs::write(folder.join(name), "root copy").unwrap();
+        assert_eq!(
+            crate::media::files::locate_existing(&folder, name).unwrap(),
+            folder.join(name)
+        );
+
+        let mut keep_going = || true;
+        assert_eq!(
+            crate::media::files::migrate_media_to_shards(&folder, &mut keep_going).unwrap(),
+            vec![name.to_string()]
+        );
+        assert_eq!(
+            crate::media::files::locate_existing(&folder, name).unwrap(),
+            path
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"root copy");
+
+        let entries = crate::media::files::media_file_entries(&folder).unwrap();
+        assert_eq!(entries, vec![(name.to_string(), path.clone())]);
+        assert_eq!(crate::media::files::media_file_count(&folder).unwrap(), 1);
+        assert_eq!(
+            crate::media::files::combined_folder_mtime(&folder).unwrap(),
+            crate::media::files::mtime_as_i64(
+                folder.join(crate::media::files::shard_dir_name(name))
+            )
+            .unwrap()
+            .max(crate::media::files::mtime_as_i64(&folder).unwrap())
+        );
     }
 
     #[test]

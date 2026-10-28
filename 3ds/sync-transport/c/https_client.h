@@ -50,6 +50,7 @@ typedef struct {
 } Anki3dsRequestOptions;
 
 int anki_3ds_https_post(
+    int slot,
     const char *host,
     const char *path,
     const char *header_anki_sync,
@@ -62,6 +63,11 @@ int anki_3ds_https_post(
 );
 
 void anki_3ds_http_response_free(Anki3dsHttpResponse *resp);
+
+// Must be called once before any concurrent requests are issued.
+int anki_3ds_https_global_init(void);
+
+void anki_3ds_https_cleanup(void);
 
 #ifdef __cplusplus
 }

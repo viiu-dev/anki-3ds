@@ -314,9 +314,24 @@ pub(crate) fn open_or_create<P: AsRef<Path>>(path: P) -> error::Result<Connectio
         );
     }
 
+    // WAL needs either shared memory or exclusive locking. The SD VFS has no
+    // shared-memory support, so the console connection stays exclusive, as the
+    // collection database does.
+    #[cfg(target_os = "horizon")]
+    db.pragma_update(None, "locking_mode", "exclusive")?;
     db.pragma_update(None, "page_size", 4096)?;
     db.pragma_update(None, "legacy_file_format", false)?;
-    db.pragma_update_and_check(None, "journal_mode", "wal", |_| Ok(()))?;
+    db.pragma_update(None, "synchronous", "normal")?;
+    db.pragma_update(None, "temp_store", "memory")?;
+    if db
+        .pragma_update_and_check(None, "journal_mode", "wal", |_| Ok(()))
+        .is_err()
+    {
+        // The SD-card VFS cannot back WAL shared memory, so fall back to an
+        // in-memory journal instead of repeatedly creating and deleting a
+        // rollback journal next to the database.
+        db.pragma_update(None, "journal_mode", "memory")?;
+    }
 
     initial_db_setup(&mut db)?;
 

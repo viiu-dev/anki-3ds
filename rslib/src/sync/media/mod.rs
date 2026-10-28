@@ -1,25 +1,17 @@
 // Copyright: Ankitects Pty Ltd and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
-#[cfg(feature = "network")]
 pub mod begin;
-#[cfg(feature = "network")]
 pub mod changes;
 pub mod database;
-#[cfg(feature = "network")]
 pub mod download;
 pub mod progress;
-#[cfg(feature = "network")]
 pub mod protocol;
-#[cfg(feature = "network")]
 pub mod sanity;
-#[cfg(feature = "network")]
 pub mod syncer;
 #[cfg(feature = "network")]
 mod tests;
-#[cfg(feature = "network")]
 pub mod upload;
-#[cfg(feature = "network")]
 pub mod zip;
 
 /// The maximum length we allow a filename to be. When combined
@@ -36,6 +28,9 @@ pub const MAX_MEDIA_FILENAME_LENGTH_SERVER: usize = 255;
 pub static MAX_INDIVIDUAL_MEDIA_FILE_SIZE: usize = 100 * 1024 * 1024;
 
 pub static MAX_MEDIA_FILES_IN_ZIP: usize = 25;
+
+/// Maximum number of simultaneous media download connections.
+pub const MAX_MEDIA_CONNECTIONS: usize = 4;
 
 /// If reached, no further files are placed into the zip.
 pub static MEDIA_SYNC_TARGET_ZIP_BYTES: usize = (2.5 * 1024.0 * 1024.0) as usize;

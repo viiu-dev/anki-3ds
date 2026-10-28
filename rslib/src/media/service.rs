@@ -98,13 +98,14 @@ impl crate::services::MediaService for Collection {
         &mut self,
         path: anki_proto::generic::String,
     ) -> error::Result<generic::String> {
-        Ok(self
-            .media()?
-            .media_folder
-            .join(path.val)
-            .to_string_lossy()
-            .to_string()
-            .into())
+        let mgr = self.media()?;
+        Ok(
+            crate::media::files::locate_existing(&mgr.media_folder, &path.val)
+                .unwrap_or_else(|| crate::media::files::sharded_path(&mgr.media_folder, &path.val))
+                .to_string_lossy()
+                .to_string()
+                .into(),
+        )
     }
 }
 

@@ -6,6 +6,7 @@ mod auth_store;
 mod backend;
 mod clock;
 mod i18n;
+mod media_sync;
 mod review_text;
 mod sync;
 mod theme;
@@ -49,6 +50,38 @@ fn error_text(error: &dyn std::error::Error) -> String {
         source = error.source();
     }
     text
+}
+pub(crate) fn media_diag(path: &str) -> String {
+    let size = match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return "missing".into(),
+    };
+    let mut head = [0u8; 8];
+    let count = fs::File::open(path)
+        .map(|mut file| {
+            use std::io::Read;
+            file.read(&mut head).unwrap_or(0)
+        })
+        .unwrap_or(0);
+    if count == 0 {
+        return format!("size={size} head=empty");
+    }
+    let mut hex = String::with_capacity(count * 2);
+    for byte in &head[..count] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("size={size} head={hex}")
+}
+pub(crate) fn log_media_once(key: &str, text: &str) {
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let logged = LOGGED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let mut guard = logged
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.insert(key.to_owned()) {
+        event(text);
+    }
 }
 
 pub struct DeckItem {
@@ -219,6 +252,248 @@ fn browse_chip(x: f32, y: f32, w: f32, h: f32, label: &str, active: bool) {
     );
 }
 
+const AUDIO_Y: f32 = 84.0;
+const AUDIO_H: f32 = 32.0;
+
+fn card_audio(card: &backend::OfferedCard, answer: bool) -> Vec<backend::MediaRef> {
+    let media = if answer {
+        &card.answer_media
+    } else {
+        &card.question_media
+    };
+    media.iter().filter(|item| item.audio).cloned().collect()
+}
+
+fn audio_button_rects(count: usize) -> Vec<(f32, f32)> {
+    let count = count.min(3);
+    if count == 0 {
+        return Vec::new();
+    }
+    let gap = 6.0;
+    let width = (320.0 - 16.0 - (count as f32 - 1.0) * gap) / count as f32;
+    (0..count)
+        .map(|index| (8.0 + index as f32 * (width + gap), width))
+        .collect()
+}
+
+fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase: u64) {
+    for (index, (x, width)) in audio_button_rects(audio.len()).into_iter().enumerate() {
+        let state = states.get(index).copied().unwrap_or(AudioState::Pending);
+        let (background, foreground) = match state {
+            AudioState::Playing => (current_theme().accent, current_theme().on_accent),
+            AudioState::Ready => (current_theme().surface_alt, current_theme().text),
+            AudioState::Pending => (current_theme().surface_alt, current_theme().text_muted),
+        };
+        Ui::draw_rounded_rect(x, AUDIO_Y, width, AUDIO_H, AUDIO_H * 0.5, background);
+        let center_y = AUDIO_Y + AUDIO_H * 0.5;
+        match state {
+            AudioState::Ready => {
+                Ui::draw_triangle(
+                    x + 6.0,
+                    center_y - 6.0,
+                    x + 6.0,
+                    center_y + 6.0,
+                    x + 16.0,
+                    center_y,
+                    current_theme().accent,
+                );
+            }
+            AudioState::Pending => {
+                Ui::draw_rect(
+                    x + 8.0,
+                    center_y - 7.0,
+                    4.0,
+                    7.0,
+                    current_theme().text_muted,
+                );
+                Ui::draw_triangle(
+                    x + 5.0,
+                    center_y,
+                    x + 15.0,
+                    center_y,
+                    x + 10.0,
+                    center_y + 6.0,
+                    current_theme().text_muted,
+                );
+            }
+            AudioState::Playing => {
+                Ui::draw_rect(x + 4.0, center_y - 3.0, 4.0, 6.0, foreground);
+                Ui::draw_triangle(
+                    x + 8.0,
+                    center_y - 6.0,
+                    x + 8.0,
+                    center_y + 6.0,
+                    x + 14.0,
+                    center_y,
+                    foreground,
+                );
+                for bar in 0..3 {
+                    let height = 3.0 + (((phase + index as u64 * 2 + bar) % 8) as f32 - 4.0).abs();
+                    Ui::draw_rect(
+                        x + 17.0 + bar as f32 * 4.0,
+                        center_y - height * 0.5,
+                        2.0,
+                        height,
+                        foreground,
+                    );
+                }
+            }
+        }
+        let label = i18n::format("Audio {0}", &[&(index + 1).to_string()]);
+        Ui::draw_text_centered(
+            x + width * 0.5 + 9.0,
+            AUDIO_Y + 10.0,
+            0.42,
+            foreground,
+            &label,
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AudioState {
+    Pending,
+    Ready,
+    Playing,
+}
+
+fn audio_states(
+    audio: &[backend::MediaRef],
+    backend: Option<&Backend>,
+    playing: Option<&str>,
+) -> Vec<AudioState> {
+    audio
+        .iter()
+        .map(|item| {
+            if Some(item.filename.as_str()) == playing {
+                AudioState::Playing
+            } else if backend.is_some_and(|active| active.media_exists(&item.filename)) {
+                AudioState::Ready
+            } else {
+                AudioState::Pending
+            }
+        })
+        .collect()
+}
+
+enum PrefetchFile {
+    Image(String),
+    Audio(String),
+}
+
+fn prefetch_for_card(backend: &Backend, card: &backend::OfferedCard) -> Vec<PrefetchFile> {
+    let mut files = Vec::new();
+    for item in card
+        .question_media
+        .iter()
+        .chain(card.answer_media.iter())
+        .filter(|item| item.audio)
+    {
+        if backend.media_exists(&item.filename) {
+            files.push(PrefetchFile::Audio(backend.media_path(&item.filename)));
+        }
+    }
+    for item in card
+        .answer_media
+        .iter()
+        .chain(card.question_media.iter())
+        .filter(|item| !item.audio)
+    {
+        if backend.media_exists(&item.filename) {
+            files.push(PrefetchFile::Image(backend.media_path(&item.filename)));
+        }
+    }
+    files
+}
+
+#[derive(Default)]
+struct Prefetch {
+    thread: Option<std::thread::JoinHandle<()>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Prefetch {
+    fn stop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn request(&mut self, files: Vec<PrefetchFile>) {
+        if let Some(handle) = self.thread.take() {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        self.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        self.thread = std::thread::Builder::new()
+            .name("prefetch".into())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                Ui::media_prefetch_clear();
+                Ui::audio_prefetch_clear();
+                for file in files {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    match file {
+                        PrefetchFile::Image(path) => {
+                            Ui::media_prefetch(&path);
+                        }
+                        PrefetchFile::Audio(path) => {
+                            Ui::audio_prefetch(&path);
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+const MEDIA_STATUS_Y: f32 = 28.0;
+
+fn draw_media_strip(status: Option<&str>, pending: bool) {
+    if pending {
+        Ui::draw_text_centered(
+            160.0,
+            MEDIA_STATUS_Y,
+            0.36,
+            current_theme().text_muted,
+            tr("Downloading media..."),
+        );
+    } else if let Some(status) = status {
+        let text = i18n::format("Media sync: {0}", &[status]);
+        Ui::fit_text(
+            160.0,
+            MEDIA_STATUS_Y,
+            0.36,
+            300.0,
+            current_theme().text_muted,
+            &text,
+        );
+    }
+}
+
+fn audio_tap(audio: &[backend::MediaRef], x: f32) -> Action {
+    for (index, (bx, bw)) in audio_button_rects(audio.len()).into_iter().enumerate() {
+        if x >= bx && x < bx + bw {
+            return Action::PlayAudio(Some(index));
+        }
+    }
+    Action::None
+}
+
 fn browse_row(y: f32, title: &str, selected: bool) {
     Ui::draw_rounded_rect(
         6.0,
@@ -281,6 +556,9 @@ fn format_steps(steps: &[f32]) -> String {
 fn parse_steps(text: &str) -> Option<Vec<f32>> {
     let mut steps = Vec::new();
     for token in text.split_whitespace() {
+        if steps.len() >= 20 {
+            return None;
+        }
         let (number, multiplier) = if let Some(rest) = token.strip_suffix('d') {
             (rest, 1440.0)
         } else if let Some(rest) = token.strip_suffix('h') {
@@ -296,13 +574,31 @@ fn parse_steps(text: &str) -> Option<Vec<f32>> {
         if !(0.0..=100000.0).contains(&value) {
             return None;
         }
-        steps.push(value * multiplier);
+        let step = value * multiplier;
+        if !step.is_finite() || step <= 0.0 || step > 365.0 * 1440.0 {
+            return None;
+        }
+        steps.push(step);
     }
     if steps.is_empty() {
         None
     } else {
         Some(steps)
     }
+}
+
+fn parse_limited_u32<'a>(
+    text: &str,
+    min: u32,
+    max: u32,
+    message: &'a str,
+) -> std::result::Result<u32, Box<dyn std::error::Error + 'a>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(message.into());
+    }
+    let value: u32 = trimmed.parse().map_err(|_| message)?;
+    Ok(value.clamp(min, max))
 }
 
 fn on_off(value: bool) -> String {
@@ -482,6 +778,7 @@ enum Screen {
     },
     Settings {
         selected: usize,
+        scroll: usize,
         previous: Box<Screen>,
     },
     CardChoice {
@@ -528,6 +825,7 @@ enum Action {
     Bury,
     Filter(usize),
     Restore,
+    PlayAudio(Option<usize>),
     Exit,
 }
 
@@ -730,7 +1028,7 @@ const MAIN_MENU: [(Action, &str); 10] = [
     (Action::Settings, "Settings"),
     (Action::Exit, "Exit"),
 ];
-const SETTINGS_MENU: [(Action, &str); 8] = [
+const SETTINGS_MENU: [(Action, &str); 11] = [
     (Action::None, "Font scale"),
     (Action::None, "Theme"),
     (Action::Language, "Language"),
@@ -739,9 +1037,15 @@ const SETTINGS_MENU: [(Action, &str); 8] = [
     (Action::FullSync, "Full sync"),
     (Action::Clock, "Update clock"),
     (Action::Help, "Help"),
+    (Action::None, "Auto-play audio"),
+    (Action::None, "Download connections"),
+    (Action::None, "Media sync"),
 ];
 const FONT_SCALE_ITEM: usize = 0;
 const THEME_ITEM: usize = 1;
+const AUTOPLAY_ITEM: usize = 8;
+const CONNECTIONS_ITEM: usize = 9;
+const MEDIA_SYNC_ITEM: usize = 10;
 const MENU_COLS: usize = 2;
 const MENU_TILE_W: f32 = 146.0;
 const MENU_TILE_H: f32 = 30.0;
@@ -768,10 +1072,84 @@ fn menu_hit(x: f32, y: f32, rows: usize, length: usize) -> Option<usize> {
     })
 }
 
-fn settings_label(index: usize) -> String {
+const SETTINGS_TILE_X0: f32 = 10.0;
+const SETTINGS_TILE_Y0: f32 = 42.0;
+const SETTINGS_TILE_W: f32 = 292.0;
+const SETTINGS_TILE_H: f32 = 20.0;
+const SETTINGS_TILE_GAP: f32 = 2.0;
+const SETTINGS_VISIBLE_ROWS: usize = 8;
+
+fn settings_tile(row: usize) -> (f32, f32) {
+    (
+        SETTINGS_TILE_X0,
+        SETTINGS_TILE_Y0 + row as f32 * (SETTINGS_TILE_H + SETTINGS_TILE_GAP),
+    )
+}
+
+fn settings_hit(x: f32, y: f32, scroll: usize) -> Option<usize> {
+    let row = ((y - SETTINGS_TILE_Y0) / (SETTINGS_TILE_H + SETTINGS_TILE_GAP)) as usize;
+    if row >= SETTINGS_VISIBLE_ROWS {
+        return None;
+    }
+    let (tx, ty) = settings_tile(row);
+    if x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + SETTINGS_TILE_H {
+        let index = scroll + row;
+        (index < SETTINGS_MENU.len()).then_some(index)
+    } else {
+        None
+    }
+}
+
+fn settings_max_scroll() -> usize {
+    SETTINGS_MENU.len().saturating_sub(SETTINGS_VISIBLE_ROWS)
+}
+
+fn settings_scroll_into_view(selected: usize, scroll: &mut usize) {
+    if selected < *scroll {
+        *scroll = selected;
+    } else if selected >= *scroll + SETTINGS_VISIBLE_ROWS {
+        *scroll = selected + 1 - SETTINGS_VISIBLE_ROWS;
+    }
+    *scroll = (*scroll).min(settings_max_scroll());
+}
+
+fn settings_label(
+    index: usize,
+    media_running: bool,
+    media_files: usize,
+    media_status: Option<&str>,
+) -> String {
     match index {
         FONT_SCALE_ITEM => i18n::format("Font scale: {0}%", &[&i18n::font_scale().to_string()]),
         THEME_ITEM => i18n::format("Theme: {0}", &[tr(ThemeKind::label(theme::kind()))]),
+        AUTOPLAY_ITEM => i18n::format(
+            "Auto-play audio: {0}",
+            &[if i18n::autoplay_audio() {
+                tr("On")
+            } else {
+                tr("Off")
+            }],
+        ),
+        CONNECTIONS_ITEM => i18n::format(
+            "Download connections: {0}",
+            &[&i18n::download_connections().to_string()],
+        ),
+        MEDIA_SYNC_ITEM => {
+            if media_running {
+                if let Some(status) = media_status {
+                    i18n::format("Media sync: {0}. A stops.", &[status])
+                } else {
+                    i18n::format(
+                        "Media sync: {0} files. A stops.",
+                        &[&media_files.to_string()],
+                    )
+                }
+            } else if let Some(status) = media_status {
+                i18n::format("Media sync: {0}. A starts.", &[status])
+            } else {
+                i18n::format("Media sync: {0}. A starts.", &[tr("Idle")])
+            }
+        }
         _ => tr(SETTINGS_MENU[index].1).to_owned(),
     }
 }
@@ -781,11 +1159,30 @@ fn menu_label(index: usize) -> String {
 }
 
 fn main() {
-    let apt = Apt::new().expect("APT initialization");
-    let mut hid = Hid::new().expect("HID initialization");
-    let _gfx = Gfx::new().expect("graphics initialization");
+    let apt = match Apt::new() {
+        Ok(apt) => apt,
+        Err(error) => {
+            eprintln!("APT initialization failed: {error}");
+            return;
+        }
+    };
+    let mut hid = match Hid::new() {
+        Ok(hid) => hid,
+        Err(error) => {
+            eprintln!("HID initialization failed: {error}");
+            return;
+        }
+    };
+    let _gfx = match Gfx::new() {
+        Ok(gfx) => gfx,
+        Err(error) => {
+            eprintln!("graphics initialization failed: {error}");
+            return;
+        }
+    };
     if !Ui::init() {
-        panic!("Failed to initialize Citro2D/Citro3D UI engine");
+        eprintln!("Failed to initialize Citro2D/Citro3D UI engine");
+        return;
     }
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
@@ -793,12 +1190,11 @@ fn main() {
             tracing_subscriber::fmt::layer()
                 .without_time()
                 .with_ansi(false)
-                .with_writer(|| {
-                    fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(LOG)
-                        .expect("sync log")
+                .with_writer(|| -> Box<dyn std::io::Write + Send> {
+                    match fs::OpenOptions::new().create(true).append(true).open(LOG) {
+                        Ok(file) => Box::new(file),
+                        Err(_) => Box::new(std::io::sink()),
+                    }
                 })
                 .with_filter(
                     tracing_subscriber::filter::Targets::new()
@@ -844,6 +1240,11 @@ fn main() {
         }
     };
     let mut job: Option<sync::Job> = None;
+    let mut media_job: Option<media_sync::MediaSync> = None;
+    let mut media_result: Option<String> = None;
+    let mut media_notice_until = Instant::now();
+    let mut last_media_changed = 0u32;
+    let mut last_media_refresh = Instant::now();
     let mut exit_pending = false;
     let mut clock_job: Option<clock::Job> = None;
     let mut next_clock_check =
@@ -895,7 +1296,13 @@ fn main() {
     let mut card_scroll = 0usize;
     let mut review_scroll = 0.0f32;
     let mut review_max_scroll = 0.0f32;
+    let mut audio_index = 0usize;
+    let mut last_autoplay_card: Option<(i64, bool)> = None;
     let mut last_review_card: Option<(i64, bool)> = None;
+    let mut card_media_pending = false;
+    let mut prefetch = Prefetch::default();
+    let mut playing_audio: Option<String> = None;
+    let mut frame: u64 = 0;
     let mut top_layout = TextLayout::default();
     let mut top_card = RichTextLayout::default();
     let mut top_max = 0usize;
@@ -937,6 +1344,9 @@ fn main() {
         clock_connected = connected;
         if clock_job.is_none()
             && job.is_none()
+            && !media_job
+                .as_ref()
+                .is_some_and(media_sync::MediaSync::is_running)
             && connected
             && clock::needs_refresh()
             && Instant::now() >= next_clock_check
@@ -953,9 +1363,26 @@ fn main() {
         }
         if let Some(done) = job.as_mut().and_then(sync::Job::poll) {
             job = None;
-            backend = done.backend;
-            auth = done.auth;
-            screen = match done.result {
+            let sync::Completed {
+                backend: done_backend,
+                auth: done_auth,
+                media: done_media,
+                media_error: done_media_error,
+                result: done_result,
+            } = done;
+            backend = done_backend;
+            auth = done_auth;
+            if let Some(active) = done_media {
+                media_job = Some(active);
+                media_result = None;
+                last_media_changed = 0;
+                last_media_refresh = Instant::now();
+            }
+            if let Some(error) = done_media_error {
+                media_result = Some(i18n::format("failed: {0}", &[&error]));
+                media_notice_until = Instant::now() + Duration::from_secs(3600);
+            }
+            screen = match done_result {
                 Ok(sync::Outcome::LoggedIn) => {
                     event("LOGIN_COMPLETE");
                     Screen::Info {
@@ -967,11 +1394,7 @@ fn main() {
                 }
                 Ok(sync::Outcome::Complete) => {
                     event("SYNC_COMPLETE");
-                    Screen::Info {
-                        title: tr("Synced").into(),
-                        text: tr("Collection synced.").into(),
-                        previous: Box::new(Screen::Decks),
-                    }
+                    Screen::Decks
                 }
                 Ok(sync::Outcome::FullRequired {
                     upload_ok,
@@ -995,6 +1418,46 @@ fn main() {
             if exit_pending {
                 break;
             }
+        }
+        let mut media_finished = false;
+        let mut media_refreshed_now = false;
+        if let Some(active) = &media_job {
+            let changed = active.changed();
+            let in_review = matches!(screen, Screen::Question { .. } | Screen::Answer { .. });
+            let interval = Duration::from_millis(if in_review { 1500 } else { 400 });
+            if changed != last_media_changed && last_media_refresh.elapsed() >= interval {
+                last_media_changed = changed;
+                last_media_refresh = Instant::now();
+                if !in_review || card_media_pending {
+                    Ui::media_refresh();
+                    top_card.invalidate();
+                    media_refreshed_now = true;
+                }
+            }
+            media_finished = !active.is_running();
+        }
+        if media_finished {
+            if let Some(active) = media_job.take() {
+                let state = active.state();
+                let files = active.processed_files();
+                let (text, persistent) = match state {
+                    media_sync::State::Done => (
+                        i18n::format("complete ({0} files)", &[&files.to_string()]),
+                        false,
+                    ),
+                    media_sync::State::Cancelled => (tr("stopped").to_owned(), false),
+                    media_sync::State::Failed(error) => {
+                        (i18n::format("failed: {0}", &[&error]), true)
+                    }
+                    media_sync::State::Running => (tr("running").to_owned(), false),
+                };
+                media_result = Some(text);
+                media_notice_until =
+                    Instant::now() + Duration::from_secs(if persistent { 3600 } else { 15 });
+            }
+            Ui::media_refresh();
+            top_card.invalidate();
+            media_refreshed_now = true;
         }
         hid.scan_input();
         let down = hid.keys_down();
@@ -1069,6 +1532,10 @@ fn main() {
             Action::Rate(1)
         } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::R) {
             Action::Rate(3)
+        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
+            && down.contains(KeyPad::L)
+        {
+            Action::PlayAudio(None)
         } else if down.contains(KeyPad::A) {
             Action::Primary
         } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
@@ -1161,6 +1628,12 @@ fn main() {
                 Screen::Decks if (194.0..222.0).contains(&y) && (168.0..308.0).contains(&x) => {
                     Action::Sync
                 }
+                Screen::Question { card, .. } if (AUDIO_Y..AUDIO_Y + AUDIO_H).contains(&y) => {
+                    audio_tap(&card_audio(card, false), x)
+                }
+                Screen::Answer { card, .. } if (AUDIO_Y..AUDIO_Y + AUDIO_H).contains(&y) => {
+                    audio_tap(&card_audio(card, true), x)
+                }
                 Screen::Question { .. }
                     if (128.0..200.0).contains(&y) && (40.0..280.0).contains(&x) =>
                 {
@@ -1249,9 +1722,10 @@ fn main() {
                         Action::None
                     }
                 }
-                Screen::Settings { selected, .. } => {
-                    let rows = (SETTINGS_MENU.len() + MENU_COLS - 1) / MENU_COLS;
-                    if let Some(index) = menu_hit(x, y, rows, SETTINGS_MENU.len()) {
+                Screen::Settings {
+                    selected, scroll, ..
+                } => {
+                    if let Some(index) = settings_hit(x, y, *scroll) {
                         *selected = index;
                         Action::Primary
                     } else {
@@ -1330,6 +1804,7 @@ fn main() {
                     "RIGHT" => Action::Right,
                     "FILTER" => Action::Filter(value.parse().unwrap_or(0)),
                     "RESTORE" => Action::Restore,
+                    "AUDIO" => Action::PlayAudio(None),
                     "COLLAPSE" => {
                         selected = value.parse().unwrap_or(0);
                         Action::Left
@@ -1351,6 +1826,9 @@ fn main() {
             }
         }
         if matches!(action, Action::Exit) {
+            if let Some(active) = &media_job {
+                active.cancel();
+            }
             if let Some(job) = &job {
                 job.cancel();
                 exit_pending = true;
@@ -1380,6 +1858,7 @@ fn main() {
                         let menu = std::mem::replace(&mut screen, Screen::Decks);
                         screen = Screen::Settings {
                             selected: 0,
+                            scroll: 0,
                             previous: Box::new(menu),
                         };
                         card_scroll = 0;
@@ -1413,6 +1892,60 @@ fn main() {
                         event(&format!("THEME {}", kind.key()));
                         return Ok(());
                     }
+                }
+                if *selected == AUTOPLAY_ITEM && matches!(action, Action::Primary) {
+                    let value = i18n::toggle_autoplay_audio()?;
+                    event(&format!("AUTOPLAY {}", if value { "on" } else { "off" }));
+                    return Ok(());
+                }
+                if *selected == CONNECTIONS_ITEM {
+                    if let Some(direction) = adjust {
+                        let value = i18n::cycle_download_connections(direction)?;
+                        event(&format!("DOWNLOAD_CONNECTIONS {value}"));
+                        return Ok(());
+                    }
+                }
+                if *selected == MEDIA_SYNC_ITEM && matches!(action, Action::Primary) {
+                    if let Some(active) = &media_job {
+                        active.cancel();
+                        event("MEDIA_SYNC_CANCEL");
+                    } else if auth.is_none() {
+                        media_result = Some(i18n::format("failed: {0}", &[&tr("Not logged in")]));
+                        media_notice_until = Instant::now() + Duration::from_secs(3600);
+                    } else {
+                        let priority = backend
+                            .as_mut()
+                            .map(|active| active.priority_media(200))
+                            .unwrap_or_default();
+                        match backend.as_ref() {
+                            Some(active_backend) => {
+                                let index = active_backend.media_index_handle();
+                                match sync::start_media(auth.clone(), &login, priority, index) {
+                                    Ok(job) => {
+                                        media_job = Some(job);
+                                        media_result = None;
+                                        last_media_changed = 0;
+                                        last_media_refresh = Instant::now();
+                                        event("MEDIA_SYNC_MANUAL_START");
+                                    }
+                                    Err(error) => {
+                                        event(&format!("MEDIA_SYNC_MANUAL_ERROR {error}"));
+                                        media_result = Some(i18n::format("failed: {0}", &[&error]));
+                                        media_notice_until =
+                                            Instant::now() + Duration::from_secs(3600);
+                                    }
+                                }
+                            }
+                            None => {
+                                media_result = Some(i18n::format(
+                                    "failed: {0}",
+                                    &[&tr("Collection unavailable")],
+                                ));
+                                media_notice_until = Instant::now() + Duration::from_secs(3600);
+                            }
+                        }
+                    }
+                    return Ok(());
                 }
                 if matches!(action, Action::Primary) {
                     action = SETTINGS_MENU[*selected].0;
@@ -1562,6 +2095,11 @@ fn main() {
                         login.password = password;
                     }
                 }
+                if let Some(active) = media_job.take() {
+                    active.cancel();
+                }
+                media_result = None;
+                media_notice_until = Instant::now();
                 let collection = backend.take().ok_or("collection unavailable")?;
                 match sync::Job::start(
                     collection,
@@ -1651,6 +2189,18 @@ fn main() {
                         .set_language(card)?;
                 }
                 Action::Clock => {
+                    if media_job
+                        .as_ref()
+                        .is_some_and(media_sync::MediaSync::is_running)
+                    {
+                        let previous = std::mem::replace(&mut screen, Screen::Decks);
+                        screen = Screen::Info {
+                            title: tr("Update clock").into(),
+                            text: tr("Media sync is running. Try again when it finishes.").into(),
+                            previous: Box::new(previous),
+                        };
+                        return Ok(());
+                    }
                     let offset = match clock::configure(true, &apt, &mut hid, clock_job.take()) {
                         Ok(offset) => offset,
                         Err(error) => {
@@ -1809,6 +2359,53 @@ fn main() {
                         },
                     };
                     card_scroll = 0;
+                }
+                Action::PlayAudio(index) => {
+                    let audio = match &screen {
+                        Screen::Question { card, .. } => card_audio(card, false),
+                        Screen::Answer { card, .. } => card_audio(card, true),
+                        _ => Vec::new(),
+                    };
+                    if audio.is_empty() {
+                        return Ok(());
+                    }
+                    let chosen = match index {
+                        Some(value) => value.min(audio.len() - 1),
+                        None => {
+                            if audio_index + 1 < audio.len() {
+                                audio_index + 1
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    audio_index = chosen;
+                    let resolved = backend
+                        .as_ref()
+                        .map(|active| active.media_path(&audio[chosen].filename))
+                        .unwrap_or_else(|| audio[chosen].path());
+                    match Ui::audio_play(&resolved) {
+                        AudioAttempt::Done(true) => {
+                            playing_audio = Some(audio[chosen].filename.clone());
+                            event(&format!(
+                                "AUDIO play index={chosen} ok=true file={}",
+                                audio[chosen].filename
+                            ));
+                        }
+                        AudioAttempt::Done(false) => {
+                            if let AudioAttempt::Done(decoded) = Ui::audio_decode(&resolved) {
+                                let diag = media_diag(&resolved);
+                                log_media_once(
+                                    &format!("audio|{resolved}|{diag}"),
+                                    &format!(
+                                        "AUDIO play index={chosen} ok=false decode={decoded} file={} {diag}",
+                                        audio[chosen].filename
+                                    ),
+                                );
+                            }
+                        }
+                        AudioAttempt::Busy => {}
+                    }
                 }
                 Action::FullSync => {
                     screen = Screen::SyncChoice {
@@ -1975,19 +2572,27 @@ fn main() {
                                     if let Some(value) = Ui::keyboard(label, &initial)
                                         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
                                     {
-                                        let value: u32 = value.trim().parse()?;
-                                        match kind {
-                                            OptField::NewLimit => options.new = value.min(9999),
-                                            OptField::ReviewLimit => {
-                                                options.reviews = value.min(9999)
-                                            }
+                                        let (min, max, message) = match kind {
+                                            OptField::NewLimit | OptField::ReviewLimit => (
+                                                0,
+                                                9999,
+                                                tr("Enter a whole number from 0 to 9999."),
+                                            ),
                                             OptField::LeechThreshold => {
-                                                options.leech_threshold = value.min(99)
+                                                (1, 99, tr("Enter a whole number from 1 to 99."))
                                             }
                                             _ => {
-                                                options.desired_retention =
-                                                    (value.clamp(50, 99) as f32) / 100.0
+                                                (50, 99, tr("Enter a whole number from 50 to 99."))
                                             }
+                                        };
+                                        let value = parse_limited_u32(&value, min, max, message)?;
+                                        match kind {
+                                            OptField::NewLimit => options.new = value,
+                                            OptField::ReviewLimit => options.reviews = value,
+                                            OptField::LeechThreshold => {
+                                                options.leech_threshold = value
+                                            }
+                                            _ => options.desired_retention = (value as f32) / 100.0,
                                         }
                                     }
                                 }
@@ -2100,13 +2705,16 @@ fn main() {
                                     selected.saturating_sub(MENU_COLS)
                                 };
                             }
-                            Screen::Settings { selected, .. } => {
+                            Screen::Settings {
+                                selected, scroll, ..
+                            } => {
                                 let length = SETTINGS_MENU.len();
                                 *selected = if matches!(action, Action::Down) {
-                                    (*selected + MENU_COLS).min(length - 1)
+                                    (*selected + 1).min(length - 1)
                                 } else {
-                                    selected.saturating_sub(MENU_COLS)
+                                    selected.saturating_sub(1)
                                 };
+                                settings_scroll_into_view(*selected, scroll);
                             }
                             _ => {
                                 card_scroll = next(card_scroll, top_max + 1);
@@ -2136,12 +2744,16 @@ fn main() {
                         } else {
                             selected.saturating_sub(1)
                         };
-                    } else if let Screen::Settings { selected, .. } = &mut screen {
+                    } else if let Screen::Settings {
+                        selected, scroll, ..
+                    } = &mut screen
+                    {
                         *selected = if matches!(action, Action::Right) {
                             (*selected + 1).min(SETTINGS_MENU.len() - 1)
                         } else {
                             selected.saturating_sub(1)
                         };
+                        settings_scroll_into_view(*selected, scroll);
                     } else if matches!(
                         screen,
                         Screen::Info { .. } | Screen::Browser(_) | Screen::Editor { .. }
@@ -2199,9 +2811,114 @@ fn main() {
             Screen::Answer { card, .. } => Some((card.id, true)),
             _ => None,
         };
-        if review_card != last_review_card {
-            last_review_card = review_card;
+        if let Some(active) = &media_job {
+            active.set_paused(review_card.is_some());
+        }
+        if playing_audio.is_some() && !Ui::audio_is_playing() {
+            playing_audio = None;
+        }
+        let card_changed = review_card != last_review_card;
+        if card_changed {
             review_scroll = 0.0;
+            audio_index = 0;
+            playing_audio = None;
+            Ui::audio_stop();
+            if media_job
+                .as_ref()
+                .is_some_and(media_sync::MediaSync::is_running)
+            {
+                Ui::media_refresh();
+            }
+            let current = match &screen {
+                Screen::Question { card, .. } | Screen::Answer { card, .. } => Some(card),
+                _ => None,
+            };
+            if let (Some(active), Some(card), Some(active_backend)) =
+                (media_job.as_ref(), current, backend.as_ref())
+            {
+                active.set_focus(&active_backend.card_all_files(card));
+                let mut files = active_backend.card_missing_files(card, false);
+                files.extend(active_backend.card_missing_files(card, true));
+                if !files.is_empty() {
+                    active.prioritize(&files);
+                }
+            }
+            if let (Some(card), Some(active_backend)) = (current, backend.as_ref()) {
+                prefetch.request(prefetch_for_card(active_backend, card));
+            } else {
+                prefetch.request(Vec::new());
+            }
+        }
+        if card_changed || media_refreshed_now {
+            card_media_pending = match (&screen, backend.as_ref()) {
+                (Screen::Question { card, .. }, Some(active_backend)) => {
+                    active_backend.card_media_missing(card, false)
+                }
+                (Screen::Answer { card, .. }, Some(active_backend)) => {
+                    active_backend.card_media_missing(card, true)
+                }
+                _ => false,
+            };
+        }
+        if media_refreshed_now {
+            if let (Some((_, answer)), Some(active_backend)) = (review_card, backend.as_ref()) {
+                let current = match &screen {
+                    Screen::Question { card, .. } | Screen::Answer { card, .. } => Some(card),
+                    _ => None,
+                };
+                if let Some(card) = current {
+                    if active_backend.card_media_missing(card, answer) {
+                        prefetch.request(prefetch_for_card(active_backend, card));
+                    }
+                }
+            }
+        }
+        if card_changed {
+            last_review_card = review_card;
+        }
+        if let Some((id, answer)) = review_card {
+            if last_autoplay_card != Some((id, answer)) {
+                if i18n::autoplay_audio() {
+                    let audio = match &screen {
+                        Screen::Question { card, .. } => card_audio(card, false),
+                        Screen::Answer { card, .. } => card_audio(card, true),
+                        _ => Vec::new(),
+                    };
+                    if let Some(first) = audio.first() {
+                        let resolved = backend
+                            .as_ref()
+                            .map(|active| active.media_path(&first.filename))
+                            .unwrap_or_else(|| first.path());
+                        match Ui::audio_play(&resolved) {
+                            AudioAttempt::Done(true) => {
+                                playing_audio = Some(first.filename.clone());
+                                event(&format!("AUDIO auto ok=true file={}", first.filename));
+                                last_autoplay_card = Some((id, answer));
+                            }
+                            AudioAttempt::Done(false) => {
+                                if let AudioAttempt::Done(decoded) = Ui::audio_decode(&resolved) {
+                                    let diag = media_diag(&resolved);
+                                    log_media_once(
+                                        &format!("audio|{resolved}|{diag}"),
+                                        &format!(
+                                            "AUDIO auto ok=false decode={decoded} file={} {diag}",
+                                            first.filename
+                                        ),
+                                    );
+                                }
+                                last_autoplay_card = Some((id, answer));
+                            }
+                            AudioAttempt::Busy => {}
+                        }
+                    } else {
+                        last_autoplay_card = Some((id, answer));
+                    }
+                } else {
+                    last_autoplay_card = Some((id, answer));
+                }
+            }
+        } else {
+            last_autoplay_card = None;
         }
         let state = match &screen {
             Screen::Decks => "DECKS",
@@ -2240,7 +2957,29 @@ fn main() {
             last_state = state.into();
         }
 
+        let media_status = media_job
+            .as_ref()
+            .filter(|active| active.is_running())
+            .map(|active| {
+                let processed = active.processed_files();
+                if processed > 0 {
+                    i18n::format("{0} files", &[&processed.to_string()])
+                } else {
+                    let checked = active.checked_files();
+                    if checked > 0 {
+                        i18n::format("checking {0} files", &[&checked.to_string()])
+                    } else {
+                        tr("starting").to_owned()
+                    }
+                }
+            })
+            .or_else(|| {
+                media_result
+                    .as_ref()
+                    .and_then(|text| (Instant::now() < media_notice_until).then(|| text.clone()))
+            });
         Ui::frame_begin();
+        frame = frame.wrapping_add(1);
         Ui::target_top(current_theme().bg_top);
         top_max = 0;
         review_max_scroll = 0.0;
@@ -2291,11 +3030,15 @@ fn main() {
                 } else {
                     tr("UP/DOWN or touch selects. A continues. B cancels.")
                 };
-                let text=i18n::format("Full sync replaces one collection.\nUpload allowed: {0}\nDownload allowed: {1}\nSelected: {2}\n{3}",&[
-                    tr(if *upload_ok {"Yes"} else {"No"}),tr(if *download_ok {"Yes"} else {"No"}),
-                    selected,
-                    instruction,
-                ]);
+                let text = i18n::format(
+                    "Full sync replaces one collection.\nUpload allowed: {0}\nDownload allowed: {1}\nSelected: {2}\n{3}",
+                    &[
+                        tr(if *upload_ok { "Yes" } else { "No" }),
+                        tr(if *download_ok { "Yes" } else { "No" }),
+                        selected,
+                        instruction,
+                    ],
+                );
                 top_layout.draw(&text, 360.0, 200.0, 60.0, 8, 0);
             }
             Screen::Decks => {
@@ -2337,14 +3080,35 @@ fn main() {
                 }
             }
             Screen::Question { card, .. } | Screen::Answer { card, .. } => {
-                let html = if matches!(screen, Screen::Answer { .. }) {
+                let answer = matches!(screen, Screen::Answer { .. });
+                let html = if answer {
                     card.cloze_answer_html
                         .as_deref()
                         .unwrap_or(&card.answer_html)
                 } else {
                     &card.question_html
                 };
-                top_card.set_text(html, CARD_WIDTH, i18n::font_scale_factor());
+                let media = if answer {
+                    &card.answer_media
+                } else {
+                    &card.question_media
+                };
+                let images: Vec<String> = media
+                    .iter()
+                    .filter(|item| !item.audio)
+                    .filter(|item| {
+                        backend
+                            .as_ref()
+                            .is_some_and(|active| active.media_exists(&item.filename))
+                    })
+                    .map(|item| {
+                        backend
+                            .as_ref()
+                            .map(|active| active.media_path(&item.filename))
+                            .unwrap_or_else(|| item.path())
+                    })
+                    .collect();
+                top_card.set_text(html, &images, CARD_WIDTH, i18n::font_scale_factor());
                 review_max_scroll = top_card.max_scroll();
                 review_scroll = review_scroll.min(review_max_scroll);
                 top_card.draw(review_scroll);
@@ -2551,6 +3315,16 @@ fn main() {
                 );
                 Ui::draw_status_compact(314.0, 3.0, 0.42);
                 counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                let audio = card_audio(card, false);
+                let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
+                draw_audio_buttons(&audio, &states, frame);
+                draw_media_strip(
+                    media_status.as_deref(),
+                    card_media_pending
+                        && media_job
+                            .as_ref()
+                            .is_some_and(media_sync::MediaSync::is_running),
+                );
                 Ui::draw_button(40.0, 128.0, 240.0, 52.0, tr("Show answer"), None, 0, false);
                 Ui::draw_text_centered(
                     160.0,
@@ -2570,6 +3344,16 @@ fn main() {
                 );
                 Ui::draw_status_compact(314.0, 3.0, 0.42);
                 counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                let audio = card_audio(card, true);
+                let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
+                draw_audio_buttons(&audio, &states, frame);
+                draw_media_strip(
+                    media_status.as_deref(),
+                    card_media_pending
+                        && media_job
+                            .as_ref()
+                            .is_some_and(media_sync::MediaSync::is_running),
+                );
                 for (i, label) in [tr("Again"), tr("Hard"), tr("Good"), tr("Easy")]
                     .iter()
                     .enumerate()
@@ -2681,15 +3465,49 @@ fn main() {
                     Ui::draw_button(x, y, MENU_TILE_W, MENU_TILE_H, &label, None, style, false);
                 }
             }
-            Screen::Settings { selected, .. } => {
+            Screen::Settings {
+                selected, scroll, ..
+            } => {
                 header(320.0, tr("Settings"));
-                let rows = (SETTINGS_MENU.len() + MENU_COLS - 1) / MENU_COLS;
-                for i in 0..SETTINGS_MENU.len() {
-                    let (x, y) = menu_tile(i, rows);
-                    let style = if i == *selected { 0 } else { 6 };
-                    let label = Ui::ellipsize(&settings_label(i), 0.50, MENU_TILE_W - 12.0);
-                    Ui::draw_button(x, y, MENU_TILE_W, MENU_TILE_H, &label, None, style, false);
+                let (media_running, media_files) = media_job
+                    .as_ref()
+                    .map(|active| (active.is_running(), active.processed_files()))
+                    .unwrap_or((false, 0));
+                for row in 0..SETTINGS_VISIBLE_ROWS {
+                    let index = scroll + row;
+                    if index >= SETTINGS_MENU.len() {
+                        break;
+                    }
+                    let (x, y) = settings_tile(row);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let settings_media_status = if media_running {
+                        media_status.as_deref()
+                    } else {
+                        media_result.as_deref()
+                    };
+                    let label =
+                        settings_label(index, media_running, media_files, settings_media_status);
+                    let label = Ui::ellipsize(&label, 0.50, SETTINGS_TILE_W - 12.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        SETTINGS_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
                 }
+                Ui::draw_scrollbar(
+                    305.0,
+                    SETTINGS_TILE_Y0,
+                    8.0,
+                    (SETTINGS_TILE_H + SETTINGS_TILE_GAP) * SETTINGS_VISIBLE_ROWS as f32,
+                    SETTINGS_MENU.len(),
+                    SETTINGS_VISIBLE_ROWS,
+                    *scroll,
+                );
             }
             Screen::CardChoice { selected, .. } => {
                 header(320.0, tr("Bury / Suspend"));
@@ -2738,27 +3556,36 @@ fn main() {
                 Ui::draw_text_centered(160.0, 120.0, 0.50, current_theme().text, tr("START: Exit"));
             }
         }
-        if !matches!(
+        let hide_footer = matches!(
             screen,
             Screen::Question { .. }
                 | Screen::Answer { .. }
                 | Screen::SyncChoice { .. }
                 | Screen::CardChoice { .. }
-        ) {
-            footer(if clock::is_known() {
-                tr("Menu [SELECT]                      Options")
+        );
+        if !hide_footer {
+            let text = if let Some(status) = &media_status {
+                i18n::format("Media sync: {0}", &[status])
+            } else if clock::is_known() {
+                tr("Menu [SELECT]                      Options").to_owned()
             } else {
-                tr("Clock will update when connected")
-            });
+                tr("Clock will update when connected").to_owned()
+            };
+            footer(&text);
         }
         Ui::frame_end();
     }
+    if let Some(active) = &media_job {
+        active.cancel();
+    }
     if let Some(active) = job.take() {
-        if let Some(done) = active.finish() {
+        if let Some(done) = active.finish_timeout(Duration::from_secs(3)) {
             backend = done.backend;
         }
     }
     drop(clock_job);
+    drop(media_job.take());
+    prefetch.stop();
     Ui::fini();
     if let Some(backend) = backend {
         match backend.close() {

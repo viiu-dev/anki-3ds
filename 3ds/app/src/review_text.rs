@@ -1104,7 +1104,7 @@ fn is_kanji(ch: char) -> bool {
     )
 }
 
-fn decode_entities(text: &str) -> String {
+pub(crate) fn decode_entities(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find('&') {
