@@ -190,5 +190,7 @@
     "Battery indicator": "Indicador de batería",
     "Battery indicator: {0}": "Indicador de batería: {0}",
     "Linear (25%)": "Lineal (25%)",
-    "System default": "Sistema"
+    "System default": "Sistema",
+    "Console LEDs": "LED de la consola",
+    "Console LEDs: {0}": "LED de la consola: {0}"
 }

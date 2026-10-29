@@ -7,6 +7,7 @@ mod backend;
 mod clock;
 mod event_log;
 mod i18n;
+mod leds;
 mod media_sync;
 mod review_text;
 mod sync;
@@ -1285,7 +1286,7 @@ const MAIN_MENU: [(Action, &str); 10] = [
     (Action::Settings, "Settings"),
     (Action::Exit, "Exit"),
 ];
-const SETTINGS_MENU: [(Action, &str); 12] = [
+const SETTINGS_MENU: [(Action, &str); 13] = [
     (Action::None, "Font scale"),
     (Action::None, "Theme"),
     (Action::Language, "Language"),
@@ -1298,6 +1299,7 @@ const SETTINGS_MENU: [(Action, &str); 12] = [
     (Action::None, "Download connections"),
     (Action::None, "Media sync"),
     (Action::None, "Battery indicator"),
+    (Action::None, "Console LEDs"),
 ];
 const FONT_SCALE_ITEM: usize = 0;
 const THEME_ITEM: usize = 1;
@@ -1305,6 +1307,7 @@ const AUTOPLAY_ITEM: usize = 8;
 const CONNECTIONS_ITEM: usize = 9;
 const MEDIA_SYNC_ITEM: usize = 10;
 const BATTERY_ITEM: usize = 11;
+const CONSOLE_LEDS_ITEM: usize = 12;
 const MENU_COLS: usize = 2;
 const MENU_TILE_W: f32 = 146.0;
 const MENU_TILE_H: f32 = 30.0;
@@ -1401,6 +1404,10 @@ fn settings_label(
                 "System default"
             })],
         ),
+        CONSOLE_LEDS_ITEM => i18n::format(
+            "Console LEDs: {0}",
+            &[tr(if i18n::console_leds() { "On" } else { "Off" })],
+        ),
         MEDIA_SYNC_ITEM => {
             if media_running {
                 if let Some(status) = media_status {
@@ -1468,6 +1475,7 @@ fn main() {
         .init();
     i18n::init();
     theme::init();
+    leds::init();
     Ui::apply_theme();
     Ui::set_battery_linear(i18n::battery_linear());
     let startup_error = assets::prepare()
@@ -2230,6 +2238,15 @@ fn main() {
                     event(&format!(
                         "BATTERY_INDICATOR {}",
                         if value { "linear" } else { "system" }
+                    ));
+                    return Ok(());
+                }
+                if *selected == CONSOLE_LEDS_ITEM && matches!(action, Action::Primary) {
+                    let value = i18n::toggle_console_leds()?;
+                    leds::apply(value);
+                    event(&format!(
+                        "CONSOLE_LEDS {}",
+                        if value { "on" } else { "off" }
                     ));
                     return Ok(());
                 }
@@ -3998,6 +4015,7 @@ fn main() {
     drop(media_job.take());
     prefetch.stop();
     Ui::fini();
+    leds::restore();
     if let Some(backend) = backend {
         match backend.close() {
             Ok(()) => event("CLOSE_OK"),

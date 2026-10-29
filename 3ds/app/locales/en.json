@@ -190,5 +190,7 @@
     "Battery indicator": "Battery indicator",
     "Battery indicator: {0}": "Battery indicator: {0}",
     "Linear (25%)": "Linear (25%)",
-    "System default": "System default"
+    "System default": "System default",
+    "Console LEDs": "Console LEDs",
+    "Console LEDs: {0}": "Console LEDs: {0}"
 }

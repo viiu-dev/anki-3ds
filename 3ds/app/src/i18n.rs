@@ -27,6 +27,7 @@ pub fn init() {
     load_autoplay_audio();
     load_download_connections();
     load_battery_linear();
+    load_console_leds();
     let system_spanish =
         Cfgu::new().ok().and_then(|c| c.language().ok()) == Some(Language::Spanish);
     let spanish = match std::fs::read_to_string(PATH).ok().as_deref().map(str::trim) {
@@ -150,6 +151,36 @@ fn load_autoplay_audio() {
         .and_then(|value| value.get("autoplay_audio").and_then(|v| v.as_bool()));
     if let Some(value) = value {
         AUTOPLAY_AUDIO.store(value, Ordering::Relaxed);
+    }
+}
+
+static CONSOLE_LEDS: AtomicBool = AtomicBool::new(true);
+
+pub fn console_leds() -> bool {
+    CONSOLE_LEDS.load(Ordering::Relaxed)
+}
+
+pub fn set_console_leds(value: bool) -> io::Result<()> {
+    write_setting("console_leds", serde_json::json!(value))?;
+    CONSOLE_LEDS.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn toggle_console_leds() -> io::Result<bool> {
+    let value = !console_leds();
+    set_console_leds(value)?;
+    Ok(value)
+}
+
+fn load_console_leds() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("console_leds").and_then(|v| v.as_bool()));
+    if let Some(value) = value {
+        CONSOLE_LEDS.store(value, Ordering::Relaxed);
     }
 }
 
