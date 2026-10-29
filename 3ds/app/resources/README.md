@@ -11,3 +11,8 @@ cairosvg 3ds/app/resources/icon.svg -o 3ds/app/resources/icon.png -s 1.5
 ```
 
 These assets do not imply endorsement by Ankitects.
+
+`NotoSansJP.ttf` covers Latin, Cyrillic and Japanese. `NotoSans-Latin-Cyrillic.ttf`
+is a Noto Sans subset with Ukrainian and other extended Cyrillic letters, used
+as a per-glyph fallback. Both fonts are licensed under the SIL Open Font
+License in `licenses/NotoSansJP-OFL.txt`.

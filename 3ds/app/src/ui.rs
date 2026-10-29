@@ -43,6 +43,7 @@ const CARD_PITCH_GAP: f32 = 4.0;
 // Bundled SIL OFL font, so users never need to copy cjk.bcfnt to their SD
 // card. The renderer rasterizes only visible glyphs into a small atlas.
 const CARD_FONT: &[u8] = include_bytes!("../resources/NotoSansJP.ttf");
+const FALLBACK_FONT: &[u8] = include_bytes!("../resources/NotoSans-Latin-Cyrillic.ttf");
 
 #[inline]
 pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -66,7 +67,12 @@ extern "C" {
         cancel: *const c_char,
         accept: *const c_char,
     ) -> c_int;
-    fn ui_init(font_data: *const c_void, font_size: usize) -> bool;
+    fn ui_init(
+        font_data: *const c_void,
+        font_size: usize,
+        fallback_data: *const c_void,
+        fallback_size: usize,
+    ) -> bool;
     fn ui_set_theme(theme: *const Theme);
     fn ui_wifi_connected() -> bool;
     fn ui_fini();
@@ -251,7 +257,14 @@ impl Ui {
     }
 
     pub fn init() -> bool {
-        unsafe { ui_init(CARD_FONT.as_ptr().cast(), CARD_FONT.len()) }
+        unsafe {
+            ui_init(
+                CARD_FONT.as_ptr().cast(),
+                CARD_FONT.len(),
+                FALLBACK_FONT.as_ptr().cast(),
+                FALLBACK_FONT.len(),
+            )
+        }
     }
 
     pub fn fini() {

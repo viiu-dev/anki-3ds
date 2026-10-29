@@ -1337,6 +1337,7 @@ impl SettingsCategory {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChoiceKind {
+    Language,
     Theme,
     FontScale,
     Battery,
@@ -1374,7 +1375,7 @@ const SYSTEM_ITEMS: [SettingsItem; 2] = [
     SettingsItem::Toggle(ToggleKind::ConsoleLeds),
     SettingsItem::Action(Action::Help, "Help"),
 ];
-const LANGUAGE_ITEMS: [SettingsItem; 1] = [SettingsItem::Action(Action::Language, "Language")];
+const LANGUAGE_ITEMS: [SettingsItem; 1] = [SettingsItem::Choice(ChoiceKind::Language)];
 
 fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
     match category {
@@ -1392,6 +1393,7 @@ fn settings_row_count(category: SettingsCategory) -> usize {
 
 fn choice_title(kind: ChoiceKind) -> &'static str {
     match kind {
+        ChoiceKind::Language => "Language",
         ChoiceKind::Theme => "Theme",
         ChoiceKind::FontScale => "Font scale",
         ChoiceKind::Battery => "Battery indicator",
@@ -1401,6 +1403,10 @@ fn choice_title(kind: ChoiceKind) -> &'static str {
 
 fn choice_options(kind: ChoiceKind) -> Vec<String> {
     match kind {
+        ChoiceKind::Language => i18n::LANGUAGES
+            .iter()
+            .map(|(_, name)| (*name).to_owned())
+            .collect(),
         ChoiceKind::Theme => ThemeKind::ALL
             .iter()
             .map(|value| tr(value.label()).to_owned())
@@ -1418,6 +1424,7 @@ fn choice_options(kind: ChoiceKind) -> Vec<String> {
 
 fn choice_selected(kind: ChoiceKind) -> usize {
     match kind {
+        ChoiceKind::Language => i18n::language_index(),
         ChoiceKind::Theme => ThemeKind::ALL
             .iter()
             .position(|value| *value == theme::kind())
@@ -1439,6 +1446,10 @@ fn choice_label(kind: ChoiceKind) -> String {
 
 fn apply_choice(kind: ChoiceKind, index: usize) -> std::io::Result<()> {
     match kind {
+        ChoiceKind::Language => {
+            i18n::set_language(index)?;
+            event(&format!("LANGUAGE {}", i18n::language()));
+        }
         ChoiceKind::Theme => {
             let value = ThemeKind::ALL[index.min(ThemeKind::ALL.len() - 1)];
             theme::set(value)?;
@@ -2400,10 +2411,18 @@ fn main() {
                     let category = SettingsCategory::ALL[index.min(SettingsCategory::ALL.len() - 1)];
                     let old = std::mem::replace(&mut screen, Screen::Decks);
                     if let Screen::Settings { selected, previous } = old {
-                        screen = Screen::SettingsCategory {
-                            category,
-                            selected: 0,
-                            previous: Box::new(Screen::Settings { selected, previous }),
+                        let settings = Screen::Settings { selected, previous };
+                        screen = match category {
+                            SettingsCategory::Language => Screen::SettingsChoice {
+                                kind: ChoiceKind::Language,
+                                selected: i18n::language_index(),
+                                previous: Box::new(settings),
+                            },
+                            _ => Screen::SettingsCategory {
+                                category,
+                                selected: 0,
+                                previous: Box::new(settings),
+                            },
                         };
                     }
                     return Ok(());
@@ -2520,6 +2539,11 @@ fn main() {
                                 if kind == ChoiceKind::FontScale {
                                     review_scroll = 0.0;
                                 }
+                                if kind == ChoiceKind::Language {
+                                    if let Some(active) = backend.as_mut() {
+                                        active.set_language(None)?;
+                                    }
+                                }
                             }
                             SettingsItem::Toggle(kind) => apply_toggle(kind)?,
                             SettingsItem::Action(_, _) => {}
@@ -2537,6 +2561,11 @@ fn main() {
                         apply_choice(kind, index)?;
                         if kind == ChoiceKind::FontScale {
                             review_scroll = 0.0;
+                        }
+                        if kind == ChoiceKind::Language {
+                            if let Some(active) = backend.as_mut() {
+                                active.set_language(None)?;
+                            }
                         }
                         return Ok(());
                     }

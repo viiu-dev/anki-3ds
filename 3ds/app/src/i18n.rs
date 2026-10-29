@@ -12,11 +12,35 @@ use std::sync::OnceLock;
 
 use ctru::services::cfgu::Cfgu;
 use ctru::services::cfgu::Language;
-static SPANISH: AtomicBool = AtomicBool::new(false);
-static EN: OnceLock<HashMap<String, String>> = OnceLock::new();
-static ES: OnceLock<HashMap<String, String>> = OnceLock::new();
-const PATH: &str = "sdmc:/3ds/anki-3ds/language.txt";
 
+pub const LANGUAGES: [(&str, &str); 9] = [
+    ("en", "English"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("it", "Italiano"),
+    ("pt", "Português"),
+    ("ru", "Русский"),
+    ("uk", "Українська"),
+    ("ja", "日本語"),
+];
+
+const CATALOGS: [&str; 9] = [
+    include_str!("../locales/en.json"),
+    include_str!("../locales/es.json"),
+    include_str!("../locales/fr.json"),
+    include_str!("../locales/de.json"),
+    include_str!("../locales/it.json"),
+    include_str!("../locales/pt.json"),
+    include_str!("../locales/ru.json"),
+    include_str!("../locales/uk.json"),
+    include_str!("../locales/ja.json"),
+];
+
+static CATALOG_CACHE: [OnceLock<HashMap<String, String>>; 9] = [const { OnceLock::new() }; 9];
+static LANGUAGE: AtomicU8 = AtomicU8::new(0);
+
+const PATH: &str = "sdmc:/3ds/anki-3ds/language.txt";
 const SETTINGS_PATH: &str = "sdmc:/3ds/anki-3ds/settings.json";
 pub const FONT_SCALES: [u16; 7] = [85, 100, 125, 150, 175, 200, 250];
 const DEFAULT_FONT_SCALE: u16 = 100;
@@ -28,33 +52,68 @@ pub fn init() {
     load_download_connections();
     load_battery_linear();
     load_console_leds();
-    let system_spanish =
-        Cfgu::new().ok().and_then(|c| c.language().ok()) == Some(Language::Spanish);
-    let spanish = match std::fs::read_to_string(PATH).ok().as_deref().map(str::trim) {
-        Some("es") => true,
-        Some("en") => false,
-        _ => system_spanish,
-    };
-    SPANISH.store(spanish, Ordering::Relaxed);
-    EN.get_or_init(|| {
-        serde_json::from_str(include_str!("../locales/en.json")).expect("English catalog")
-    });
-    ES.get_or_init(|| {
-        serde_json::from_str(include_str!("../locales/es.json")).expect("Spanish catalog")
-    });
+    let saved = fs::read_to_string(PATH)
+        .ok()
+        .and_then(|text| index_of(text.trim()));
+    let index = saved.unwrap_or_else(|| index_of(system_language()).unwrap_or(0));
+    LANGUAGE.store(index as u8, Ordering::Relaxed);
+    let _ = catalog();
 }
-pub fn language() -> &'static str {
-    if SPANISH.load(Ordering::Relaxed) {
-        "es"
-    } else {
-        "en"
+
+fn system_language() -> &'static str {
+    match Cfgu::new().ok().and_then(|config| config.language().ok()) {
+        Some(Language::Japanese) => "ja",
+        Some(Language::French) => "fr",
+        Some(Language::German) => "de",
+        Some(Language::Italian) => "it",
+        Some(Language::Spanish) => "es",
+        Some(Language::Portuguese) => "pt",
+        Some(Language::Russian) => "ru",
+        _ => "en",
     }
 }
-pub fn toggle() -> std::io::Result<()> {
-    let spanish = !SPANISH.load(Ordering::Relaxed);
-    std::fs::write(PATH, if spanish { "es" } else { "en" })?;
-    SPANISH.store(spanish, Ordering::Relaxed);
+
+fn index_of(code: &str) -> Option<usize> {
+    LANGUAGES.iter().position(|(value, _)| *value == code)
+}
+
+fn catalog() -> Option<&'static HashMap<String, String>> {
+    let index = usize::from(LANGUAGE.load(Ordering::Relaxed)).min(LANGUAGES.len() - 1);
+    Some(
+        CATALOG_CACHE[index]
+            .get_or_init(|| serde_json::from_str(CATALOGS[index]).expect("locale catalog")),
+    )
+}
+
+pub fn language() -> &'static str {
+    LANGUAGES[language_index()].0
+}
+
+pub fn language_index() -> usize {
+    usize::from(LANGUAGE.load(Ordering::Relaxed)).min(LANGUAGES.len() - 1)
+}
+
+pub fn set_language(index: usize) -> io::Result<()> {
+    let index = index.min(LANGUAGES.len() - 1);
+    fs::write(PATH, LANGUAGES[index].0)?;
+    LANGUAGE.store(index as u8, Ordering::Relaxed);
     Ok(())
+}
+
+pub fn cycle_language(direction: i32) -> io::Result<usize> {
+    let count = LANGUAGES.len();
+    let index = language_index();
+    let next = if direction < 0 {
+        (index + count - 1) % count
+    } else {
+        (index + 1) % count
+    };
+    set_language(next)?;
+    Ok(next)
+}
+
+pub fn toggle() -> std::io::Result<()> {
+    cycle_language(1).map(|_| ())
 }
 
 fn load_font_scale() {
@@ -144,6 +203,31 @@ fn load_autoplay_audio() {
     }
 }
 
+static BATTERY_LINEAR: AtomicBool = AtomicBool::new(true);
+
+pub fn battery_linear() -> bool {
+    BATTERY_LINEAR.load(Ordering::Relaxed)
+}
+
+pub fn set_battery_linear(value: bool) -> io::Result<()> {
+    write_setting("battery_linear", serde_json::json!(value))?;
+    BATTERY_LINEAR.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+
+fn load_battery_linear() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("battery_linear").and_then(|v| v.as_bool()));
+    if let Some(value) = value {
+        BATTERY_LINEAR.store(value, Ordering::Relaxed);
+    }
+}
+
 static CONSOLE_LEDS: AtomicBool = AtomicBool::new(true);
 
 pub fn console_leds() -> bool {
@@ -171,30 +255,6 @@ fn load_console_leds() {
         .and_then(|value| value.get("console_leds").and_then(|v| v.as_bool()));
     if let Some(value) = value {
         CONSOLE_LEDS.store(value, Ordering::Relaxed);
-    }
-}
-
-static BATTERY_LINEAR: AtomicBool = AtomicBool::new(true);
-
-pub fn battery_linear() -> bool {
-    BATTERY_LINEAR.load(Ordering::Relaxed)
-}
-
-pub fn set_battery_linear(value: bool) -> io::Result<()> {
-    write_setting("battery_linear", serde_json::json!(value))?;
-    BATTERY_LINEAR.store(value, Ordering::Relaxed);
-    Ok(())
-}
-
-fn load_battery_linear() {
-    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
-        return;
-    };
-    let value = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|value| value.get("battery_linear").and_then(|v| v.as_bool()));
-    if let Some(value) = value {
-        BATTERY_LINEAR.store(value, Ordering::Relaxed);
     }
 }
 
@@ -235,6 +295,7 @@ pub fn set_download_connections(value: u8) -> io::Result<u8> {
     Ok(value)
 }
 
+
 fn load_download_connections() {
     let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
         return;
@@ -249,16 +310,12 @@ fn load_download_connections() {
 }
 
 pub fn tr(message: &'static str) -> &'static str {
-    let catalog = if SPANISH.load(Ordering::Relaxed) {
-        ES.get()
-    } else {
-        EN.get()
-    };
-    catalog
-        .and_then(|c| c.get(message))
+    catalog()
+        .and_then(|catalog| catalog.get(message))
         .map(String::as_str)
         .unwrap_or(message)
 }
+
 pub fn format(message: &'static str, values: &[&str]) -> String {
     let mut text = tr(message).to_owned();
     for (index, value) in values.iter().enumerate() {

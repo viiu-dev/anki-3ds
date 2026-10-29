@@ -60,6 +60,7 @@
 typedef struct {
     uint32_t codepoint;
     int px;
+    int font;
     int glyph;
     int atlas_x;
     int atlas_y;
@@ -116,7 +117,9 @@ static C2D_TextBuf s_measure_buf = NULL;
 static bool s_initialized = false;
 
 static stbtt_fontinfo s_font;
+static stbtt_fontinfo s_fallback;
 static bool s_font_loaded = false;
+static bool s_fallback_loaded = false;
 static C3D_Tex s_card_atlas_tex;
 static bool s_card_atlas_ready = false;
 static uint8_t s_card_atlas[CARD_ATLAS_W * CARD_ATLAS_H * 4];
@@ -1227,11 +1230,21 @@ static CardGlyph* ensure_glyph(uint32_t codepoint, int px) {
         return NULL;
     }
 
-    float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
-    int glyph = stbtt_FindGlyphIndex(&s_font, (int)codepoint);
+    const stbtt_fontinfo* font = &s_font;
+    int font_index = 0;
+    int glyph = stbtt_FindGlyphIndex(font, (int)codepoint);
+    if (glyph == 0 && s_fallback_loaded) {
+        int fallback = stbtt_FindGlyphIndex(&s_fallback, (int)codepoint);
+        if (fallback != 0) {
+            font = &s_fallback;
+            font_index = 1;
+            glyph = fallback;
+        }
+    }
+    float em_scale = stbtt_ScaleForMappingEmToPixels(font, (float)px);
     int advance_units = 0;
     int lsb = 0;
-    stbtt_GetGlyphHMetrics(&s_font, glyph, &advance_units, &lsb);
+    stbtt_GetGlyphHMetrics(font, glyph, &advance_units, &lsb);
     (void)lsb;
 
     int width = 0;
@@ -1239,7 +1252,7 @@ static CardGlyph* ensure_glyph(uint32_t codepoint, int px) {
     int offset_x = 0;
     int offset_y = 0;
     unsigned char* bitmap =
-        stbtt_GetGlyphBitmap(&s_font, em_scale, em_scale, glyph, &width, &height, &offset_x, &offset_y);
+        stbtt_GetGlyphBitmap(font, em_scale, em_scale, glyph, &width, &height, &offset_x, &offset_y);
 
     int cell_w = width + 2;
     int cell_h = height + 2;
@@ -1259,6 +1272,7 @@ static CardGlyph* ensure_glyph(uint32_t codepoint, int px) {
     CardGlyph* glyph_entry = &s_glyphs[s_glyph_count++];
     glyph_entry->codepoint = codepoint;
     glyph_entry->px = px;
+    glyph_entry->font = font_index;
     glyph_entry->glyph = glyph;
     glyph_entry->atlas_x = s_atlas_x + 1;
     glyph_entry->atlas_y = s_atlas_y + 1;
@@ -1327,7 +1341,7 @@ void ui_reset_card_text(void) {
     reset_card_atlas();
 }
 
-bool ui_init(const void* font_data, size_t font_size) {
+bool ui_init(const void* font_data, size_t font_size, const void* fallback_data, size_t fallback_size) {
     if (s_initialized) return true;
 
     osSetSpeedupEnable(true);
@@ -1354,6 +1368,12 @@ bool ui_init(const void* font_data, size_t font_size) {
     }
     s_font_loaded = font_offset >= 0 &&
         stbtt_InitFont(&s_font, (const unsigned char*)font_data, font_offset);
+    int fallback_offset = -1;
+    if (fallback_data && fallback_size > 0) {
+        fallback_offset = stbtt_GetFontOffsetForIndex((const unsigned char*)fallback_data, 0);
+    }
+    s_fallback_loaded = fallback_offset >= 0 &&
+        stbtt_InitFont(&s_fallback, (const unsigned char*)fallback_data, fallback_offset);
     if (s_font_loaded) {
         s_card_atlas_ready = C3D_TexInit(&s_card_atlas_tex, CARD_ATLAS_W, CARD_ATLAS_H, GPU_RGBA8);
         if (s_card_atlas_ready) {
@@ -1542,16 +1562,25 @@ static bool draw_glyph_run(float x, float y, float scale, uint32_t color,
             return false;
         }
     }
-    float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
     float baseline = y + CARD_FONT_BASELINE * (float)px;
     float pen_x = x;
     int previous_glyph = -1;
+    const stbtt_fontinfo* previous_font = NULL;
     cursor = (const unsigned char*)str;
     while (*cursor) {
         uint32_t cp = utf8_next(&cursor);
-        int glyph_index = stbtt_FindGlyphIndex(&s_font, (int)cp);
-        if (previous_glyph >= 0) {
-            pen_x += stbtt_GetGlyphKernAdvance(&s_font, previous_glyph, glyph_index) * em_scale;
+        const stbtt_fontinfo* font = &s_font;
+        int glyph_index = stbtt_FindGlyphIndex(font, (int)cp);
+        if (glyph_index == 0 && s_fallback_loaded) {
+            int fallback = stbtt_FindGlyphIndex(&s_fallback, (int)cp);
+            if (fallback != 0) {
+                font = &s_fallback;
+                glyph_index = fallback;
+            }
+        }
+        float em_scale = stbtt_ScaleForMappingEmToPixels(font, (float)px);
+        if (previous_glyph >= 0 && previous_font == font) {
+            pen_x += stbtt_GetGlyphKernAdvance(font, previous_glyph, glyph_index) * em_scale;
         }
         CardGlyph* glyph = find_glyph(cp, px);
         if (glyph) {
@@ -1566,6 +1595,7 @@ static bool draw_glyph_run(float x, float y, float scale, uint32_t color,
             pen_x += glyph->advance;
         }
         previous_glyph = glyph_index;
+        previous_font = font;
     }
     return true;
 }
@@ -1593,22 +1623,32 @@ float ui_get_card_text_width(float scale, const char* str) {
     }
 
     int px = card_font_px(scale);
-    float em_scale = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
     float width = 0.0f;
     int previous_glyph = -1;
+    const stbtt_fontinfo* previous_font = NULL;
     const unsigned char* cursor = (const unsigned char*)str;
     while (*cursor) {
         uint32_t cp = utf8_next(&cursor);
-        int glyph_index = stbtt_FindGlyphIndex(&s_font, (int)cp);
-        if (previous_glyph >= 0) {
-            width += stbtt_GetGlyphKernAdvance(&s_font, previous_glyph, glyph_index) * em_scale;
+        const stbtt_fontinfo* font = &s_font;
+        int glyph_index = stbtt_FindGlyphIndex(font, (int)cp);
+        if (glyph_index == 0 && s_fallback_loaded) {
+            int fallback = stbtt_FindGlyphIndex(&s_fallback, (int)cp);
+            if (fallback != 0) {
+                font = &s_fallback;
+                glyph_index = fallback;
+            }
+        }
+        float em_scale = stbtt_ScaleForMappingEmToPixels(font, (float)px);
+        if (previous_glyph >= 0 && previous_font == font) {
+            width += stbtt_GetGlyphKernAdvance(font, previous_glyph, glyph_index) * em_scale;
         }
         int advance = 0;
         int lsb = 0;
-        stbtt_GetGlyphHMetrics(&s_font, glyph_index, &advance, &lsb);
+        stbtt_GetGlyphHMetrics(font, glyph_index, &advance, &lsb);
         (void)lsb;
         width += advance * em_scale;
         previous_glyph = glyph_index;
+        previous_font = font;
     }
     return width;
 }

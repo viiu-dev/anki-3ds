@@ -56,7 +56,8 @@ typedef struct {
 
 // `font_data` is the bundled TrueType font and must remain valid for the
 // lifetime of the UI. The renderer rasterizes CJK glyphs into a small atlas.
-bool ui_init(const void* font_data, size_t font_size);
+bool ui_init(const void* font_data, size_t font_size, const void* fallback_data,
+             size_t fallback_size);
 void ui_set_theme(const UiTheme* theme);
 void ui_fini(void);
 void ui_frame_begin(void);

@@ -191,6 +191,18 @@
     "Battery indicator: {0}": "Battery indicator: {0}",
     "Linear (25%)": "Linear (25%)",
     "System default": "System default",
+    "Appearance and display": "Appearance and display",
+    "Audio and review": "Audio and review",
+    "Sync and network": "Sync and network",
+    "System and hardware": "System and hardware",
+    "Theme, font size and battery.": "Theme, font size and battery.",
+    "Audio playback and review options.": "Audio playback and review options.",
+    "Account, clock and media downloads.": "Account, clock and media downloads.",
+    "Hardware lights and help.": "Hardware lights and help.",
+    "Choose the interface language.": "Choose the interface language.",
+    "Choose a category. B returns.": "Choose a category. B returns.",
+    "A opens or changes. B returns.": "A opens or changes. B returns.",
+    "Choose an option. A applies. B returns.": "Choose an option. A applies. B returns.",
     "Console LEDs": "Console LEDs",
     "Console LEDs: {0}": "Console LEDs: {0}"
 }
