@@ -270,10 +270,14 @@ fn audio_button_rects(visible: usize, paged: bool) -> Vec<(f32, f32)> {
     }
     let side = if paged { 20.0 } else { 8.0 };
     let gap = 6.0;
-    let usable = 320.0 - 2.0 * side - (visible as f32 - 1.0) * gap;
-    let width = usable / visible as f32;
+    let usable = 320.0 - 2.0 * side;
+    let four_slot = (usable - (AUDIO_VISIBLE as f32 - 1.0) * gap) / AUDIO_VISIBLE as f32;
+    let fit = (usable - (visible as f32 - 1.0) * gap) / visible as f32;
+    let width = if paged { four_slot } else { fit };
+    let row = visible as f32 * width + (visible as f32 - 1.0) * gap;
+    let start = (320.0 - row) * 0.5;
     (0..visible)
-        .map(|index| (side + index as f32 * (width + gap), width))
+        .map(|index| (start + index as f32 * (width + gap), width))
         .collect()
 }
 
@@ -306,51 +310,63 @@ fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase:
         };
         Ui::draw_rounded_rect(x, AUDIO_Y, width, AUDIO_H, AUDIO_H * 0.5, background);
         let center_y = AUDIO_Y + AUDIO_H * 0.5;
+        let label = i18n::format("Audio {0}", &[&(index + 1).to_string()]);
+        let label_width = Ui::get_text_width(0.42, &label);
+        let icon_width = if state == AudioState::Playing {
+            22.0
+        } else {
+            14.0
+        };
+        let gap = 6.0;
+        let group = icon_width + gap + label_width;
+        let group_x = x + (width - group) * 0.5;
+        let icon_x = group_x + icon_width * 0.5;
         match state {
             AudioState::Ready => {
                 Ui::draw_triangle(
-                    x + 6.0,
+                    icon_x - 4.5,
                     center_y - 6.0,
-                    x + 6.0,
+                    icon_x - 4.5,
                     center_y + 6.0,
-                    x + 16.0,
+                    icon_x + 5.5,
                     center_y,
                     current_theme().accent,
                 );
             }
             AudioState::Pending => {
                 Ui::draw_rect(
-                    x + 8.0,
+                    icon_x - 1.5,
                     center_y - 7.0,
                     4.0,
                     7.0,
                     current_theme().text_muted,
                 );
                 Ui::draw_triangle(
-                    x + 5.0,
+                    icon_x - 5.0,
                     center_y,
-                    x + 15.0,
+                    icon_x + 5.0,
                     center_y,
-                    x + 10.0,
+                    icon_x,
                     center_y + 6.0,
                     current_theme().text_muted,
                 );
             }
             AudioState::Playing => {
-                Ui::draw_rect(x + 4.0, center_y - 3.0, 4.0, 6.0, foreground);
+                Ui::draw_rect(icon_x - 7.0, center_y - 3.0, 4.0, 6.0, foreground);
                 Ui::draw_triangle(
-                    x + 8.0,
+                    icon_x - 3.0,
                     center_y - 6.0,
-                    x + 8.0,
+                    icon_x - 3.0,
                     center_y + 6.0,
-                    x + 14.0,
+                    icon_x + 3.0,
                     center_y,
                     foreground,
                 );
-                for bar in 0..3 {
-                    let height = 3.0 + (((phase + index as u64 * 2 + bar) % 8) as f32 - 4.0).abs();
+                for bar in 0..2 {
+                    let height =
+                        3.0 + (((phase + index as u64 * 2 + bar) % 8) as f32 - 4.0).abs();
                     Ui::draw_rect(
-                        x + 17.0 + bar as f32 * 4.0,
+                        icon_x + 5.0 + bar as f32 * 4.0,
                         center_y - height * 0.5,
                         2.0,
                         height,
@@ -359,9 +375,8 @@ fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase:
                 }
             }
         }
-        let label = i18n::format("Audio {0}", &[&(index + 1).to_string()]);
-        Ui::draw_text_centered(
-            x + width * 0.5 + 9.0,
+        Ui::draw_text(
+            group_x + icon_width + gap,
             AUDIO_Y + 10.0,
             0.42,
             foreground,
@@ -408,6 +423,183 @@ fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase:
             };
             Ui::draw_rect(start + dot as f32 * spacing - 1.5, 119.0, 3.0, 3.0, color);
         }
+    }
+}
+
+
+fn with_alpha(color: u32, alpha: f32) -> u32 {
+    let a = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+    (color & 0x00ff_ffff) | (a << 24)
+}
+
+fn feedback_alpha(elapsed: f32) -> f32 {
+    if elapsed < 0.10 {
+        elapsed / 0.10
+    } else if elapsed < 0.55 {
+        1.0
+    } else {
+        (1.0 - (elapsed - 0.55) / 0.40).clamp(0.0, 1.0)
+    }
+}
+
+fn rating_colors(rating: i32) -> (u32, u32) {
+    match rating {
+        0 => (current_theme().again_bg, current_theme().again_fg),
+        1 => (current_theme().hard_bg, current_theme().hard_fg),
+        2 => (current_theme().good_bg, current_theme().good_fg),
+        _ => (current_theme().easy_bg, current_theme().easy_fg),
+    }
+}
+
+fn draw_rating_icon(rating: i32, cx: f32, cy: f32, scale: f32, color: u32) {
+    match rating {
+        0 => {
+            Ui::draw_line(cx - 6.0 * scale, cy - 6.0 * scale, cx + 6.0 * scale, cy + 6.0 * scale, 2.5 * scale, color);
+            Ui::draw_line(cx - 6.0 * scale, cy + 6.0 * scale, cx + 6.0 * scale, cy - 6.0 * scale, 2.5 * scale, color);
+        }
+        1 => {
+            Ui::draw_rect(cx - 8.0 * scale, cy - 1.5 * scale, 16.0 * scale, 3.0 * scale, color);
+        }
+        2 => {
+            Ui::draw_line(cx - 7.0 * scale, cy + 1.0 * scale, cx - 2.0 * scale, cy + 6.0 * scale, 2.5 * scale, color);
+            Ui::draw_line(cx - 2.0 * scale, cy + 6.0 * scale, cx + 8.0 * scale, cy - 6.0 * scale, 2.5 * scale, color);
+        }
+        _ => {
+            Ui::draw_line(cx - 9.0 * scale, cy + 0.5 * scale, cx - 5.0 * scale, cy + 5.0 * scale, 2.2 * scale, color);
+            Ui::draw_line(cx - 5.0 * scale, cy + 5.0 * scale, cx + 1.0 * scale, cy - 4.0 * scale, 2.2 * scale, color);
+            Ui::draw_line(cx - 1.0 * scale, cy + 0.5 * scale, cx + 3.0 * scale, cy + 5.0 * scale, 2.2 * scale, color);
+            Ui::draw_line(cx + 3.0 * scale, cy + 5.0 * scale, cx + 9.0 * scale, cy - 4.0 * scale, 2.2 * scale, color);
+        }
+    }
+}
+
+fn draw_rating_badge(feedback: Option<(i32, Instant)>) {
+    let Some((rating, at)) = feedback else {
+        return;
+    };
+    let elapsed = at.elapsed().as_secs_f32();
+    if elapsed >= 0.95 {
+        return;
+    }
+    let alpha = feedback_alpha(elapsed);
+    let (background, foreground) = rating_colors(rating);
+    let radius = 15.0;
+    let cx = TOP_WIDTH - 28.0;
+    let cy = 27.0;
+    Ui::draw_rounded_rect(
+        cx - radius,
+        cy - radius,
+        radius * 2.0,
+        radius * 2.0,
+        radius,
+        with_alpha(background, alpha * 0.95),
+    );
+    draw_rating_icon(rating, cx, cy, 1.0, with_alpha(foreground, alpha));
+}
+
+fn draw_sync_button(x: f32, y: f32, w: f32, h: f32, state: i32) {
+    let label = tr("Sync");
+    let text_width = Ui::get_text_width(0.50, label);
+    let icon = 10.0;
+    let gap = 7.0;
+    let group = icon + gap + text_width;
+    let start = x + (w - group) * 0.5;
+    let text_y = y + h * 0.5 - 6.0;
+    Ui::draw_button(x, y, w, h, "", None, 6, false);
+    Ui::draw_sync_icon(start, text_y + 2.0, icon, state);
+    Ui::draw_text(
+        start + icon + gap,
+        text_y,
+        0.50,
+        current_theme().text,
+        label,
+    );
+}
+
+fn draw_undo_button(x: f32, y: f32, w: f32, h: f32, enabled: bool) {
+    let style = if enabled { 6 } else { 8 };
+    Ui::draw_button(x, y, w, h, tr("Undo"), None, style, false);
+}
+
+fn draw_rating_edge(feedback: Option<(i32, Instant)>) {
+    let Some((rating, at)) = feedback else {
+        return;
+    };
+    let elapsed = at.elapsed().as_secs_f32();
+    if elapsed >= 0.95 {
+        return;
+    }
+    let alpha = feedback_alpha(elapsed);
+    let (background, foreground) = rating_colors(rating);
+    if elapsed < 0.55 {
+        let fade = 1.0 - elapsed / 0.55;
+        let x = 8.0 + rating as f32 * 76.0;
+        Ui::draw_rounded_rect(x, 190.0, 72.0, 36.0, 16.0, with_alpha(background, fade * 0.95));
+        draw_rating_icon(rating, x + 36.0, 208.0, 0.9, with_alpha(foreground, fade));
+    }
+    Ui::draw_rounded_rect(313.0, 84.0, 5.0, 76.0, 2.5, with_alpha(foreground, alpha * 0.9));
+}
+
+fn draw_leech_notice(notice: Option<&(String, Instant)>) {
+    let Some((text, at)) = notice else {
+        return;
+    };
+    let elapsed = at.elapsed().as_secs_f32();
+    if elapsed >= 2.8 {
+        return;
+    }
+    let alpha = if elapsed < 0.15 {
+        elapsed / 0.15
+    } else if elapsed < 2.3 {
+        1.0
+    } else {
+        (1.0 - (elapsed - 2.3) / 0.50).clamp(0.0, 1.0)
+    };
+    let theme = current_theme();
+    let width = TOP_WIDTH - 96.0;
+    let height = 32.0;
+    let x = (TOP_WIDTH - width) * 0.5;
+    let y = 196.0;
+    let radius = height * 0.5;
+    Ui::draw_rounded_rect(
+        x,
+        y + 1.5,
+        width,
+        height,
+        radius,
+        with_alpha(theme.shadow, alpha),
+    );
+    Ui::draw_rounded_rect(
+        x,
+        y,
+        width,
+        height,
+        radius,
+        with_alpha(theme.border, alpha),
+    );
+    Ui::draw_rounded_rect(
+        x + 1.0,
+        y + 1.0,
+        width - 2.0,
+        height - 2.0,
+        radius - 1.0,
+        with_alpha(theme.surface_alt, alpha),
+    );
+    Ui::draw_rect(x + 14.0, y + height * 0.5 - 2.0, 4.0, 4.0, with_alpha(theme.hard_fg, alpha));
+    Ui::fit_text(
+        TOP_WIDTH / 2.0 + 5.0,
+        y + 9.0,
+        0.46,
+        width,
+        with_alpha(theme.text, alpha),
+        text,
+    );
+}
+
+fn leech_message(event: backend::LeechEvent) -> String {
+    match event {
+        backend::LeechEvent::Suspended => tr("Leech: card suspended").to_owned(),
+        backend::LeechEvent::Tagged => tr("Leech: card tagged").to_owned(),
     }
 }
 
@@ -1097,7 +1289,7 @@ const MAIN_MENU: [(Action, &str); 10] = [
     (Action::Settings, "Settings"),
     (Action::Exit, "Exit"),
 ];
-const SETTINGS_MENU: [(Action, &str); 11] = [
+const SETTINGS_MENU: [(Action, &str); 12] = [
     (Action::None, "Font scale"),
     (Action::None, "Theme"),
     (Action::Language, "Language"),
@@ -1109,12 +1301,14 @@ const SETTINGS_MENU: [(Action, &str); 11] = [
     (Action::None, "Auto-play audio"),
     (Action::None, "Download connections"),
     (Action::None, "Media sync"),
+    (Action::None, "Battery indicator"),
 ];
 const FONT_SCALE_ITEM: usize = 0;
 const THEME_ITEM: usize = 1;
 const AUTOPLAY_ITEM: usize = 8;
 const CONNECTIONS_ITEM: usize = 9;
 const MEDIA_SYNC_ITEM: usize = 10;
+const BATTERY_ITEM: usize = 11;
 const MENU_COLS: usize = 2;
 const MENU_TILE_W: f32 = 146.0;
 const MENU_TILE_H: f32 = 30.0;
@@ -1203,6 +1397,14 @@ fn settings_label(
             "Download connections: {0}",
             &[&i18n::download_connections().to_string()],
         ),
+        BATTERY_ITEM => i18n::format(
+            "Battery indicator: {0}",
+            &[tr(if i18n::battery_linear() {
+                "Linear (25%)"
+            } else {
+                "System default"
+            })],
+        ),
         MEDIA_SYNC_ITEM => {
             if media_running {
                 if let Some(status) = media_status {
@@ -1275,6 +1477,7 @@ fn main() {
     i18n::init();
     theme::init();
     Ui::apply_theme();
+    Ui::set_battery_linear(i18n::battery_linear());
     let startup_error = assets::prepare()
         .map_err(|e| e.to_string())
         .and_then(|_| {
@@ -1330,6 +1533,14 @@ fn main() {
             }
         }
     };
+    let mut synced_ms = i18n::sync_stamp();
+    let mut current_ms = backend
+        .as_mut()
+        .and_then(|b| b.collection_modified_ms().ok())
+        .unwrap_or(0);
+    if synced_ms == 0 {
+        synced_ms = current_ms;
+    }
     let mut root = DeckTreeNode::default();
     let mut screen = if let Some(error) = startup_error {
         Screen::Error(error)
@@ -1391,6 +1602,10 @@ fn main() {
     let mut script_step = 0;
     let mut script_cooldown = 120;
     let mut last_state = String::new();
+    let mut daily_studied = String::new();
+    let mut rating_feedback: Option<(i32, Instant)> = None;
+    let mut leech_notice: Option<(String, Instant)> = None;
+    let mut last_answered: Option<i64> = None;
     let trace_touch = fs::metadata("sdmc:/3ds/anki-3ds/trace-touch").is_ok();
 
     while apt.main_loop() {
@@ -1451,6 +1666,17 @@ fn main() {
             if let Some(error) = done_media_error {
                 media_result = Some(i18n::format("failed: {0}", &[&error]));
                 media_notice_until = Instant::now() + Duration::from_secs(3600);
+            }
+            if matches!(done_result, Ok(sync::Outcome::Complete)) {
+                if let Some(b) = backend.as_mut() {
+                    if let Ok(ms) = b.collection_modified_ms() {
+                        current_ms = ms;
+                        synced_ms = ms;
+                        if let Err(error) = i18n::save_sync_stamp(ms) {
+                            event(&format!("SYNC_STAMP_ERROR {error}"));
+                        }
+                    }
+                }
             }
             screen = match done_result {
                 Ok(sync::Outcome::LoggedIn) => {
@@ -1530,6 +1756,7 @@ fn main() {
             media_refreshed_now = true;
         }
         hid.scan_input();
+        let undo_available = last_answered.is_some();
         let down = hid.keys_down();
         let held = hid.keys_held();
         if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
@@ -1715,9 +1942,27 @@ fn main() {
                     audio_tap(&card_audio(card, true), audio_page, x)
                 }
                 Screen::Question { .. }
-                    if (128.0..200.0).contains(&y) && (40.0..280.0).contains(&x) =>
+                    if (128.0..180.0).contains(&y) && (8.0..216.0).contains(&x) =>
                 {
                     Action::Reveal
+                }
+                Screen::Question { .. }
+                    if (128.0..180.0).contains(&y) && (224.0..312.0).contains(&x) =>
+                {
+                    if undo_available {
+                        Action::Undo
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::Answer { .. }
+                    if (148.0..184.0).contains(&y) && (236.0..308.0).contains(&x) =>
+                {
+                    if undo_available {
+                        Action::Undo
+                    } else {
+                        Action::None
+                    }
                 }
                 Screen::Answer { .. } if (190.0..226.0).contains(&y) => {
                     let n = ((x - 8.0) / 76.0).floor() as i32;
@@ -1885,6 +2130,8 @@ fn main() {
                     "FILTER" => Action::Filter(value.parse().unwrap_or(0)),
                     "RESTORE" => Action::Restore,
                     "AUDIO" => Action::PlayAudio(None),
+                    "AUDIO_NEXT" => Action::AudioPage(1),
+                    "AUDIO_PREV" => Action::AudioPage(-1),
                     "COLLAPSE" => {
                         selected = value.parse().unwrap_or(0);
                         Action::Left
@@ -1984,6 +2231,15 @@ fn main() {
                         event(&format!("DOWNLOAD_CONNECTIONS {value}"));
                         return Ok(());
                     }
+                }
+                if *selected == BATTERY_ITEM && matches!(action, Action::Primary) {
+                    let value = i18n::toggle_battery_linear()?;
+                    Ui::set_battery_linear(value);
+                    event(&format!(
+                        "BATTERY_INDICATOR {}",
+                        if value { "linear" } else { "system" }
+                    ));
+                    return Ok(());
                 }
                 if *selected == MEDIA_SYNC_ITEM && matches!(action, Action::Primary) {
                     if let Some(active) = &media_job {
@@ -2414,9 +2670,35 @@ fn main() {
                     card_scroll = 0;
                 }
                 Action::Undo => {
-                    backend.as_mut().ok_or("collection unavailable")?.undo()?;
-                    event("UNDO_OK");
-                    screen = Screen::Decks;
+                    let review_deck = match &screen {
+                        Screen::Question { deck_name, .. }
+                        | Screen::Answer { deck_name, .. }
+                        | Screen::Empty { deck_name } => Some(deck_name.clone()),
+                        Screen::Menu { previous, .. } => match &**previous {
+                            Screen::Question { deck_name, .. }
+                            | Screen::Answer { deck_name, .. }
+                            | Screen::Empty { deck_name } => Some(deck_name.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let b = backend.as_mut().ok_or("collection unavailable")?;
+                    match (review_deck, last_answered.take()) {
+                        (Some(deck_name), Some(card_id)) => {
+                            b.undo()?;
+                            event(&format!("UNDO_REVIEW card={card_id}"));
+                            screen = match b.reopen_card(card_id)? {
+                                Some(card) => Screen::Question { card, deck_name },
+                                None => Screen::Empty { deck_name },
+                            };
+                        }
+                        _ => {
+                            b.undo()?;
+                            event("UNDO_OK");
+                            screen = Screen::Decks;
+                        }
+                    }
+                    card_scroll = 0;
                 }
                 Action::Bury => {
                     let card_id = match &screen {
@@ -2555,6 +2837,7 @@ fn main() {
                 Action::Field | Action::Primary | Action::Reveal | Action::Rate(_) => {
                     match &mut screen {
                         Screen::Decks if !decks.is_empty() => {
+                            last_answered = None;
                             screen = match backend
                                 .as_mut()
                                 .ok_or("collection unavailable")?
@@ -2583,8 +2866,16 @@ fn main() {
                             let old = std::mem::replace(&mut screen, Screen::Decks);
                             if let Screen::Answer { card, deck_name } = old {
                                 let b = backend.as_mut().ok_or("collection unavailable")?;
-                                let id = b.answer(card, rating)?;
-                                event(&format!("REVIEW card={id} rating={rating}"));
+                                let outcome = b.answer(card, rating)?;
+                                last_answered = Some(outcome.card_id);
+                                rating_feedback = Some((rating, Instant::now()));
+                                if let Some(leech) = outcome.leech {
+                                    leech_notice = Some((leech_message(leech), Instant::now()));
+                                }
+                                event(&format!(
+                                    "REVIEW card={} rating={rating} leech={:?}",
+                                    outcome.card_id, outcome.leech
+                                ));
                                 screen = match b.next()? {
                                     Some(card) => Screen::Question { card, deck_name },
                                     None => Screen::Empty { deck_name },
@@ -2873,6 +3164,21 @@ fn main() {
         if matches!(action, Action::Exit) {
             break;
         }
+        if !matches!(action, Action::None) {
+            if let Some(b) = backend.as_mut() {
+                if let Ok(ms) = b.collection_modified_ms() {
+                    current_ms = ms;
+                }
+            }
+        }
+        let sync_dirty = current_ms > synced_ms;
+        let sync_state = if job.is_some() {
+            2
+        } else if sync_dirty {
+            1
+        } else {
+            0
+        };
 
         if matches!(screen, Screen::Empty { .. })
             && last_empty_poll.elapsed() >= Duration::from_secs(1)
@@ -3030,6 +3336,9 @@ fn main() {
         if state != last_state {
             if state == "DECKS" {
                 if let Some(b) = backend.as_mut() {
+                    daily_studied = b.studied_today_text().unwrap_or_default();
+                }
+                if let Some(b) = backend.as_mut() {
                     match b.deck_tree() {
                         Ok(tree) => {
                             root = tree;
@@ -3108,7 +3417,7 @@ fn main() {
                 upload_ok,
                 download_ok,
                 download,
-                confirmed,
+                confirmed: _,
             } => {
                 header(400.0, tr("Full sync"));
                 let selected = if *download {
@@ -3116,18 +3425,12 @@ fn main() {
                 } else {
                     tr("Upload (replaces remote)")
                 };
-                let instruction = if *confirmed {
-                    tr("Press A to confirm replacement.")
-                } else {
-                    tr("UP/DOWN or touch selects. A continues. B cancels.")
-                };
                 let text = i18n::format(
-                    "Full sync replaces one collection.\nUpload allowed: {0}\nDownload allowed: {1}\nSelected: {2}\n{3}",
+                    "Full sync replaces one collection.\nUpload allowed: {0}\nDownload allowed: {1}\nSelected: {2}",
                     &[
                         tr(if *upload_ok { "Yes" } else { "No" }),
                         tr(if *download_ok { "Yes" } else { "No" }),
                         selected,
-                        instruction,
                     ],
                 );
                 top_layout.draw(&text, 360.0, 200.0, 60.0, 8, 0);
@@ -3138,7 +3441,7 @@ fn main() {
                 if let Some(deck) = decks.get(selected) {
                     Ui::fit_text(
                         200.0,
-                        86.0,
+                        82.0,
                         0.68,
                         360.0,
                         current_theme().text,
@@ -3146,19 +3449,31 @@ fn main() {
                     );
                     Ui::fit_text(
                         200.0,
-                        116.0,
+                        108.0,
                         0.44,
                         360.0,
                         current_theme().text_muted,
                         &deck.name,
                     );
-                    counts(deck.new_count, deck.learn_count, deck.review_count, 153.0);
-                    Ui::draw_text_centered(
+                    counts(deck.new_count, deck.learn_count, deck.review_count, 136.0);
+                    if !daily_studied.is_empty() {
+                        Ui::fit_text(
+                            200.0,
+                            176.0,
+                            0.40,
+                            360.0,
+                            current_theme().text_muted,
+                            &daily_studied,
+                        );
+                    }
+                    let due = deck.new_count + deck.learn_count + deck.review_count;
+                    Ui::fit_text(
                         200.0,
-                        210.0,
-                        0.43,
-                        current_theme().text_muted,
-                        tr("A Study    SELECT Menu"),
+                        194.0,
+                        0.44,
+                        360.0,
+                        current_theme().text,
+                        &i18n::format("Cards due: {0}", &[&due.to_string()]),
                     );
                 } else {
                     Ui::draw_text_centered(
@@ -3236,7 +3551,7 @@ fn main() {
                     Ui::draw_text_centered(200.0, 80.0, 0.52, current_theme().text_muted, value);
                 }
                 top_max = top_layout.draw(
-                    tr("Changes apply to this deck's preset. Save [X] applies; Cancel [B] keeps the previous values."),
+                    tr("Changes apply to this deck's preset."),
                     360.0,
                     200.0,
                     118.0,
@@ -3306,6 +3621,8 @@ fn main() {
                 top_max = top_layout.draw(err, 360.0, 200.0, 62.0, 7, card_scroll);
             }
         }
+        draw_rating_badge(rating_feedback);
+        draw_leech_notice(leech_notice.as_ref());
         Ui::target_bottom(current_theme().bg_bottom);
         match &screen {
             Screen::SyncWait => {
@@ -3394,7 +3711,7 @@ fn main() {
                     scroll_pos,
                 );
                 button(12.0, 194.0, 140.0, tr("Study [A]"), None, 0);
-                button(168.0, 194.0, 140.0, tr("Sync"), None, 6);
+                draw_sync_button(168.0, 194.0, 140.0, 28.0, sync_state);
             }
             Screen::Question { card, deck_name } => {
                 Ui::draw_text(
@@ -3404,7 +3721,7 @@ fn main() {
                     current_theme().text_muted,
                     &Ui::ellipsize(deck_name, 0.44, 205.0),
                 );
-                Ui::draw_status_compact(314.0, 3.0, 0.42);
+                Ui::draw_status_compact(314.0, 3.0, 0.42, sync_state);
                 counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
                 let audio = card_audio(card, false);
                 let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
@@ -3416,14 +3733,8 @@ fn main() {
                             .as_ref()
                             .is_some_and(media_sync::MediaSync::is_running),
                 );
-                Ui::draw_button(40.0, 128.0, 240.0, 52.0, tr("Show answer"), None, 0, false);
-                Ui::draw_text_centered(
-                    160.0,
-                    187.0,
-                    0.40,
-                    current_theme().text_muted,
-                    tr("Tap or press [A]"),
-                );
+                Ui::draw_button(8.0, 128.0, 208.0, 52.0, tr("Show answer"), None, 0, false);
+                draw_undo_button(224.0, 128.0, 88.0, 52.0, undo_available);
             }
             Screen::Answer { card, deck_name } => {
                 Ui::draw_text(
@@ -3433,7 +3744,7 @@ fn main() {
                     current_theme().text_muted,
                     &Ui::ellipsize(deck_name, 0.44, 205.0),
                 );
-                Ui::draw_status_compact(314.0, 3.0, 0.42);
+                Ui::draw_status_compact(314.0, 3.0, 0.42, sync_state);
                 counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
                 let audio = card_audio(card, true);
                 let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
@@ -3445,6 +3756,7 @@ fn main() {
                             .as_ref()
                             .is_some_and(media_sync::MediaSync::is_running),
                 );
+                draw_undo_button(236.0, 148.0, 72.0, 36.0, undo_available);
                 for (i, label) in [tr("Again"), tr("Hard"), tr("Good"), tr("Easy")]
                     .iter()
                     .enumerate()
@@ -3452,14 +3764,24 @@ fn main() {
                     let interval = card.intervals.get(i).map(String::as_str).unwrap_or("?");
                     let hint = format!("{interval} [{}]", ["Y", "X", "A", "R"][i]);
                     let hint = Ui::ellipsize(&hint, 0.42, 68.0);
-                    button(
-                        8.0 + i as f32 * 76.0,
+                    let pressed = rating_feedback.is_some_and(|(rating, at)| {
+                        rating == i as i32 && at.elapsed().as_secs_f32() < 0.40
+                    });
+                    let x = 8.0 + i as f32 * 76.0;
+                    Ui::draw_button(
+                        x,
                         190.0,
                         72.0,
+                        36.0,
                         label,
                         Some(&hint),
                         i as i32 + 2,
+                        pressed,
                     );
+                    if pressed {
+                        let (_, foreground) = rating_colors(i as i32);
+                        Ui::draw_line(x + 8.0, 229.0, x + 64.0, 229.0, 3.0, foreground);
+                    }
                 }
             }
             Screen::Browser(b) => {
@@ -3646,6 +3968,12 @@ fn main() {
                 Ui::draw_text_centered(160.0, 90.0, 0.50, current_theme().text, tr("Retry [A]"));
                 Ui::draw_text_centered(160.0, 120.0, 0.50, current_theme().text, tr("START: Exit"));
             }
+        }
+        if matches!(
+            screen,
+            Screen::Question { .. } | Screen::Answer { .. } | Screen::Empty { .. }
+        ) {
+            draw_rating_edge(rating_feedback);
         }
         let hide_footer = matches!(
             screen,

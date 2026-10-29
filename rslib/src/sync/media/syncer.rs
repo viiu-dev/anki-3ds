@@ -68,6 +68,8 @@ pub struct MediaSyncer<T> {
 }
 
 impl<T: MediaSyncProtocol> MediaSyncer<T> {
+    const SCAN_LOCAL_CHANGES: bool = !cfg!(target_os = "horizon");
+
     pub fn new(
         mgr: MediaManager,
         progress: ThrottlingProgressHandler<MediaSyncProgress>,
@@ -162,7 +164,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
     }
 
     fn save_index(&mut self) {
-        if !self.index_dirty {
+        if !self.index_dirty || self.client.is_cancelled() {
             return;
         }
         self.index_dirty = false;
@@ -180,7 +182,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         let fresh_db = meta.last_sync_usn.0 == 0;
         if fresh_db {
             self.pause_point().await?;
-            self.register_changes()?;
+            if Self::SCAN_LOCAL_CHANGES {
+                self.register_changes()?;
+            }
             self.progress.check_cancelled()?;
         }
         let meta = self.mgr.db.get_meta()?;
@@ -204,7 +208,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         if !fresh_db {
             self.progress.check_cancelled()?;
             self.pause_point().await?;
-            self.register_changes()?;
+            if Self::SCAN_LOCAL_CHANGES {
+                self.register_changes()?;
+            }
         }
 
         // need to send changes to server?
@@ -355,7 +361,11 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
 
             let (to_download, to_delete, to_remove_pending) =
                 changes::determine_required_changes(&self.mgr.db, batch)?;
-            let batch_start_dirmod = combined_folder_mtime(&self.mgr.media_folder)?;
+            let batch_start_dirmod = if Self::SCAN_LOCAL_CHANGES {
+                combined_folder_mtime(&self.mgr.media_folder)?
+            } else {
+                0
+            };
 
             // file removal
             self.mgr.remove_files(to_delete.as_slice())?;
@@ -376,7 +386,11 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             }
 
             // then update the DB
-            let dirmod = combined_folder_mtime(&self.mgr.media_folder)?;
+            let dirmod = if Self::SCAN_LOCAL_CHANGES {
+                combined_folder_mtime(&self.mgr.media_folder)?
+            } else {
+                0
+            };
             if self.progress.check_cancelled().is_err() {
                 return Err(AnkiError::Interrupted);
             }
@@ -387,7 +401,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                 // update usn
                 let mut batch_meta = ctx.get_meta()?;
                 batch_meta.last_sync_usn = last_usn;
-                if batch_meta.folder_mtime == batch_start_dirmod {
+                if batch_start_dirmod != 0 && batch_meta.folder_mtime == batch_start_dirmod {
                     batch_meta.folder_mtime = dirmod;
                 }
                 ctx.set_meta(&batch_meta)?;

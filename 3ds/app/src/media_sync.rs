@@ -286,6 +286,9 @@ fn sync_with_recovery(
             changed.fetch_add(1, Ordering::Release);
         }
     }
+    if cancel.load(Ordering::Acquire) {
+        return Err(State::Cancelled);
+    }
     let handler = ThrottlingProgressHandler::<MediaSyncProgress>::new(progress.clone());
     let error =
         match block_on(manager.sync_media_with_config(handler, client.clone(), None, config())) {

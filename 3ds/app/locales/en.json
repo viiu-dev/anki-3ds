@@ -183,5 +183,12 @@
     "running": "running",
     "Not logged in": "Not logged in",
     "Collection unavailable": "Collection unavailable",
-    "Unpacking": "Unpacking"
+    "Unpacking": "Unpacking",
+    "Cards due: {0}": "Cards due: {0}",
+    "Leech: card suspended": "Leech: card suspended",
+    "Leech: card tagged": "Leech: card tagged",
+    "Battery indicator": "Battery indicator",
+    "Battery indicator: {0}": "Battery indicator: {0}",
+    "Linear (25%)": "Linear (25%)",
+    "System default": "System default"
 }

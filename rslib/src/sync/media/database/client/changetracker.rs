@@ -7,7 +7,7 @@ use std::time;
 
 use tracing::debug;
 
-use crate::media::files::combined_folder_mtime;
+use crate::media::files::combined_folder_mtime_checked;
 use crate::media::files::filename_if_normalized;
 use crate::media::files::media_file_entries_checked;
 use crate::media::files::sha1_of_file_checked;
@@ -59,7 +59,10 @@ where
     ) -> Result<(Vec<String>, Vec<String>)> {
         ctx.transact(|ctx| {
             // folder mtime unchanged?
-            let dirmod = combined_folder_mtime(self.media_folder)?;
+            let media_folder = self.media_folder;
+            let dirmod = combined_folder_mtime_checked(media_folder, &mut || {
+                self.fire_progress_cb().is_ok()
+            })?;
 
             let mut meta = ctx.get_meta()?;
             debug!(

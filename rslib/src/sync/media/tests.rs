@@ -341,7 +341,9 @@ async fn media_index_tracks_worker_changes() -> Result<()> {
             index.mark_migrated(&fname);
         }
         assert!(index.contains("migrated"));
-        assert!(!index.is_unmigrated("migrated"));
+        if crate::media::files::sharding_enabled() {
+            assert!(!index.is_unmigrated("migrated"));
+        }
         assert!(locate_existing(&media1.media_folder, "migrated").is_some());
         Ok(())
     })

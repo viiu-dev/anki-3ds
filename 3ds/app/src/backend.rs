@@ -239,6 +239,17 @@ pub struct OfferedCard {
     shown_at: i64,
 }
 
+pub struct AnswerOutcome {
+    pub card_id: i64,
+    pub leech: Option<LeechEvent>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum LeechEvent {
+    Suspended,
+    Tagged,
+}
+
 impl Backend {
     pub fn open_with_progress(
         progress: std::sync::Arc<std::sync::Mutex<anki::progress::ProgressState>>,
@@ -507,6 +518,39 @@ impl Backend {
         let Some(queued) = queued.cards.into_iter().next() else {
             return Ok(None);
         };
+        self.offer(queued, new_count, learn_count, review_count)
+            .map(Some)
+    }
+
+    pub fn reopen_card(&mut self, card_id: i64) -> Result<Option<OfferedCard>> {
+        let queued = SchedulerService::get_queued_cards(
+            &mut self.collection,
+            GetQueuedCardsRequest {
+                fetch_limit: 500,
+                intraday_learning_only: false,
+            },
+        )?;
+        let new_count = queued.new_count;
+        let learn_count = queued.learning_count;
+        let review_count = queued.review_count;
+        let Some(queued) = queued
+            .cards
+            .into_iter()
+            .find(|queued| queued.card.as_ref().is_some_and(|card| card.id == card_id))
+        else {
+            return self.next();
+        };
+        self.offer(queued, new_count, learn_count, review_count)
+            .map(Some)
+    }
+
+    fn offer(
+        &mut self,
+        queued: QueuedCard,
+        new_count: u32,
+        learn_count: u32,
+        review_count: u32,
+    ) -> Result<OfferedCard> {
         let queued_card = queued.card.as_ref().ok_or("queue omitted card")?;
         let id = queued_card.id;
         super::event(&format!(
@@ -544,7 +588,7 @@ impl Backend {
                 .ok_or("queue omitted scheduling states")?,
         )?
         .vals;
-        Ok(Some(OfferedCard {
+        Ok(OfferedCard {
             id,
             intervals,
             question_html,
@@ -557,7 +601,16 @@ impl Backend {
             learn_count,
             review_count,
             shown_at: TimestampMillis::now().0,
-        }))
+        })
+    }
+
+    pub fn collection_modified_ms(&mut self) -> Result<i64> {
+        Ok(self.collection.sync_meta()?.modified.0)
+    }
+
+    pub fn studied_today_text(&mut self) -> Result<String> {
+        let text = self.collection.studied_today()?;
+        Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
     }
 
     fn answer_html(&self, html: &str) -> String {
@@ -686,7 +739,7 @@ impl Backend {
         Ok(output.trim().to_string())
     }
 
-    pub fn answer(&mut self, card: OfferedCard, rating: i32) -> Result<i64> {
+    pub fn answer(&mut self, card: OfferedCard, rating: i32) -> Result<AnswerOutcome> {
         let states = card
             .queued
             .states
@@ -700,6 +753,11 @@ impl Backend {
         };
         let id = card.queued.card.ok_or("queue omitted card")?.id;
         let now = TimestampMillis::now().0;
+        let before = if rating == 0 {
+            self.card_status(id).ok()
+        } else {
+            None
+        };
         let _changes = SchedulerService::answer_card(
             &mut self.collection,
             CardAnswer {
@@ -711,7 +769,26 @@ impl Backend {
                 milliseconds_taken: (now - card.shown_at).clamp(0, 60_000) as u32,
             },
         )?;
-        Ok(id)
+        let leech = match (before, rating == 0) {
+            (Some(before), true) => match self.card_status(id) {
+                Ok(after) => {
+                    if !before.leech && after.leech {
+                        Some(if after.suspended {
+                            LeechEvent::Suspended
+                        } else {
+                            LeechEvent::Tagged
+                        })
+                    } else if !before.suspended && after.suspended {
+                        Some(LeechEvent::Suspended)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        Ok(AnswerOutcome { card_id: id, leech })
     }
 
     pub fn search(&mut self, query: &str) -> Result<Vec<i64>> {

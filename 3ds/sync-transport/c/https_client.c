@@ -33,6 +33,7 @@ struct ResponseBuffer {
 };
 
 static CURL *g_easy[HTTPS_SLOT_COUNT];
+static CURLM *g_multi[HTTPS_SLOT_COUNT];
 
 typedef struct {
     char host[128];
@@ -146,6 +147,10 @@ void anki_3ds_https_cleanup(void) {
         if (g_easy[slot]) {
             curl_easy_cleanup(g_easy[slot]);
             g_easy[slot] = NULL;
+        }
+        if (g_multi[slot]) {
+            curl_multi_cleanup(g_multi[slot]);
+            g_multi[slot] = NULL;
         }
     }
     dns_cache_clear();
@@ -278,7 +283,48 @@ static int request_with_ip(
     char errbuf[CURL_ERROR_SIZE] = {0};
     curl_easy_setopt(easy, CURLOPT_ERRORBUFFER, errbuf);
 
-    CURLcode code = curl_easy_perform(easy);
+    CURLcode code = CURLE_OK;
+    if (options->cancelled && options->cancelled(options->context)) {
+        code = CURLE_ABORTED_BY_CALLBACK;
+        snprintf(errbuf, sizeof(errbuf), "sync cancelled");
+    } else {
+        if (!g_multi[slot]) {
+            g_multi[slot] = curl_multi_init();
+        }
+        CURLM *multi = g_multi[slot];
+        if (!multi) {
+            code = CURLE_FAILED_INIT;
+            snprintf(errbuf, sizeof(errbuf), "curl_multi_init failed");
+        } else if (curl_multi_add_handle(multi, easy) != CURLM_OK) {
+            code = CURLE_FAILED_INIT;
+            snprintf(errbuf, sizeof(errbuf), "curl_multi_add_handle failed");
+        } else {
+            int running = 0;
+            do {
+                if (curl_multi_perform(multi, &running) != CURLM_OK) {
+                    code = CURLE_FAILED_INIT;
+                    snprintf(errbuf, sizeof(errbuf), "curl_multi_perform failed");
+                    break;
+                }
+                if (!running) break;
+                if (options->cancelled && options->cancelled(options->context)) {
+                    code = CURLE_ABORTED_BY_CALLBACK;
+                    snprintf(errbuf, sizeof(errbuf), "sync cancelled");
+                    break;
+                }
+                int numfds = 0;
+                curl_multi_poll(multi, NULL, 0, 100, &numfds);
+            } while (1);
+            int queued = 0;
+            CURLMsg *message;
+            while ((message = curl_multi_info_read(multi, &queued))) {
+                if (message->msg == CURLMSG_DONE) {
+                    code = message->data.result;
+                }
+            }
+            curl_multi_remove_handle(multi, easy);
+        }
+    }
     curl_off_t tcp_us = 0, tls_us = 0, first_byte_us = 0;
     curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME_T, &tcp_us);
     curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME_T, &tls_us);
@@ -351,6 +397,10 @@ int anki_3ds_https_post(
         return -1;
     }
     if (slot < 0 || slot >= HTTPS_SLOT_COUNT) slot = 0;
+    if (options->cancelled && options->cancelled(options->context)) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "sync cancelled");
+        return CURLE_ABORTED_BY_CALLBACK;
+    }
 
     bool allow_override = false;
 #ifdef ANKI_3DS_EMULATOR

@@ -442,7 +442,7 @@ old3ds-official-rust-ci:
 
 old3ds-official-python-ci:
     {{ ninja }} pylib
-    PYTHONPATH="$PWD/out/pylib:$PWD/pylib" out/pyenv/bin/python -m pytest pylib/tests
+    ANKI_TEST_MODE=1 PYTHONPATH="$PWD/out/pylib:$PWD/pylib" out/pyenv/bin/python -m pytest pylib/tests
 
 old3ds-app-cia-smoke label:
     python3 3ds/app/smoke-cia.py {{label}}

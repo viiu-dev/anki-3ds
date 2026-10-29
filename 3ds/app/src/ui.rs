@@ -24,8 +24,8 @@ const CARD_TEXT_SCALE: f32 = 0.55;
 const CARD_LINE_HEIGHT: f32 = 19.0;
 // Furigana is deliberately larger than the usual ~60% of the base size so
 // readings stay legible at the 3DS's small bitmap glyph sizes.
-const CARD_RUBY_SCALE: f32 = 0.78;
-const CARD_RUBY_HEIGHT: f32 = 14.0;
+const CARD_RUBY_SCALE: f32 = 0.55;
+const CARD_RUBY_HEIGHT: f32 = 10.0;
 const CARD_BLOCK_GAP: f32 = 4.0;
 const CARD_SECTION_GAP: f32 = 5.0;
 const CARD_LIST_GAP: f32 = 2.0;
@@ -108,7 +108,9 @@ extern "C" {
     fn ui_audio_prefetch_clear();
     fn ui_audio_stop();
     fn ui_audio_is_playing() -> bool;
-    fn ui_draw_status_compact(x_right: f32, y: f32, scale: f32);
+    fn ui_draw_status_compact(x_right: f32, y: f32, scale: f32, sync_state: c_int);
+    fn ui_draw_sync_icon(x: f32, y: f32, size: f32, state: c_int);
+    fn ui_set_battery_linear(linear: bool);
     fn ui_draw_scroll_indicator(x_right: f32, y: f32, w: f32, h: f32, scroll: f32, max_scroll: f32);
 
     fn ui_draw_nav_tab(
@@ -158,10 +160,14 @@ extern "C" {
 // Current UI locales are left-to-right; leave translated text and values
 // intact.
 fn display_text(text: &str) -> Cow<'_, str> {
-    if text.chars().any(|c| matches!(c, '\u{2066}'..='\u{2069}')) {
+    if text
+        .chars()
+        .any(|c| matches!(c, '\u{2066}'..='\u{2069}' | '\n' | '\r'))
+    {
         Cow::Owned(
             text.chars()
                 .filter(|c| !matches!(c, '\u{2066}'..='\u{2069}'))
+                .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
                 .collect(),
         )
     } else {
@@ -466,8 +472,16 @@ impl Ui {
         unsafe { ui_audio_is_playing() }
     }
 
-    pub fn draw_status_compact(x_right: f32, y: f32, scale: f32) {
-        unsafe { ui_draw_status_compact(x_right, y, scale) }
+    pub fn draw_status_compact(x_right: f32, y: f32, scale: f32, sync_state: i32) {
+        unsafe { ui_draw_status_compact(x_right, y, scale, sync_state as c_int) }
+    }
+
+    pub fn draw_sync_icon(x: f32, y: f32, size: f32, state: i32) {
+        unsafe { ui_draw_sync_icon(x, y, size, state as c_int) }
+    }
+
+    pub fn set_battery_linear(linear: bool) {
+        unsafe { ui_set_battery_linear(linear) }
     }
 
     pub fn draw_scroll_indicator(x: f32, y: f32, w: f32, h: f32, scroll: f32, max_scroll: f32) {
@@ -1566,10 +1580,7 @@ impl RichTextLayout {
         let scale = CARD_TEXT_SCALE * font_scale * scale_multiplier;
         let text_scale = scale * if style.sub || style.sup { 0.75 } else { 1.0 };
         let base_width = Ui::get_card_text_width(text_scale, text);
-        let reading_width = ruby
-            .map(|reading| Ui::get_card_text_width(scale * CARD_RUBY_SCALE, reading))
-            .unwrap_or(0.0);
-        let mut width = base_width.max(reading_width);
+        let mut width = base_width;
         if style.bold {
             width += 0.7 * font_scale * scale_multiplier;
         }

@@ -183,5 +183,12 @@
     "running": "en curso",
     "Not logged in": "No has iniciado sesión",
     "Collection unavailable": "Colección no disponible",
-    "Unpacking": "Descomprimiendo"
+    "Unpacking": "Descomprimiendo",
+    "Cards due: {0}": "Tarjetas pendientes: {0}",
+    "Leech: card suspended": "Sanguijuela: tarjeta suspendida",
+    "Leech: card tagged": "Sanguijuela: tarjeta etiquetada",
+    "Battery indicator": "Indicador de batería",
+    "Battery indicator: {0}": "Indicador de batería: {0}",
+    "Linear (25%)": "Lineal (25%)",
+    "System default": "Sistema"
 }

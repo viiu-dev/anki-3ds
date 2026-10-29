@@ -26,6 +26,7 @@ pub fn init() {
     load_font_scale();
     load_autoplay_audio();
     load_download_connections();
+    load_battery_linear();
     let system_spanish =
         Cfgu::new().ok().and_then(|c| c.language().ok()) == Some(Language::Spanish);
     let spanish = match std::fs::read_to_string(PATH).ok().as_deref().map(str::trim) {
@@ -150,6 +151,49 @@ fn load_autoplay_audio() {
     if let Some(value) = value {
         AUTOPLAY_AUDIO.store(value, Ordering::Relaxed);
     }
+}
+
+static BATTERY_LINEAR: AtomicBool = AtomicBool::new(true);
+
+pub fn battery_linear() -> bool {
+    BATTERY_LINEAR.load(Ordering::Relaxed)
+}
+
+pub fn toggle_battery_linear() -> io::Result<bool> {
+    let value = !battery_linear();
+    write_setting("battery_linear", serde_json::json!(value))?;
+    BATTERY_LINEAR.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_battery_linear() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("battery_linear").and_then(|v| v.as_bool()));
+    if let Some(value) = value {
+        BATTERY_LINEAR.store(value, Ordering::Relaxed);
+    }
+}
+
+pub fn sync_stamp() -> i64 {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return 0;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("sync_collection_modified")
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0)
+}
+
+pub fn save_sync_stamp(value: i64) -> io::Result<()> {
+    write_setting("sync_collection_modified", serde_json::json!(value))
 }
 
 const MAX_DOWNLOAD_CONNECTIONS: u8 = 4;

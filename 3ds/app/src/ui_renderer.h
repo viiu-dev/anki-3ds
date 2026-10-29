@@ -88,7 +88,10 @@ void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char
 float ui_get_card_text_width(float scale, const char* str);
 
 // Compact clock + battery cluster without the old status-bar banner.
-void ui_draw_status_compact(float x_right, float y, float scale);
+void ui_draw_status_compact(float x_right, float y, float scale, int sync_state);
+void ui_draw_sync_icon(float x, float y, float size, int state);
+void ui_draw_wifi_icon(float x, float y, float size, bool connected);
+void ui_set_battery_linear(bool linear);
 // Minimal scroll thumb for full-screen content.
 void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, float max_scroll);
 

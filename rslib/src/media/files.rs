@@ -85,9 +85,19 @@ pub fn shard_dir_name(fname: &str) -> String {
     format!("{:02x}", (hash >> 24) as u8)
 }
 
+/// True when media files are stored in shard subdirectories. Only the 3DS
+/// build shards; host builds keep the traditional flat layout.
+pub fn sharding_enabled() -> bool {
+    cfg!(target_os = "horizon")
+}
+
 /// Full path of a media file inside its shard subdirectory.
 pub fn sharded_path(folder: &Path, fname: &str) -> PathBuf {
-    folder.join(shard_dir_name(fname)).join(fname)
+    if sharding_enabled() {
+        folder.join(shard_dir_name(fname)).join(fname)
+    } else {
+        folder.join(fname)
+    }
 }
 
 /// Existing media file, preferring its shard copy.
@@ -235,10 +245,10 @@ pub fn save_media_name_index(index: &MediaNameIndex, folder: &Path) -> Result<()
         text
     };
     let cache_path = media_index_cache_path(folder);
-    let mut tempfile = anki_io::new_tempfile_in(cache_path.parent().unwrap_or(folder))?;
-    tempfile.write_all(data.as_bytes())?;
-    tempfile.flush()?;
-    anki_io::atomic_rename(tempfile, &cache_path, false)?;
+    let temp_path = cache_path.with_extension("idx.tmp");
+    fs::write(&temp_path, data.as_bytes())?;
+    let _ = fs::remove_file(&cache_path);
+    fs::rename(&temp_path, &cache_path)?;
     Ok(())
 }
 
@@ -317,10 +327,26 @@ impl MediaNameIndex {
 }
 
 /// Latest modification time of the folder or any shard subdirectory.
-pub(crate) fn combined_folder_mtime(folder: &Path) -> io::Result<i64> {
+pub(crate) fn combined_folder_mtime(folder: &Path) -> Result<i64> {
+    combined_folder_mtime_checked(folder, &mut || true)
+}
+
+/// [combined_folder_mtime], aborting the shard walk when `keep_going` is
+/// false. The 3DS FAT layer reports no usable directory mtime for shards, so
+/// it only stats the media root instead of walking every shard folder.
+pub(crate) fn combined_folder_mtime_checked(
+    folder: &Path,
+    keep_going: &mut impl FnMut() -> bool,
+) -> Result<i64> {
     let mut latest = mtime_as_i64(folder)?;
+    if cfg!(target_os = "horizon") {
+        return Ok(latest);
+    }
     if let Ok(entries) = fs::read_dir(folder) {
         for entry in entries.flatten() {
+            if !keep_going() {
+                return Err(AnkiError::Interrupted);
+            }
             let path = entry.path();
             if path.is_dir() {
                 if let Ok(mtime) = mtime_as_i64(&path) {
@@ -356,6 +382,9 @@ pub fn migrate_media_to_shards(
     keep_going: &mut impl FnMut() -> bool,
     max_files: usize,
 ) -> Result<Vec<String>> {
+    if !sharding_enabled() {
+        return Ok(Vec::new());
+    }
     let mut moved = Vec::new();
     let mut created: HashSet<String> = HashSet::new();
     let root_entries: Vec<fs::DirEntry> = fs::read_dir(folder)?.collect::<io::Result<_>>()?;
@@ -1050,7 +1079,11 @@ mod test {
         assert!(shard.bytes().all(|b| b.is_ascii_hexdigit()));
 
         let path = crate::media::files::sharded_path(&folder, name);
-        assert_eq!(path.parent().unwrap().file_name().unwrap(), shard.as_str());
+        if crate::media::files::sharding_enabled() {
+            assert_eq!(path.parent().unwrap().file_name().unwrap(), shard.as_str());
+        } else {
+            assert_eq!(path, folder.join(name));
+        }
 
         assert!(crate::media::files::locate_existing(&folder, name).is_none());
 
@@ -1061,11 +1094,14 @@ mod test {
         );
 
         let mut keep_going = || true;
-        assert_eq!(
+        let moved =
             crate::media::files::migrate_media_to_shards(&folder, &mut keep_going, usize::MAX)
-                .unwrap(),
-            vec![name.to_string()]
-        );
+                .unwrap();
+        if crate::media::files::sharding_enabled() {
+            assert_eq!(moved, vec![name.to_string()]);
+        } else {
+            assert!(moved.is_empty());
+        }
         assert_eq!(
             crate::media::files::locate_existing(&folder, name).unwrap(),
             path
@@ -1075,13 +1111,14 @@ mod test {
         let entries = crate::media::files::media_file_entries(&folder).unwrap();
         assert_eq!(entries, vec![(name.to_string(), path.clone())]);
         assert_eq!(crate::media::files::media_file_count(&folder).unwrap(), 1);
+        let expected_mtime = if crate::media::files::sharding_enabled() {
+            crate::media::files::mtime_as_i64(folder.join(shard)).unwrap()
+        } else {
+            crate::media::files::mtime_as_i64(&folder).unwrap()
+        };
         assert_eq!(
             crate::media::files::combined_folder_mtime(&folder).unwrap(),
-            crate::media::files::mtime_as_i64(
-                folder.join(crate::media::files::shard_dir_name(name))
-            )
-            .unwrap()
-            .max(crate::media::files::mtime_as_i64(&folder).unwrap())
+            expected_mtime.max(crate::media::files::mtime_as_i64(&folder).unwrap())
         );
     }
 
@@ -1127,6 +1164,10 @@ mod test {
         let mut keep_going = || true;
         let moved =
             crate::media::files::migrate_media_to_shards(&folder, &mut keep_going, 2).unwrap();
+        if !crate::media::files::sharding_enabled() {
+            assert!(moved.is_empty());
+            return;
+        }
         assert_eq!(moved.len(), 2);
         let mut keep_going = || true;
         let moved =

@@ -3,6 +3,7 @@
 
 #include "ui_renderer.h"
 #include <3ds.h>
+#include <3ds/services/mcuhwc.h>
 #include <citro2d.h>
 #include <citro3d.h>
 #include <math.h>
@@ -1356,7 +1357,7 @@ bool ui_init(const void* font_data, size_t font_size) {
     if (s_font_loaded) {
         s_card_atlas_ready = C3D_TexInit(&s_card_atlas_tex, CARD_ATLAS_W, CARD_ATLAS_H, GPU_RGBA8);
         if (s_card_atlas_ready) {
-            C3D_TexSetFilter(&s_card_atlas_tex, GPU_LINEAR, GPU_LINEAR);
+            C3D_TexSetFilter(&s_card_atlas_tex, GPU_NEAREST, GPU_NEAREST);
             C3D_TexSetWrap(&s_card_atlas_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
             reset_card_atlas();
             commit_card_atlas();
@@ -1401,6 +1402,7 @@ void ui_fini(void) {
 
 void ui_frame_begin(void) {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL);
     commit_card_atlas();
     if (s_text_buf) {
         C2D_TextBufClear(s_text_buf);
@@ -1424,6 +1426,10 @@ void ui_target_bottom(uint32_t bg_color) {
 }
 
 void ui_draw_rect(float x, float y, float w, float h, uint32_t color) {
+    x = roundf(x);
+    y = roundf(y);
+    w = roundf(w);
+    h = roundf(h);
     C2D_DrawRectSolid(x, y, 0.5f, w, h, color);
 }
 
@@ -1450,7 +1456,7 @@ void ui_draw_rect_gradient(float x, float y, float w, float h, uint32_t c_top, u
 }
 
 void ui_draw_line(float x0, float y0, float x1, float y1, float thickness, uint32_t color) {
-    C2D_DrawLine(x0, y0, color, x1, y1, color, thickness, 0.5f);
+    C2D_DrawLine(roundf(x0), roundf(y0), color, roundf(x1), roundf(y1), color, thickness, 0.5f);
 }
 
 void ui_draw_circle(float x, float y, float radius, uint32_t color) {
@@ -1474,7 +1480,7 @@ void ui_draw_text(float x, float y, float scale, uint32_t color, const char* str
     C2D_Text text;
     C2D_TextParse(&text, s_text_buf, str);
     C2D_TextOptimize(&text);
-    C2D_DrawText(&text, C2D_WithColor, x, y, 0.6f, scale, scale, color);
+    C2D_DrawText(&text, C2D_WithColor, roundf(x), roundf(y), 0.6f, scale, scale, color);
 }
 
 float ui_get_text_width(float scale, const char* str) {
@@ -1496,9 +1502,11 @@ static void draw_system_card_text(float x, float y, float scale, uint32_t color,
     C2D_Text text;
     C2D_TextParse(&text, s_text_buf, str);
     C2D_TextOptimize(&text);
+    x = roundf(x);
+    y = roundf(y);
     C2D_DrawText(&text, C2D_WithColor, x, y, 0.6f, scale, scale, color);
     if (bold) {
-        C2D_DrawText(&text, C2D_WithColor, x + 0.7f, y, 0.6f, scale, scale, color);
+        C2D_DrawText(&text, C2D_WithColor, x + 1.0f, y, 0.6f, scale, scale, color);
     }
     if (italic) {
         C2D_DrawText(&text, C2D_WithColor, x + 0.9f, y + 0.4f, 0.6f, scale, scale,
@@ -1519,7 +1527,9 @@ static void draw_card_glyph(const CardGlyph* glyph, float x, float y, uint32_t c
     C2D_Image image = { .tex = &s_card_atlas_tex, .subtex = &subtexture };
     C2D_ImageTint tint;
     C2D_PlainImageTint(&tint, color, 1.0f);
-    C2D_DrawImageAt(image, x + glyph->offset_x, y + glyph->offset_y, 0.6f, &tint, 1.0f, 1.0f);
+    float px = roundf(x + (float)glyph->offset_x);
+    float py = roundf(y + (float)glyph->offset_y);
+    C2D_DrawImageAt(image, px, py, 0.6f, &tint, 1.0f, 1.0f);
 }
 
 static bool draw_glyph_run(float x, float y, float scale, uint32_t color,
@@ -1613,7 +1623,114 @@ void ui_draw_text_right(float x_right, float y, float scale, uint32_t color, con
     ui_draw_text(x_right - w, y, scale, color, str);
 }
 
-static void draw_clock_battery(float x_right, float y, float scale) {
+bool ui_wifi_connected(void);
+
+static bool g_battery_linear = true;
+
+void ui_set_battery_linear(bool linear) {
+    g_battery_linear = linear;
+}
+
+static int battery_percent(void) {
+    static int cached = -1;
+    static time_t last_poll = 0;
+    time_t now = (time_t)(osGetTime() / 1000);
+    if (cached >= 0 && now - last_poll < 30) {
+        return cached;
+    }
+    u8 percent = 0;
+    if (R_SUCCEEDED(mcuHwcInit())) {
+        if (R_SUCCEEDED(MCUHWC_GetBatteryLevel(&percent)) && percent <= 100) {
+            cached = percent;
+            last_poll = now;
+        }
+        mcuHwcExit();
+    }
+    if (cached < 0 && R_SUCCEEDED(ptmuInit())) {
+        u8 level = 0;
+        if (R_SUCCEEDED(PTMU_GetBatteryLevel(&level))) {
+            cached = (int)level * 20;
+            last_poll = now;
+        }
+        ptmuExit();
+    }
+    return cached;
+}
+
+static int system_battery_level(void) {
+    static int cached = 0;
+    static time_t last_poll = 0;
+    time_t now = (time_t)(osGetTime() / 1000);
+    if (last_poll != 0 && now - last_poll < 30) {
+        return cached;
+    }
+    if (R_SUCCEEDED(ptmuInit())) {
+        u8 level = 0;
+        if (R_SUCCEEDED(PTMU_GetBatteryLevel(&level))) {
+            cached = (int)level;
+            last_poll = now;
+        }
+        ptmuExit();
+    }
+    return cached;
+}
+
+void ui_draw_wifi_icon(float x, float y, float size, bool connected) {
+    uint32_t color = connected ? g_theme.review : g_theme.text_faint;
+    float unit = size / 10.0f;
+    for (int i = 0; i < 3; i++) {
+        float height = unit * (3.0f + i * 2.5f);
+        ui_draw_rounded_rect(x + i * unit * 3.0f, y + (size - height), unit * 2.2f,
+                             height, unit, color);
+    }
+    if (!connected) {
+        ui_draw_line(x, y + size, x + size, y, 1.5f, g_theme.text_faint);
+    }
+}
+
+static void draw_arc(float cx, float cy, float radius, float start, float end, uint32_t color) {
+    int steps = 4;
+    float previous_x = cx + cosf(start) * radius;
+    float previous_y = cy + sinf(start) * radius;
+    for (int i = 1; i <= steps; i++) {
+        float angle = start + (end - start) * (float)i / (float)steps;
+        float x = cx + cosf(angle) * radius;
+        float y = cy + sinf(angle) * radius;
+        ui_draw_line(previous_x, previous_y, x, y, 1.6f, color);
+        previous_x = x;
+        previous_y = y;
+    }
+}
+
+void ui_draw_sync_icon(float x, float y, float size, int state) {
+    float cx = x + size * 0.5f;
+    float cy = y + size * 0.5f;
+    float radius = size * 0.40f;
+    switch (state) {
+        case 1:
+            ui_draw_circle(cx, cy, radius * 0.62f, g_theme.hard_fg);
+            break;
+        case 2: {
+            static int phase = 0;
+            phase = (phase + 1) % 8;
+            for (int i = 0; i < 8; i++) {
+                if (i == phase || i == (phase + 7) % 8) continue;
+                float start = (float)i * (2.0f * (float)M_PI / 8.0f);
+                draw_arc(cx, cy, radius, start, start + (2.0f * (float)M_PI / 8.0f),
+                         g_theme.accent);
+            }
+            break;
+        }
+        default:
+            ui_draw_line(cx - radius * 0.75f, cy + radius * 0.05f, cx - radius * 0.15f,
+                         cy + radius * 0.65f, 1.8f, g_theme.review);
+            ui_draw_line(cx - radius * 0.15f, cy + radius * 0.65f, cx + radius * 0.8f,
+                         cy - radius * 0.6f, 1.8f, g_theme.review);
+            break;
+    }
+}
+
+static void draw_status(float x_right, float y, float scale, int sync_state) {
     static const int64_t epoch_1900_to_1970 = 2208988800LL;
     time_t raw_time = (time_t)((int64_t)(osGetTime() / 1000) - epoch_1900_to_1970);
     struct tm ti;
@@ -1624,35 +1741,52 @@ static void draw_clock_battery(float x_right, float y, float scale) {
         snprintf(time_str, sizeof(time_str), "--:--");
     }
 
-    static u8 cached_batt = 0;
-    static time_t last_poll = 0;
-    u8 batt = cached_batt;
-    if (raw_time != last_poll && R_SUCCEEDED(ptmuInit())) {
-        if (R_SUCCEEDED(PTMU_GetBatteryLevel(&batt))) cached_batt = batt;
-        ptmuExit();
-        last_poll = raw_time;
-    }
-
     float batt_w = 16.0f;
     float batt_h = 8.0f;
     float batt_x = x_right - batt_w;
-    float batt_y = y + 1.0f;
+    float midline = y + 7.0f;
+    float batt_y = midline - batt_h * 0.5f;
     ui_draw_rounded_rect(batt_x, batt_y, batt_w, batt_h, 2.0f, g_theme.text_muted);
     ui_draw_rounded_rect(batt_x + 1, batt_y + 1, batt_w - 2, batt_h - 2, 1.5f, g_theme.bg_bottom);
     ui_draw_rect(batt_x + batt_w, batt_y + 2, 2, 4, g_theme.text_muted);
 
-    int bars = (int)batt;
-    if (bars > 4) bars = 4;
+    int bars;
+    if (g_battery_linear) {
+        int percent = battery_percent();
+        if (percent < 0) percent = system_battery_level() * 20;
+        if (percent >= 75) {
+            bars = 4;
+        } else if (percent >= 50) {
+            bars = 3;
+        } else if (percent >= 25) {
+            bars = 2;
+        } else if (percent > 0) {
+            bars = 1;
+        } else {
+            bars = 0;
+        }
+    } else {
+        bars = system_battery_level();
+        if (bars > 4) bars = 4;
+    }
     uint32_t fill_clr = (bars <= 1) ? g_theme.learn : g_theme.review;
     for (int b = 0; b < bars; b++) {
         ui_draw_rect(batt_x + 2 + b * 3.0f, batt_y + 2, 2.2f, batt_h - 4, fill_clr);
     }
 
-    ui_draw_text_right(batt_x - 5.0f, y, scale, g_theme.text_muted, time_str);
+    float icon = 10.0f;
+    float gap = 6.0f;
+    float wifi_x = batt_x - gap - icon;
+    float sync_x = wifi_x - gap - icon;
+    float time_right = sync_x - gap;
+    float text_y = midline - 0.48f * (float)card_font_px(scale);
+    ui_draw_text_right(time_right, text_y, scale, g_theme.text_muted, time_str);
+    ui_draw_sync_icon(sync_x, midline - icon * 0.5f, icon, sync_state);
+    ui_draw_wifi_icon(wifi_x, midline - icon * 0.5f, icon, ui_wifi_connected());
 }
 
-void ui_draw_status_compact(float x_right, float y, float scale) {
-    draw_clock_battery(x_right, y, scale);
+void ui_draw_status_compact(float x_right, float y, float scale, int sync_state) {
+    draw_status(x_right, y, scale, sync_state);
 }
 
 void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, float max_scroll) {
@@ -1898,10 +2032,11 @@ void ui_draw_scrollbar(float x, float y, float w, float h, int total_items, int 
 void ui_draw_button(float x, float y, float w, float h, const char* text, const char* subtext, int style, bool pressed) {
     uint32_t bg, fg;
     bool rating = (style >= 2 && style <= 5);
+    bool outlined = (style == 0 || style == 6 || style == 8);
     switch (style) {
         case 0:
-            bg = g_theme.accent;
-            fg = g_theme.on_accent;
+            bg = mix_color(g_theme.surface_alt, g_theme.accent, 0.16f);
+            fg = g_theme.accent;
             break;
         case 1:
             bg = g_theme.hard_bg;
@@ -1923,17 +2058,30 @@ void ui_draw_button(float x, float y, float w, float h, const char* text, const 
             bg = g_theme.easy_bg;
             fg = g_theme.easy_fg;
             break;
+        case 8:
+            bg = g_theme.surface_alt;
+            fg = g_theme.text_faint;
+            break;
         default:
             bg = g_theme.surface_alt;
             fg = g_theme.text;
             break;
     }
-    if (pressed) bg = darken(bg, style == 0 ? 0.18f : 0.10f);
+    if (pressed) bg = darken(bg, 0.10f);
 
     float radius = h * 0.5f;
     if (radius > 16.0f) radius = 16.0f;
     ui_draw_rounded_rect(x, y + 1.5f, w, h, radius, g_theme.shadow);
-    ui_draw_rounded_rect(x, y, w, h, radius, bg);
+    if (outlined) {
+        uint32_t border = style == 0
+            ? mix_color(g_theme.surface_alt, g_theme.accent, 0.45f)
+            : g_theme.border;
+        ui_draw_rounded_rect(x, y, w, h, radius, border);
+        ui_draw_rounded_rect(x + 1.0f, y + 1.0f, w - 2.0f, h - 2.0f,
+                             radius - 1.0f > 1.0f ? radius - 1.0f : 1.0f, bg);
+    } else {
+        ui_draw_rounded_rect(x, y, w, h, radius, bg);
+    }
 
     if (subtext && subtext[0]) {
         const char* top_line = rating ? subtext : text;
