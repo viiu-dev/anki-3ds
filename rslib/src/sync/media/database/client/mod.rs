@@ -188,6 +188,17 @@ delete from media where fname=?",
         Ok(map?)
     }
 
+    /// All filenames the media database knows about, in registration order.
+    pub(crate) fn file_names(&self) -> error::Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare("select fname from media where csum is not null")?;
+        let names = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, rusqlite::Error>>()?;
+        Ok(names)
+    }
+
     /// Returns all filenames and checksums, where the checksum is not null.
     pub(crate) fn all_registered_checksums(&self) -> error::Result<Checksums> {
         self.db

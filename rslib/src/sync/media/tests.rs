@@ -334,7 +334,10 @@ async fn media_index_tracks_worker_changes() -> Result<()> {
         fs::write(media1.media_folder.join("migrated"), "migrated").unwrap();
         index.insert("migrated", true);
         let mut keep_going = || true;
-        for fname in media1.migrate_to_shards(&mut keep_going).unwrap() {
+        for fname in media1
+            .migrate_to_shards(&mut keep_going, usize::MAX)
+            .unwrap()
+        {
             index.mark_migrated(&fname);
         }
         assert!(index.contains("migrated"));

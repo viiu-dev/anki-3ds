@@ -18,6 +18,7 @@ use crate::error::SyncErrorKind;
 use crate::media::files::combined_folder_mtime;
 use crate::media::files::locate_existing;
 use crate::media::files::normalize_filename;
+use crate::media::files::save_media_name_index;
 use crate::media::files::AddedFile;
 use crate::media::files::MediaNameIndex;
 use crate::media::MediaManager;
@@ -60,6 +61,7 @@ pub struct MediaSyncer<T> {
     paused: Option<Arc<AtomicBool>>,
     focus: Option<Arc<MediaPriority>>,
     index: Option<Arc<MediaNameIndex>>,
+    index_dirty: bool,
     parallel_downloads: bool,
     priority_attempted: HashSet<String>,
     priority_fetched: HashSet<String>,
@@ -81,6 +83,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             paused: None,
             focus: None,
             index: None,
+            index_dirty: false,
             parallel_downloads: true,
             priority_attempted: HashSet::new(),
             priority_fetched: HashSet::new(),
@@ -136,21 +139,36 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
     }
 
     async fn pause_point(&mut self) -> Result<()> {
+        if self.bulk_paused() {
+            self.save_index();
+        }
         while self.bulk_paused() {
             self.fetch_priority_now().await?;
             if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                 return Err(AnkiError::Interrupted);
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(20));
         }
         Ok(())
     }
 
     pub async fn sync(&mut self, server_usn: Option<Usn>) -> Result<()> {
-        self.sync_inner(server_usn).await.map_err(|e| {
+        let result = self.sync_inner(server_usn).await.map_err(|e| {
             debug!("sync error: {:?}", e);
             e
-        })
+        });
+        self.save_index();
+        result
+    }
+
+    fn save_index(&mut self) {
+        if !self.index_dirty {
+            return;
+        }
+        self.index_dirty = false;
+        if let Some(index) = &self.index {
+            let _ = save_media_name_index(index, &self.mgr.media_folder);
+        }
     }
 
     #[allow(clippy::useless_let_if_seq)]
@@ -229,16 +247,22 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
     }
 
     /// Make sure media DB is up to date.
-    fn register_changes(&mut self) -> Result<Vec<String>> {
+    fn register_changes(&mut self) -> Result<(Vec<String>, Vec<String>)> {
         let progress_cb = |checked| self.progress.update(true, |p| p.checked = checked).is_ok();
-        let removed = ChangeTracker::new(self.mgr.media_folder.as_path(), progress_cb)
+        let (changed, removed) = ChangeTracker::new(self.mgr.media_folder.as_path(), progress_cb)
             .register_changes(&self.mgr.db)?;
         if let Some(index) = &self.index {
+            for fname in &changed {
+                index.insert(fname, false);
+            }
             for fname in &removed {
                 index.remove(fname);
             }
         }
-        Ok(removed)
+        if !changed.is_empty() || !removed.is_empty() {
+            self.index_dirty = true;
+        }
+        Ok((changed, removed))
     }
 
     /// Fetch prioritized files that are missing on disk directly by name,
@@ -339,6 +363,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                 for fname in &to_delete {
                     index.remove(fname);
                 }
+            }
+            if !to_delete.is_empty() {
+                self.index_dirty = true;
             }
             self.progress
                 .update(false, |p| p.downloaded_deletions += to_delete.len())?;
@@ -487,7 +514,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             }
             if self.bulk_paused() {
                 self.fetch_priority_now().await?;
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
             let event = session.recv_timeout(Duration::from_millis(100));
@@ -529,7 +556,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         let folder = self.mgr.media_folder.clone();
         let client = &self.client;
         let progress = &mut self.progress;
-        let extracted = download::extract_into_media_folder(&folder, zip_data, || {
+        let extracted = download::extract_into_media_folder(&folder, zip_data, &mut || {
             client.is_cancelled() || progress.check_cancelled().is_err()
         })?;
         let downloaded = extracted.added.len();
@@ -564,6 +591,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                 index.insert(fname, false);
             }
         }
+        if !fnames.is_empty() {
+            self.index_dirty = true;
+        }
         Ok(())
     }
 
@@ -579,8 +609,12 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                 break;
             }
 
-            let data_for_zip =
-                gather_zip_data_for_upload(&self.mgr.db, &self.mgr.media_folder, &pending)?;
+            let data_for_zip = gather_zip_data_for_upload(
+                &self.mgr.db,
+                &self.mgr.media_folder,
+                &pending,
+                &mut || !self.client.is_cancelled() && self.progress.check_cancelled().is_ok(),
+            )?;
             let zip_bytes = match data_for_zip {
                 None => {
                     // discard zip info and retry batch - not particularly

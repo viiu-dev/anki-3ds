@@ -29,7 +29,7 @@ pub(crate) struct ExtractedDownload {
 pub(crate) fn extract_into_media_folder(
     media_folder: &Path,
     zip: Vec<u8>,
-    mut cancelled: impl FnMut() -> bool,
+    cancelled: &mut impl FnMut() -> bool,
 ) -> error::Result<ExtractedDownload> {
     let reader = io::Cursor::new(zip);
     let mut zip = zip::ZipArchive::new(reader)?;
@@ -72,7 +72,7 @@ pub(crate) fn extract_into_media_folder(
         }
 
         let size = file.size();
-        let added = add_file_from_ankiweb_streaming(media_folder, real_name, &mut file)?;
+        let added = add_file_from_ankiweb_streaming(media_folder, real_name, &mut file, cancelled)?;
         bytes += size;
 
         output.push(added);

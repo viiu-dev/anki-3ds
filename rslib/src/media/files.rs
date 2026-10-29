@@ -113,10 +113,21 @@ fn open_media_file(folder: &Path, fname: &str) -> std::result::Result<fs::File, 
 /// Bare filenames and full paths for every media file, including sharded
 /// ones. A name present in both the root and a shard resolves to the shard.
 pub fn media_file_entries(folder: &Path) -> Result<Vec<(String, PathBuf)>> {
+    media_file_entries_checked(folder, &mut || true)
+}
+
+/// [media_file_entries], but polls `keep_going` between directory entries.
+pub fn media_file_entries_checked(
+    folder: &Path,
+    keep_going: &mut impl FnMut() -> bool,
+) -> Result<Vec<(String, PathBuf)>> {
     let root_entries: Vec<fs::DirEntry> = fs::read_dir(folder)?.collect::<io::Result<_>>()?;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for entry in &root_entries {
+        if !keep_going() {
+            return Err(AnkiError::Interrupted);
+        }
         if !entry.path().is_dir() {
             continue;
         }
@@ -124,6 +135,9 @@ pub fn media_file_entries(folder: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         };
         for entry in sub.flatten() {
+            if !keep_going() {
+                return Err(AnkiError::Interrupted);
+            }
             let path = entry.path();
             if path.is_dir() {
                 continue;
@@ -152,6 +166,80 @@ pub fn media_file_entries(folder: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// Count of media files, including sharded ones.
 pub fn media_file_count(folder: &Path) -> Result<usize> {
     Ok(media_file_entries(folder)?.len())
+}
+
+/// Cache file holding the media index, stored next to the media folder.
+pub fn media_index_cache_path(folder: &Path) -> PathBuf {
+    let stem = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("media");
+    folder.with_file_name(format!("{stem}.idx"))
+}
+
+const MEDIA_INDEX_VERSION: &str = "1";
+const MEDIA_INDEX_SHARDED: char = 's';
+const MEDIA_INDEX_UNMIGRATED: char = 'u';
+
+/// Load a previously saved media index without touching the media folder.
+/// Returns None when the cache is missing or invalid.
+pub fn load_media_name_index(folder: &Path) -> Option<Arc<MediaNameIndex>> {
+    let data = String::from_utf8(std::fs::read(media_index_cache_path(folder)).ok()?).ok()?;
+    let mut lines = data.lines();
+    if lines.next() != Some(MEDIA_INDEX_VERSION) {
+        return None;
+    }
+    let index = MediaNameIndex::new();
+    {
+        let mut inner = index
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for line in lines {
+            let Some((flag, name)) = line.split_once('\t') else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            inner.files.insert(name.to_owned());
+            if flag.starts_with(MEDIA_INDEX_UNMIGRATED) {
+                inner.unmigrated.insert(name.to_owned());
+            }
+        }
+    }
+    Some(index)
+}
+
+/// Persist the media index to a single compact newline-delimited file.
+pub fn save_media_name_index(index: &MediaNameIndex, folder: &Path) -> Result<()> {
+    let data = {
+        let inner = index
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut text = String::with_capacity(inner.files.len() * 48 + 4);
+        text.push_str(MEDIA_INDEX_VERSION);
+        text.push('\n');
+        for name in &inner.files {
+            let flag = if inner.unmigrated.contains(name) {
+                MEDIA_INDEX_UNMIGRATED
+            } else {
+                MEDIA_INDEX_SHARDED
+            };
+            text.push(flag);
+            text.push('\t');
+            text.push_str(name);
+            text.push('\n');
+        }
+        text
+    };
+    let cache_path = media_index_cache_path(folder);
+    let mut tempfile = anki_io::new_tempfile_in(cache_path.parent().unwrap_or(folder))?;
+    tempfile.write_all(data.as_bytes())?;
+    tempfile.flush()?;
+    anki_io::atomic_rename(tempfile, &cache_path, false)?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -260,11 +348,13 @@ fn files_have_same_contents(first: &Path, second: &Path) -> Result<bool> {
     Ok(sha1_of_file(first)? == sha1_of_file(second)?)
 }
 
-/// Move root files into shard subdirectories, returning the moved count.
-/// Stops with [AnkiError::Interrupted] when `keep_going` reports false.
+/// Move root files into shard subdirectories, returning the moved names.
+/// Moves at most `max_files`, and stops with [AnkiError::Interrupted] when
+/// `keep_going` reports false.
 pub fn migrate_media_to_shards(
     folder: &Path,
     keep_going: &mut impl FnMut() -> bool,
+    max_files: usize,
 ) -> Result<Vec<String>> {
     let mut moved = Vec::new();
     let mut created: HashSet<String> = HashSet::new();
@@ -272,6 +362,9 @@ pub fn migrate_media_to_shards(
     for entry in &root_entries {
         if !keep_going() {
             return Err(AnkiError::Interrupted);
+        }
+        if moved.len() >= max_files {
+            break;
         }
         let path = entry.path();
         if path.is_dir() {
@@ -287,6 +380,9 @@ pub fn migrate_media_to_shards(
         let dest = folder.join(&shard).join(name);
         if dest == path {
             continue;
+        }
+        if !keep_going() {
+            return Err(AnkiError::Interrupted);
         }
         if dest.exists() {
             if files_have_same_contents(&path, &dest)? {
@@ -556,6 +652,34 @@ pub(crate) fn sha1_of_file(path: &Path) -> Result<Sha1Hash, FileIoError> {
     })
 }
 
+/// [sha1_of_file], but aborts with [AnkiError::Interrupted] as soon as
+/// `keep_going` returns false.
+pub(crate) fn sha1_of_file_checked(
+    path: &Path,
+    keep_going: &mut impl FnMut() -> bool,
+) -> Result<Sha1Hash> {
+    let mut file = anki_io::open_file(path)?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0; 64 * 1024];
+    loop {
+        if !keep_going() {
+            return Err(AnkiError::Interrupted);
+        }
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[0..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(e).context(FileIoSnafu {
+                    path,
+                    op: FileOp::Read,
+                })?
+            }
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// Return the SHA1 of a stream.
 pub(crate) fn sha1_of_reader(reader: &mut impl Read) -> io::Result<Sha1Hash> {
     let mut hasher = Sha1::new();
@@ -714,6 +838,7 @@ pub(crate) fn add_file_from_ankiweb_streaming(
     media_folder: &Path,
     fname: &str,
     reader: &mut impl Read,
+    cancelled: &mut impl FnMut() -> bool,
 ) -> Result<AddedFile> {
     let normalized = normalize_filename(fname);
     if let Cow::Borrowed(_) = normalized {
@@ -721,7 +846,7 @@ pub(crate) fn add_file_from_ankiweb_streaming(
         if let Some(parent) = path.parent() {
             create_dir_all(parent)?;
         }
-        let (sha1, mtime) = write_file_hashing(&path, reader)?;
+        let (sha1, mtime) = write_file_hashing(&path, reader, cancelled)?;
         remove_superseded_root_copy(media_folder, normalized.as_ref());
         debug!(fname = normalized.as_ref(), "write");
         Ok(AddedFile {
@@ -731,20 +856,45 @@ pub(crate) fn add_file_from_ankiweb_streaming(
             renamed_from: None,
         })
     } else {
+        if cancelled() {
+            return Err(AnkiError::Interrupted);
+        }
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
         add_file_from_ankiweb(media_folder, fname, &data)
     }
 }
 
-fn write_file_hashing(path: &Path, reader: &mut impl Read) -> Result<(Sha1Hash, i64)> {
+fn write_file_hashing(
+    path: &Path,
+    reader: &mut impl Read,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<(Sha1Hash, i64)> {
     let file = fs::File::create(path)?;
     let mut writer = HashingWriter {
         inner: io::BufWriter::with_capacity(64 * 1024, file),
         hasher: Sha1::new(),
     };
-    io::copy(reader, &mut writer)?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut interrupted = false;
+    loop {
+        if cancelled() {
+            interrupted = true;
+            break;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => writer.write_all(&buf[..n])?,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
     let HashingWriter { mut inner, hasher } = writer;
+    if interrupted {
+        drop(inner);
+        let _ = fs::remove_file(path);
+        return Err(AnkiError::Interrupted);
+    }
     inner.flush()?;
     drop(inner);
     let sha1: Sha1Hash = hasher.finalize().into();
@@ -912,7 +1062,8 @@ mod test {
 
         let mut keep_going = || true;
         assert_eq!(
-            crate::media::files::migrate_media_to_shards(&folder, &mut keep_going).unwrap(),
+            crate::media::files::migrate_media_to_shards(&folder, &mut keep_going, usize::MAX)
+                .unwrap(),
             vec![name.to_string()]
         );
         assert_eq!(
@@ -963,5 +1114,49 @@ mod test {
             ),
             Cow::<str>::Owned(format!("{}_", " ".repeat(MAX_MEDIA_FILENAME_LENGTH - 2)))
         );
+    }
+
+    #[test]
+    fn migration_moves_bounded_batches() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("media");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["a.mp3", "b.mp3", "c.mp3"] {
+            std::fs::write(folder.join(name), name).unwrap();
+        }
+        let mut keep_going = || true;
+        let moved =
+            crate::media::files::migrate_media_to_shards(&folder, &mut keep_going, 2).unwrap();
+        assert_eq!(moved.len(), 2);
+        let mut keep_going = || true;
+        let moved =
+            crate::media::files::migrate_media_to_shards(&folder, &mut keep_going, 2).unwrap();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(crate::media::files::media_file_count(&folder).unwrap(), 3);
+        let mut keep_going = || false;
+        let result =
+            crate::media::files::migrate_media_to_shards(&folder, &mut keep_going, usize::MAX);
+        assert!(matches!(result, Err(crate::error::AnkiError::Interrupted)));
+    }
+
+    #[test]
+    fn media_name_index_cache_roundtrip() {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join("media");
+        std::fs::create_dir(&folder).unwrap();
+        let index = crate::media::files::MediaNameIndex::new();
+        assert!(crate::media::files::load_media_name_index(&folder).is_none());
+        for name in ["x.mp3", "y.png"] {
+            std::fs::write(folder.join(name), name).unwrap();
+            index.insert(name, true);
+        }
+        index.insert("z.mp3", false);
+        crate::media::files::save_media_name_index(&index, &folder).unwrap();
+        let loaded = crate::media::files::load_media_name_index(&folder).unwrap();
+        assert!(loaded.contains("x.mp3"));
+        assert!(loaded.is_unmigrated("y.png"));
+        assert!(!loaded.is_unmigrated("z.mp3"));
+        assert!(!loaded.contains("missing.mp3"));
+        assert_eq!(loaded.len(), 3);
     }
 }

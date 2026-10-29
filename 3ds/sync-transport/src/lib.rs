@@ -681,8 +681,10 @@ impl MediaSyncProtocol for NativeSyncClient {
                         if stop_clone.load(Ordering::Acquire) || client.is_cancelled() {
                             break None;
                         }
-                        let request = match (DownloadFilesRequest { files: files.clone() })
-                            .try_into_sync_request()
+                        let request = match (DownloadFilesRequest {
+                            files: files.clone(),
+                        })
+                        .try_into_sync_request()
                         {
                             Ok(request) => request,
                             Err(error) => {
@@ -695,7 +697,9 @@ impl MediaSyncProtocol for NativeSyncClient {
                             client.request_sync(MediaSyncMethod::DownloadFiles, request);
                         match response {
                             Ok(response) => {
-                                break Some(MediaDownloadEvent::Downloaded { data: response.data })
+                                break Some(MediaDownloadEvent::Downloaded {
+                                    data: response.data,
+                                })
                             }
                             Err(error) => {
                                 attempt += 1;

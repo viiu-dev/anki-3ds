@@ -9,8 +9,8 @@ use tracing::debug;
 
 use crate::media::files::combined_folder_mtime;
 use crate::media::files::filename_if_normalized;
-use crate::media::files::media_file_entries;
-use crate::media::files::sha1_of_file;
+use crate::media::files::media_file_entries_checked;
+use crate::media::files::sha1_of_file_checked;
 use crate::media::files::NONSYNCABLE_FILENAME;
 use crate::prelude::*;
 use crate::sync::media::database::client::MediaDatabase;
@@ -53,7 +53,10 @@ where
         }
     }
 
-    pub(crate) fn register_changes(&mut self, ctx: &MediaDatabase) -> Result<Vec<String>> {
+    pub(crate) fn register_changes(
+        &mut self,
+        ctx: &MediaDatabase,
+    ) -> Result<(Vec<String>, Vec<String>)> {
         ctx.transact(|ctx| {
             // folder mtime unchanged?
             let dirmod = combined_folder_mtime(self.media_folder)?;
@@ -68,7 +71,7 @@ where
             // as unavailable and scan instead of skipping every media change.
             if dirmod != 0 && dirmod == meta.folder_mtime {
                 debug!("skip check");
-                return Ok(Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             } else {
                 meta.folder_mtime = dirmod;
             }
@@ -78,6 +81,10 @@ where
             self.fire_progress_cb()?;
 
             let (changed, removed) = self.media_folder_changes(mtimes)?;
+            let changed_names = changed
+                .iter()
+                .map(|entry| entry.fname.clone())
+                .collect::<Vec<_>>();
 
             self.add_updated_entries(ctx, changed)?;
             self.remove_deleted_files(ctx, &removed)?;
@@ -87,7 +94,7 @@ where
             // unconditional fire at end of op for accurate counts
             self.fire_progress_cb()?;
 
-            Ok(removed)
+            Ok((changed_names, removed))
         })
     }
 
@@ -100,7 +107,9 @@ where
         let mut added_or_changed = vec![];
 
         // loop through on-disk files
-        for (disk_fname, disk_path) in media_file_entries(self.media_folder)? {
+        let entries =
+            media_file_entries_checked(self.media_folder, &mut || self.fire_progress_cb().is_ok())?;
+        for (disk_fname, disk_path) in entries {
             self.fire_progress_cb()?;
 
             // make sure the filename is normalized
@@ -144,7 +153,7 @@ where
             }
 
             // add entry to the list
-            let data = sha1_of_file(&disk_path)?;
+            let data = sha1_of_file_checked(&disk_path, &mut || self.fire_progress_cb().is_ok())?;
             let sha1 = Some(data);
             added_or_changed.push(FilesystemEntry {
                 fname: fname.to_string(),

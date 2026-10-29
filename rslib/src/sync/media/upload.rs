@@ -37,6 +37,7 @@ pub fn gather_zip_data_for_upload(
     ctx: &MediaDatabase,
     media_folder: &Path,
     files: &[MediaEntry],
+    keep_going: &mut impl FnMut() -> bool,
 ) -> Result<Option<ZipDataForUpload>> {
     let mut invalid_entries = vec![];
     let mut accumulated_size = 0;
@@ -45,6 +46,9 @@ pub fn gather_zip_data_for_upload(
     for file in files {
         if accumulated_size > MEDIA_SYNC_TARGET_ZIP_BYTES {
             break;
+        }
+        if !keep_going() {
+            return Err(AnkiError::Interrupted);
         }
 
         #[cfg(target_vendor = "apple")]

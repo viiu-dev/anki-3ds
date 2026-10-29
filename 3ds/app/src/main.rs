@@ -264,20 +264,40 @@ fn card_audio(card: &backend::OfferedCard, answer: bool) -> Vec<backend::MediaRe
     media.iter().filter(|item| item.audio).cloned().collect()
 }
 
-fn audio_button_rects(count: usize) -> Vec<(f32, f32)> {
-    let count = count.min(3);
-    if count == 0 {
+fn audio_button_rects(visible: usize, paged: bool) -> Vec<(f32, f32)> {
+    if visible == 0 {
         return Vec::new();
     }
+    let side = if paged { 20.0 } else { 8.0 };
     let gap = 6.0;
-    let width = (320.0 - 16.0 - (count as f32 - 1.0) * gap) / count as f32;
-    (0..count)
-        .map(|index| (8.0 + index as f32 * (width + gap), width))
+    let usable = 320.0 - 2.0 * side - (visible as f32 - 1.0) * gap;
+    let width = usable / visible as f32;
+    (0..visible)
+        .map(|index| (side + index as f32 * (width + gap), width))
         .collect()
 }
 
-fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase: u64) {
-    for (index, (x, width)) in audio_button_rects(audio.len()).into_iter().enumerate() {
+const AUDIO_VISIBLE: usize = 4;
+
+fn audio_page_count(total: usize) -> usize {
+    total.div_ceil(AUDIO_VISIBLE).max(1)
+}
+
+fn audio_page_offset(total: usize, page: usize) -> usize {
+    page.min(audio_page_count(total) - 1) * AUDIO_VISIBLE
+}
+
+fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase: u64, page: usize) {
+    let total = audio.len();
+    let pages = audio_page_count(total);
+    let page = page.min(pages - 1);
+    let offset = audio_page_offset(total, page);
+    let visible = total.saturating_sub(offset).min(AUDIO_VISIBLE);
+    for (slot, (x, width)) in audio_button_rects(visible, pages > 1)
+        .into_iter()
+        .enumerate()
+    {
+        let index = offset + slot;
         let state = states.get(index).copied().unwrap_or(AudioState::Pending);
         let (background, foreground) = match state {
             AudioState::Playing => (current_theme().accent, current_theme().on_accent),
@@ -348,6 +368,47 @@ fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase:
             &label,
         );
     }
+    if pages > 1 {
+        let center_y = AUDIO_Y + AUDIO_H * 0.5;
+        let prev = if page > 0 {
+            current_theme().text
+        } else {
+            current_theme().text_faint
+        };
+        let next = if page + 1 < pages {
+            current_theme().text
+        } else {
+            current_theme().text_faint
+        };
+        Ui::draw_triangle(
+            7.0,
+            center_y,
+            15.0,
+            center_y - 6.0,
+            15.0,
+            center_y + 6.0,
+            prev,
+        );
+        Ui::draw_triangle(
+            313.0,
+            center_y,
+            305.0,
+            center_y - 6.0,
+            305.0,
+            center_y + 6.0,
+            next,
+        );
+        let spacing = 7.0;
+        let start = 160.0 - (pages as f32 - 1.0) * spacing * 0.5;
+        for dot in 0..pages {
+            let color = if dot == page {
+                current_theme().accent
+            } else {
+                current_theme().border
+            };
+            Ui::draw_rect(start + dot as f32 * spacing - 1.5, 119.0, 3.0, 3.0, color);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -417,13 +478,7 @@ impl Prefetch {
         if let Some(handle) = self.thread.take() {
             self.cancel
                 .store(true, std::sync::atomic::Ordering::Release);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-            while !handle.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
     }
 
@@ -431,9 +486,7 @@ impl Prefetch {
         if let Some(handle) = self.thread.take() {
             self.cancel
                 .store(true, std::sync::atomic::Ordering::Release);
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
         self.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = self.cancel.clone();
@@ -485,10 +538,25 @@ fn draw_media_strip(status: Option<&str>, pending: bool) {
     }
 }
 
-fn audio_tap(audio: &[backend::MediaRef], x: f32) -> Action {
-    for (index, (bx, bw)) in audio_button_rects(audio.len()).into_iter().enumerate() {
+fn audio_tap(audio: &[backend::MediaRef], page: usize, x: f32) -> Action {
+    let total = audio.len();
+    let pages = audio_page_count(total);
+    if pages > 1 {
+        if x < 20.0 {
+            return Action::AudioPage(-1);
+        }
+        if x >= 300.0 {
+            return Action::AudioPage(1);
+        }
+    }
+    let offset = audio_page_offset(total, page);
+    let visible = total.saturating_sub(offset).min(AUDIO_VISIBLE);
+    for (slot, (bx, bw)) in audio_button_rects(visible, pages > 1)
+        .into_iter()
+        .enumerate()
+    {
         if x >= bx && x < bx + bw {
-            return Action::PlayAudio(Some(index));
+            return Action::PlayAudio(Some(offset + slot));
         }
     }
     Action::None
@@ -826,6 +894,7 @@ enum Action {
     Filter(usize),
     Restore,
     PlayAudio(Option<usize>),
+    AudioPage(i32),
     Exit,
 }
 
@@ -1297,6 +1366,7 @@ fn main() {
     let mut review_scroll = 0.0f32;
     let mut review_max_scroll = 0.0f32;
     let mut audio_index = 0usize;
+    let mut audio_page = 0usize;
     let mut last_autoplay_card: Option<(i64, bool)> = None;
     let mut last_review_card: Option<(i64, bool)> = None;
     let mut card_media_pending = false;
@@ -1538,6 +1608,14 @@ fn main() {
             Action::PlayAudio(None)
         } else if down.contains(KeyPad::A) {
             Action::Primary
+        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
+            && down.intersects(KeyPad::LEFT | KeyPad::CPAD_LEFT | KeyPad::CSTICK_LEFT)
+        {
+            Action::AudioPage(-1)
+        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
+            && down.intersects(KeyPad::RIGHT | KeyPad::CPAD_RIGHT | KeyPad::CSTICK_RIGHT)
+        {
+            Action::AudioPage(1)
         } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
             // Review scrolling is pixel-based and handled above from the held
             // key state. Do not also emit line-stepping actions here.
@@ -1628,11 +1706,13 @@ fn main() {
                 Screen::Decks if (194.0..222.0).contains(&y) && (168.0..308.0).contains(&x) => {
                     Action::Sync
                 }
-                Screen::Question { card, .. } if (AUDIO_Y..AUDIO_Y + AUDIO_H).contains(&y) => {
-                    audio_tap(&card_audio(card, false), x)
+                Screen::Question { card, .. }
+                    if (AUDIO_Y..AUDIO_Y + AUDIO_H + 8.0).contains(&y) =>
+                {
+                    audio_tap(&card_audio(card, false), audio_page, x)
                 }
-                Screen::Answer { card, .. } if (AUDIO_Y..AUDIO_Y + AUDIO_H).contains(&y) => {
-                    audio_tap(&card_audio(card, true), x)
+                Screen::Answer { card, .. } if (AUDIO_Y..AUDIO_Y + AUDIO_H + 8.0).contains(&y) => {
+                    audio_tap(&card_audio(card, true), audio_page, x)
                 }
                 Screen::Question { .. }
                     if (128.0..200.0).contains(&y) && (40.0..280.0).contains(&x) =>
@@ -2380,6 +2460,7 @@ fn main() {
                         }
                     };
                     audio_index = chosen;
+                    audio_page = chosen / AUDIO_VISIBLE;
                     let resolved = backend
                         .as_ref()
                         .map(|active| active.media_path(&audio[chosen].filename))
@@ -2406,6 +2487,15 @@ fn main() {
                         }
                         AudioAttempt::Busy => {}
                     }
+                }
+                Action::AudioPage(delta) => {
+                    let total = match &screen {
+                        Screen::Question { card, .. } => card_audio(card, false).len(),
+                        Screen::Answer { card, .. } => card_audio(card, true).len(),
+                        _ => 0,
+                    };
+                    let pages = audio_page_count(total);
+                    audio_page = (audio_page as i32 + delta).clamp(0, pages as i32 - 1) as usize;
                 }
                 Action::FullSync => {
                     screen = Screen::SyncChoice {
@@ -2821,6 +2911,7 @@ fn main() {
         if card_changed {
             review_scroll = 0.0;
             audio_index = 0;
+            audio_page = 0;
             playing_audio = None;
             Ui::audio_stop();
             if media_job
@@ -3317,7 +3408,7 @@ fn main() {
                 counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
                 let audio = card_audio(card, false);
                 let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
-                draw_audio_buttons(&audio, &states, frame);
+                draw_audio_buttons(&audio, &states, frame, audio_page);
                 draw_media_strip(
                     media_status.as_deref(),
                     card_media_pending
@@ -3346,7 +3437,7 @@ fn main() {
                 counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
                 let audio = card_audio(card, true);
                 let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
-                draw_audio_buttons(&audio, &states, frame);
+                draw_audio_buttons(&audio, &states, frame, audio_page);
                 draw_media_strip(
                     media_status.as_deref(),
                     card_media_pending
@@ -3579,7 +3670,7 @@ fn main() {
         active.cancel();
     }
     if let Some(active) = job.take() {
-        if let Some(done) = active.finish_timeout(Duration::from_secs(3)) {
+        if let Some(done) = active.finish() {
             backend = done.backend;
         }
     }

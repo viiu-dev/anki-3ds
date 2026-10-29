@@ -173,20 +173,10 @@ impl Drop for MediaSync {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.cancel();
-            let deadline = Instant::now() + DROP_WAIT;
-            while !thread.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            } else {
-                super::event("MEDIA_SYNC_DETACHED");
-            }
+            let _ = thread.join();
         }
     }
 }
-
-const DROP_WAIT: Duration = Duration::from_millis(1000);
 
 static WORKER: Mutex<()> = Mutex::new(());
 
@@ -249,7 +239,7 @@ fn migrate_media(
     }
     let started = Instant::now();
     let mut keep_going = || !cancel.load(Ordering::Acquire) && !paused_now();
-    match manager.migrate_to_shards(&mut keep_going) {
+    match manager.migrate_to_shards(&mut keep_going, 20) {
         Ok(moved) if moved.is_empty() => 0,
         Ok(moved) => {
             let count = moved.len();
@@ -257,6 +247,7 @@ fn migrate_media(
                 for fname in &moved {
                     index.mark_migrated(fname);
                 }
+                let _ = manager.save_media_index(index);
             }
             super::event(&format!(
                 "MEDIA_MIGRATE moved={count} elapsed_ms={}",

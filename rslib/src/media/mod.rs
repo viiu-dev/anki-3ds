@@ -239,8 +239,23 @@ impl MediaManager {
 
     /// Move unsharded root files into shard subdirectories. The caller
     /// decides when bulk I/O is acceptable via `keep_going`.
-    pub fn migrate_to_shards(&self, keep_going: &mut impl FnMut() -> bool) -> Result<Vec<String>> {
-        crate::media::files::migrate_media_to_shards(&self.media_folder, keep_going)
+    pub fn migrate_to_shards(
+        &self,
+        keep_going: &mut impl FnMut() -> bool,
+        max_files: usize,
+    ) -> Result<Vec<String>> {
+        crate::media::files::migrate_media_to_shards(&self.media_folder, keep_going, max_files)
+    }
+
+    /// Persist the shared media index next to the media folder.
+    pub fn save_media_index(&self, index: &MediaNameIndex) -> Result<()> {
+        crate::media::files::save_media_name_index(index, &self.media_folder)
+    }
+
+    /// Filenames recorded in the media database, read without scanning the
+    /// media folder.
+    pub fn known_file_names(&self) -> Result<Vec<String>> {
+        self.db.file_names()
     }
 
     pub fn all_checksums_after_checking(
@@ -262,7 +277,7 @@ impl MediaManager {
     pub fn register_changes(
         &self,
         progress: &mut impl FnMut(usize) -> bool,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, Vec<String>)> {
         ChangeTracker::new(&self.media_folder, progress).register_changes(&self.db)
     }
 

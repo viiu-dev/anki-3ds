@@ -10,60 +10,99 @@ use std::alloc::dealloc;
 use std::alloc::Layout;
 use std::io;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
-static SOC_ACTIVE: AtomicBool = AtomicBool::new(false);
+struct SocService {
+    buffer: NonNull<u8>,
+    layout: Layout,
+    refs: usize,
+}
+
+// The buffer is only handed to socInit/socExit; the service is shared by
+// reference-counted handles, never aliased mutably.
+unsafe impl Send for SocService {}
+
+static SOC_SERVICE: Mutex<Option<SocService>> = Mutex::new(None);
 
 extern "C" {
     fn socInit(buffer: *mut u32, size: u32) -> i32;
     fn socExit() -> i32;
 }
 
-pub struct NativeSoc {
-    buffer: Option<NonNull<u8>>,
-    layout: Layout,
+fn lock_service() -> std::sync::MutexGuard<'static, Option<SocService>> {
+    SOC_SERVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// The buffer is only handed to socInit/socExit; ownership is moved between
-// threads, never shared.
+pub struct NativeSoc {
+    active: bool,
+}
+
+// Cloned handles share the single SOC service; the service shuts down when
+// the last handle closes instead of failing with "already active".
 unsafe impl Send for NativeSoc {}
+
+impl Clone for NativeSoc {
+    fn clone(&self) -> Self {
+        if self.active {
+            if let Some(state) = lock_service().as_mut() {
+                state.refs += 1;
+            }
+        }
+        Self {
+            active: self.active,
+        }
+    }
+}
 
 impl NativeSoc {
     pub fn new() -> io::Result<Self> {
-        if SOC_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(io::Error::other("native SOC is already active"));
+        let mut guard = lock_service();
+        if let Some(state) = guard.as_mut() {
+            state.refs += 1;
+            return Ok(Self { active: true });
         }
         let layout = Layout::from_size_align(1024 * 1024, 4096).unwrap();
-        let buffer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| {
-            SOC_ACTIVE.store(false, Ordering::Release);
-            io::Error::other("SOC buffer allocation failed")
-        })?;
+        let buffer = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .ok_or_else(|| io::Error::other("SOC buffer allocation failed"))?;
         let result = unsafe { socInit(buffer.as_ptr().cast(), layout.size() as u32) };
         if result < 0 {
             unsafe { dealloc(buffer.as_ptr(), layout) };
-            SOC_ACTIVE.store(false, Ordering::Release);
             return Err(io::Error::other(format!("socInit failed: {result}")));
         }
-        Ok(Self {
-            buffer: Some(buffer),
+        *guard = Some(SocService {
+            buffer,
             layout,
-        })
+            refs: 1,
+        });
+        Ok(Self { active: true })
     }
 
     pub fn close(&mut self) -> io::Result<()> {
-        if let Some(buffer) = self.buffer.take() {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let shutdown = {
+            let mut guard = lock_service();
+            let Some(state) = guard.as_mut() else {
+                return Ok(());
+            };
+            state.refs = state.refs.saturating_sub(1);
+            if state.refs > 0 {
+                return Ok(());
+            }
+            guard.take()
+        };
+        if let Some(state) = shutdown {
             let result = unsafe { socExit() };
+            unsafe { dealloc(state.buffer.as_ptr(), state.layout) };
             if result < 0 {
                 return Err(io::Error::other(format!(
-                    "socExit failed; buffer retained: {result}"
+                    "socExit failed; buffer released: {result}"
                 )));
             }
-            unsafe { dealloc(buffer.as_ptr(), self.layout) };
-            SOC_ACTIVE.store(false, Ordering::Release);
         }
         Ok(())
     }

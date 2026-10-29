@@ -253,19 +253,48 @@ impl Backend {
             .set_check_integrity(true)
             .build()?;
         collection.set_configured_utc_offset(-super::clock::offset())?;
-        if super::media_sync::worker_active() {
+        let media_index = if super::media_sync::worker_active() {
             super::event("MEDIA_INIT_SKIPPED worker_active");
-        } else if let Err(error) = open_media_manager() {
-            super::event(&format!("MEDIA_INIT_ERROR {error}"));
-        }
-        let media_index = anki::media::files::MediaNameIndex::new();
-        if let Ok(entries) = anki::media::files::media_file_entries(std::path::Path::new(MEDIA_DIR))
-        {
-            let root = std::path::Path::new(MEDIA_DIR);
-            for (fname, path) in entries {
-                media_index.insert(&fname, path.parent() == Some(root));
+            anki::media::files::load_media_name_index(std::path::Path::new(MEDIA_DIR))
+                .unwrap_or_else(anki::media::files::MediaNameIndex::new)
+        } else {
+            match open_media_manager() {
+                Ok(manager) => {
+                    match anki::media::files::load_media_name_index(std::path::Path::new(MEDIA_DIR))
+                    {
+                        Some(cached) => cached,
+                        None => {
+                            let index = anki::media::files::MediaNameIndex::new();
+                            match manager.known_file_names() {
+                                Ok(names) => {
+                                    super::event(&format!("MEDIA_INDEX_SEEDED {}", names.len()));
+                                    for name in names {
+                                        index.insert(&name, false);
+                                    }
+                                }
+                                Err(error) => {
+                                    super::event(&format!(
+                                        "MEDIA_INDEX_SEED_ERROR {}",
+                                        super::error_text(&error)
+                                    ));
+                                }
+                            }
+                            if let Err(error) = manager.save_media_index(&index) {
+                                super::event(&format!(
+                                    "MEDIA_INDEX_SAVE_ERROR {}",
+                                    super::error_text(&error)
+                                ));
+                            }
+                            index
+                        }
+                    }
+                }
+                Err(error) => {
+                    super::event(&format!("MEDIA_INIT_ERROR {error}"));
+                    anki::media::files::MediaNameIndex::new()
+                }
             }
-        }
+        };
         super::event(&format!("MEDIA_INDEX {}", media_index.len()));
         Ok(Self {
             collection,

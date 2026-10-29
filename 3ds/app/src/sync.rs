@@ -231,39 +231,29 @@ impl Job {
             unpack_speed: Mutex::new(RateTracker::default()),
         })
     }
-    pub fn finish_timeout(mut self, timeout: std::time::Duration) -> Option<Completed> {
+    pub fn finish(mut self) -> Option<Completed> {
         self.cancel();
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
+        let done = loop {
             match self.receiver.try_recv() {
-                Ok(done) => {
-                    if let Some(thread) = self.thread.take() {
-                        let _ = thread.join();
-                    }
-                    return Some(done);
-                }
+                Ok(done) => break Some(done),
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(thread) = self.thread.take() {
-                        let _ = thread.join();
-                    }
-                    return Some(Completed {
+                    break Some(Completed {
                         backend: None,
                         auth: None,
                         media: None,
                         media_error: None,
                         result: Err("Sync worker terminated".into()),
-                    });
+                    })
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    if std::time::Instant::now() >= deadline {
-                        super::event("SYNC_EXIT_TIMEOUT detached");
-                        drop(self.thread.take());
-                        return None;
-                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
+        };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
+        done
     }
     pub fn is_syncing(&self) -> bool {
         match lock_progress(&self.progress).last_progress {
@@ -365,15 +355,7 @@ impl Drop for Job {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.cancel();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
-            while !thread.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            } else {
-                super::event("SYNC_DETACHED");
-            }
+            let _ = thread.join();
         }
     }
 }

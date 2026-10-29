@@ -668,7 +668,14 @@ pub enum AudioAttempt {
 fn fallback_media_path(path: &str) -> Option<String> {
     let name = path.rsplit('/').next()?;
     let root = format!("{}/{name}", super::backend::MEDIA_DIR);
-    (root != path).then_some(root)
+    if path != root {
+        return Some(root);
+    }
+    let sharded =
+        anki::media::files::sharded_path(std::path::Path::new(super::backend::MEDIA_DIR), name)
+            .to_string_lossy()
+            .into_owned();
+    (sharded != path).then_some(sharded)
 }
 
 /// Cached rich-card layout. HTML is parsed and measured only when the card or
