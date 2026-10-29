@@ -275,19 +275,12 @@ pub fn init() {
     }
 }
 
-pub fn cycle(direction: i32) -> io::Result<ThemeKind> {
-    let index = INDEX.load(Ordering::Relaxed);
-    let count = ThemeKind::ALL.len();
-    let next = if direction < 0 {
-        (index + count - 1) % count
-    } else {
-        (index + 1) % count
-    };
-    let kind = ThemeKind::from_index(next);
+pub fn set(kind: ThemeKind) -> io::Result<()> {
     save(kind)?;
-    INDEX.store(next, Ordering::Relaxed);
-    Ok(kind)
+    INDEX.store(kind.index(), Ordering::Relaxed);
+    Ok(())
 }
+
 
 fn save(kind: ThemeKind) -> io::Result<()> {
     let mut document = fs::read_to_string(SETTINGS_PATH)

@@ -82,20 +82,10 @@ pub fn font_scale_factor() -> f32 {
     f32::from(font_scale()) / 100.0
 }
 
-/// Move to the next/previous supported font size and persist it under
-/// SD:/3ds/anki-3ds/settings.json.
-pub fn adjust_font_scale(direction: i32) -> io::Result<u16> {
-    let current = font_scale();
-    let index = FONT_SCALES
-        .iter()
-        .position(|value| *value == current)
-        .unwrap_or(1);
-    let next = if direction < 0 {
-        (index + FONT_SCALES.len() - 1) % FONT_SCALES.len()
-    } else {
-        (index + 1) % FONT_SCALES.len()
-    };
-    let percent = FONT_SCALES[next];
+pub fn set_font_scale(percent: u16) -> io::Result<u16> {
+    if !FONT_SCALES.contains(&percent) {
+        return Ok(font_scale());
+    }
     save_font_scale(percent)?;
     FONT_SCALE.store(percent, Ordering::Relaxed);
     Ok(percent)
@@ -190,11 +180,10 @@ pub fn battery_linear() -> bool {
     BATTERY_LINEAR.load(Ordering::Relaxed)
 }
 
-pub fn toggle_battery_linear() -> io::Result<bool> {
-    let value = !battery_linear();
+pub fn set_battery_linear(value: bool) -> io::Result<()> {
     write_setting("battery_linear", serde_json::json!(value))?;
     BATTERY_LINEAR.store(value, Ordering::Relaxed);
-    Ok(value)
+    Ok(())
 }
 
 fn load_battery_linear() {
@@ -239,20 +228,8 @@ pub fn download_connections() -> usize {
     )
 }
 
-pub fn cycle_download_connections(direction: i32) -> io::Result<u8> {
-    let current = download_connections() as i32;
-    let next = if direction < 0 {
-        if current <= 1 {
-            i32::from(MAX_DOWNLOAD_CONNECTIONS)
-        } else {
-            current - 1
-        }
-    } else if current >= i32::from(MAX_DOWNLOAD_CONNECTIONS) {
-        1
-    } else {
-        current + 1
-    };
-    let value = next as u8;
+pub fn set_download_connections(value: u8) -> io::Result<u8> {
+    let value = value.clamp(1, MAX_DOWNLOAD_CONNECTIONS);
     write_setting("download_connections", serde_json::json!(value))?;
     DOWNLOAD_CONNECTIONS.store(value, Ordering::Relaxed);
     Ok(value)

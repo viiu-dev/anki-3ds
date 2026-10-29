@@ -1035,7 +1035,16 @@ enum Screen {
     },
     Settings {
         selected: usize,
-        scroll: usize,
+        previous: Box<Screen>,
+    },
+    SettingsCategory {
+        category: SettingsCategory,
+        selected: usize,
+        previous: Box<Screen>,
+    },
+    SettingsChoice {
+        kind: ChoiceKind,
+        selected: usize,
         previous: Box<Screen>,
     },
     CardChoice {
@@ -1084,6 +1093,7 @@ enum Action {
     Restore,
     PlayAudio(Option<usize>),
     AudioPage(i32),
+    MediaSync,
     Exit,
 }
 
@@ -1286,28 +1296,243 @@ const MAIN_MENU: [(Action, &str); 10] = [
     (Action::Settings, "Settings"),
     (Action::Exit, "Exit"),
 ];
-const SETTINGS_MENU: [(Action, &str); 13] = [
-    (Action::None, "Font scale"),
-    (Action::None, "Theme"),
-    (Action::Language, "Language"),
-    (Action::Login, "Log in"),
-    (Action::Logout, "Log out"),
-    (Action::FullSync, "Full sync"),
-    (Action::Clock, "Update clock"),
-    (Action::Help, "Help"),
-    (Action::None, "Auto-play audio"),
-    (Action::None, "Download connections"),
-    (Action::None, "Media sync"),
-    (Action::None, "Battery indicator"),
-    (Action::None, "Console LEDs"),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    Appearance,
+    Audio,
+    Network,
+    System,
+    Language,
+}
+
+impl SettingsCategory {
+    const ALL: [SettingsCategory; 5] = [
+        SettingsCategory::Appearance,
+        SettingsCategory::Audio,
+        SettingsCategory::Network,
+        SettingsCategory::System,
+        SettingsCategory::Language,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsCategory::Appearance => "Appearance and display",
+            SettingsCategory::Audio => "Audio and review",
+            SettingsCategory::Network => "Sync and network",
+            SettingsCategory::System => "System and hardware",
+            SettingsCategory::Language => "Language",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            SettingsCategory::Appearance => "Theme, font size and battery.",
+            SettingsCategory::Audio => "Audio playback and review options.",
+            SettingsCategory::Network => "Account, clock and media downloads.",
+            SettingsCategory::System => "Hardware lights and help.",
+            SettingsCategory::Language => "Choose the interface language.",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChoiceKind {
+    Theme,
+    FontScale,
+    Battery,
+    Connections,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToggleKind {
+    Autoplay,
+    ConsoleLeds,
+}
+
+#[derive(Clone, Copy)]
+enum SettingsItem {
+    Choice(ChoiceKind),
+    Toggle(ToggleKind),
+    Action(Action, &'static str),
+}
+
+const APPEARANCE_ITEMS: [SettingsItem; 3] = [
+    SettingsItem::Choice(ChoiceKind::Theme),
+    SettingsItem::Choice(ChoiceKind::FontScale),
+    SettingsItem::Choice(ChoiceKind::Battery),
 ];
-const FONT_SCALE_ITEM: usize = 0;
-const THEME_ITEM: usize = 1;
-const AUTOPLAY_ITEM: usize = 8;
-const CONNECTIONS_ITEM: usize = 9;
-const MEDIA_SYNC_ITEM: usize = 10;
-const BATTERY_ITEM: usize = 11;
-const CONSOLE_LEDS_ITEM: usize = 12;
+const AUDIO_ITEMS: [SettingsItem; 1] = [SettingsItem::Toggle(ToggleKind::Autoplay)];
+const NETWORK_ITEMS: [SettingsItem; 6] = [
+    SettingsItem::Action(Action::Login, "Log in"),
+    SettingsItem::Action(Action::Logout, "Log out"),
+    SettingsItem::Action(Action::FullSync, "Full sync"),
+    SettingsItem::Action(Action::Clock, "Update clock"),
+    SettingsItem::Choice(ChoiceKind::Connections),
+    SettingsItem::Action(Action::MediaSync, "Media sync"),
+];
+const SYSTEM_ITEMS: [SettingsItem; 2] = [
+    SettingsItem::Toggle(ToggleKind::ConsoleLeds),
+    SettingsItem::Action(Action::Help, "Help"),
+];
+const LANGUAGE_ITEMS: [SettingsItem; 1] = [SettingsItem::Action(Action::Language, "Language")];
+
+fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
+    match category {
+        SettingsCategory::Appearance => &APPEARANCE_ITEMS,
+        SettingsCategory::Audio => &AUDIO_ITEMS,
+        SettingsCategory::Network => &NETWORK_ITEMS,
+        SettingsCategory::System => &SYSTEM_ITEMS,
+        SettingsCategory::Language => &LANGUAGE_ITEMS,
+    }
+}
+
+fn settings_row_count(category: SettingsCategory) -> usize {
+    settings_items(category).len()
+}
+
+fn choice_title(kind: ChoiceKind) -> &'static str {
+    match kind {
+        ChoiceKind::Theme => "Theme",
+        ChoiceKind::FontScale => "Font scale",
+        ChoiceKind::Battery => "Battery indicator",
+        ChoiceKind::Connections => "Download connections",
+    }
+}
+
+fn choice_options(kind: ChoiceKind) -> Vec<String> {
+    match kind {
+        ChoiceKind::Theme => ThemeKind::ALL
+            .iter()
+            .map(|value| tr(value.label()).to_owned())
+            .collect(),
+        ChoiceKind::FontScale => i18n::FONT_SCALES
+            .iter()
+            .map(|value| format!("{value}%"))
+            .collect(),
+        ChoiceKind::Battery => {
+            vec![tr("Linear (25%)").to_owned(), tr("System default").to_owned()]
+        }
+        ChoiceKind::Connections => (1..=4).map(|value| value.to_string()).collect(),
+    }
+}
+
+fn choice_selected(kind: ChoiceKind) -> usize {
+    match kind {
+        ChoiceKind::Theme => ThemeKind::ALL
+            .iter()
+            .position(|value| *value == theme::kind())
+            .unwrap_or(0),
+        ChoiceKind::FontScale => i18n::FONT_SCALES
+            .iter()
+            .position(|value| *value == i18n::font_scale())
+            .unwrap_or(1),
+        ChoiceKind::Battery => usize::from(!i18n::battery_linear()),
+        ChoiceKind::Connections => i18n::download_connections().saturating_sub(1),
+    }
+}
+
+fn choice_label(kind: ChoiceKind) -> String {
+    let options = choice_options(kind);
+    let selected = choice_selected(kind).min(options.len().saturating_sub(1));
+    i18n::format("{0}: {1}", &[tr(choice_title(kind)), &options[selected]])
+}
+
+fn apply_choice(kind: ChoiceKind, index: usize) -> std::io::Result<()> {
+    match kind {
+        ChoiceKind::Theme => {
+            let value = ThemeKind::ALL[index.min(ThemeKind::ALL.len() - 1)];
+            theme::set(value)?;
+            Ui::apply_theme();
+            event(&format!("THEME {}", value.key()));
+        }
+        ChoiceKind::FontScale => {
+            let percent = i18n::set_font_scale(
+                i18n::FONT_SCALES[index.min(i18n::FONT_SCALES.len() - 1)],
+            )?;
+            event(&format!("FONT_SCALE {percent}%"));
+        }
+        ChoiceKind::Battery => {
+            let linear = index == 0;
+            i18n::set_battery_linear(linear)?;
+            Ui::set_battery_linear(linear);
+            event(&format!(
+                "BATTERY_INDICATOR {}",
+                if linear { "linear" } else { "system" }
+            ));
+        }
+        ChoiceKind::Connections => {
+            let value = i18n::set_download_connections(index as u8 + 1)?;
+            event(&format!("DOWNLOAD_CONNECTIONS {value}"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_toggle(kind: ToggleKind) -> std::io::Result<()> {
+    match kind {
+        ToggleKind::Autoplay => {
+            let value = i18n::toggle_autoplay_audio()?;
+            event(&format!("AUTOPLAY {}", if value { "on" } else { "off" }));
+        }
+        ToggleKind::ConsoleLeds => {
+            let value = i18n::toggle_console_leds()?;
+            leds::apply(value);
+            event(&format!(
+                "CONSOLE_LEDS {}",
+                if value { "on" } else { "off" }
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn settings_item_label(
+    item: SettingsItem,
+    media_running: bool,
+    media_files: usize,
+    media_status: Option<&str>,
+) -> String {
+    match item {
+        SettingsItem::Choice(kind) => choice_label(kind),
+        SettingsItem::Toggle(ToggleKind::Autoplay) => i18n::format(
+            "Auto-play audio: {0}",
+            &[tr(if i18n::autoplay_audio() {
+                "On"
+            } else {
+                "Off"
+            })],
+        ),
+        SettingsItem::Toggle(ToggleKind::ConsoleLeds) => i18n::format(
+            "Console LEDs: {0}",
+            &[tr(if i18n::console_leds() { "On" } else { "Off" })],
+        ),
+        SettingsItem::Action(Action::MediaSync, _) => {
+            media_sync_label(media_running, media_files, media_status)
+        }
+        SettingsItem::Action(_, label) => tr(label).to_owned(),
+    }
+}
+
+fn media_sync_label(
+    media_running: bool,
+    media_files: usize,
+    media_status: Option<&str>,
+) -> String {
+    if media_running {
+        if let Some(status) = media_status {
+            i18n::format("Media sync: {0}. A stops.", &[status])
+        } else {
+            i18n::format(
+                "Media sync: {0} files. A stops.",
+                &[&media_files.to_string()],
+            )
+        }
+    } else if let Some(status) = media_status {
+        i18n::format("Media sync: {0}. A starts.", &[status])
+    } else {
+        i18n::format("Media sync: {0}. A starts.", &[tr("Idle")])
+    }
+}
 const MENU_COLS: usize = 2;
 const MENU_TILE_W: f32 = 146.0;
 const MENU_TILE_H: f32 = 30.0;
@@ -1339,7 +1564,8 @@ const SETTINGS_TILE_Y0: f32 = 42.0;
 const SETTINGS_TILE_W: f32 = 292.0;
 const SETTINGS_TILE_H: f32 = 20.0;
 const SETTINGS_TILE_GAP: f32 = 2.0;
-const SETTINGS_VISIBLE_ROWS: usize = 8;
+const CHOICE_TILE_H: f32 = 18.0;
+const CHOICE_TILE_GAP: f32 = 2.0;
 
 fn settings_tile(row: usize) -> (f32, f32) {
     (
@@ -1348,83 +1574,36 @@ fn settings_tile(row: usize) -> (f32, f32) {
     )
 }
 
-fn settings_hit(x: f32, y: f32, scroll: usize) -> Option<usize> {
+fn choice_tile(row: usize) -> (f32, f32) {
+    (
+        SETTINGS_TILE_X0,
+        SETTINGS_TILE_Y0 + row as f32 * (CHOICE_TILE_H + CHOICE_TILE_GAP),
+    )
+}
+
+fn choice_hit(x: f32, y: f32, length: usize) -> Option<usize> {
+    let row = ((y - SETTINGS_TILE_Y0) / (CHOICE_TILE_H + CHOICE_TILE_GAP)) as usize;
+    if row >= length {
+        return None;
+    }
+    let (tx, ty) = choice_tile(row);
+    (x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + CHOICE_TILE_H).then_some(row)
+}
+
+fn list_hit(x: f32, y: f32, length: usize) -> Option<usize> {
     let row = ((y - SETTINGS_TILE_Y0) / (SETTINGS_TILE_H + SETTINGS_TILE_GAP)) as usize;
-    if row >= SETTINGS_VISIBLE_ROWS {
+    if row >= length {
         return None;
     }
     let (tx, ty) = settings_tile(row);
-    if x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + SETTINGS_TILE_H {
-        let index = scroll + row;
-        (index < SETTINGS_MENU.len()).then_some(index)
+    (x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + SETTINGS_TILE_H).then_some(row)
+}
+
+fn list_step(selected: usize, length: usize, down: bool) -> usize {
+    if down {
+        (selected + 1).min(length.saturating_sub(1))
     } else {
-        None
-    }
-}
-
-fn settings_max_scroll() -> usize {
-    SETTINGS_MENU.len().saturating_sub(SETTINGS_VISIBLE_ROWS)
-}
-
-fn settings_scroll_into_view(selected: usize, scroll: &mut usize) {
-    if selected < *scroll {
-        *scroll = selected;
-    } else if selected >= *scroll + SETTINGS_VISIBLE_ROWS {
-        *scroll = selected + 1 - SETTINGS_VISIBLE_ROWS;
-    }
-    *scroll = (*scroll).min(settings_max_scroll());
-}
-
-fn settings_label(
-    index: usize,
-    media_running: bool,
-    media_files: usize,
-    media_status: Option<&str>,
-) -> String {
-    match index {
-        FONT_SCALE_ITEM => i18n::format("Font scale: {0}%", &[&i18n::font_scale().to_string()]),
-        THEME_ITEM => i18n::format("Theme: {0}", &[tr(ThemeKind::label(theme::kind()))]),
-        AUTOPLAY_ITEM => i18n::format(
-            "Auto-play audio: {0}",
-            &[if i18n::autoplay_audio() {
-                tr("On")
-            } else {
-                tr("Off")
-            }],
-        ),
-        CONNECTIONS_ITEM => i18n::format(
-            "Download connections: {0}",
-            &[&i18n::download_connections().to_string()],
-        ),
-        BATTERY_ITEM => i18n::format(
-            "Battery indicator: {0}",
-            &[tr(if i18n::battery_linear() {
-                "Linear (25%)"
-            } else {
-                "System default"
-            })],
-        ),
-        CONSOLE_LEDS_ITEM => i18n::format(
-            "Console LEDs: {0}",
-            &[tr(if i18n::console_leds() { "On" } else { "Off" })],
-        ),
-        MEDIA_SYNC_ITEM => {
-            if media_running {
-                if let Some(status) = media_status {
-                    i18n::format("Media sync: {0}. A stops.", &[status])
-                } else {
-                    i18n::format(
-                        "Media sync: {0} files. A stops.",
-                        &[&media_files.to_string()],
-                    )
-                }
-            } else if let Some(status) = media_status {
-                i18n::format("Media sync: {0}. A starts.", &[status])
-            } else {
-                i18n::format("Media sync: {0}. A starts.", &[tr("Idle")])
-            }
-        }
-        _ => tr(SETTINGS_MENU[index].1).to_owned(),
+        selected.saturating_sub(1)
     }
 }
 
@@ -2047,10 +2226,28 @@ fn main() {
                         Action::None
                     }
                 }
-                Screen::Settings {
-                    selected, scroll, ..
+                Screen::Settings { selected, .. } => {
+                    if let Some(index) = list_hit(x, y, SettingsCategory::ALL.len()) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::SettingsCategory {
+                    category, selected, ..
                 } => {
-                    if let Some(index) = settings_hit(x, y, *scroll) {
+                    if let Some(index) = list_hit(x, y, settings_row_count(*category)) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::SettingsChoice {
+                    kind, selected, ..
+                } => {
+                    if let Some(index) = choice_hit(x, y, choice_options(*kind).len()) {
                         *selected = index;
                         Action::Primary
                     } else {
@@ -2185,7 +2382,6 @@ fn main() {
                         let menu = std::mem::replace(&mut screen, Screen::Decks);
                         screen = Screen::Settings {
                             selected: 0,
-                            scroll: 0,
                             previous: Box::new(menu),
                         };
                         card_scroll = 0;
@@ -2199,105 +2395,161 @@ fn main() {
                 }
             }
             if let Screen::Settings { selected, .. } = &screen {
-                let adjust = match action {
-                    Action::Primary | Action::Right => Some(1),
-                    Action::Left => Some(-1),
-                    _ => None,
-                };
-                if *selected == FONT_SCALE_ITEM {
-                    if let Some(direction) = adjust {
-                        let percent = i18n::adjust_font_scale(direction)?;
-                        event(&format!("FONT_SCALE {percent}%"));
-                        review_scroll = 0.0;
-                        return Ok(());
+                if matches!(action, Action::Primary) {
+                    let index = *selected;
+                    let category = SettingsCategory::ALL[index.min(SettingsCategory::ALL.len() - 1)];
+                    let old = std::mem::replace(&mut screen, Screen::Decks);
+                    if let Screen::Settings { selected, previous } = old {
+                        screen = Screen::SettingsCategory {
+                            category,
+                            selected: 0,
+                            previous: Box::new(Screen::Settings { selected, previous }),
+                        };
                     }
-                }
-                if *selected == THEME_ITEM {
-                    if let Some(direction) = adjust {
-                        let kind = theme::cycle(direction)?;
-                        Ui::apply_theme();
-                        event(&format!("THEME {}", kind.key()));
-                        return Ok(());
-                    }
-                }
-                if *selected == AUTOPLAY_ITEM && matches!(action, Action::Primary) {
-                    let value = i18n::toggle_autoplay_audio()?;
-                    event(&format!("AUTOPLAY {}", if value { "on" } else { "off" }));
                     return Ok(());
                 }
-                if *selected == CONNECTIONS_ITEM {
-                    if let Some(direction) = adjust {
-                        let value = i18n::cycle_download_connections(direction)?;
-                        event(&format!("DOWNLOAD_CONNECTIONS {value}"));
-                        return Ok(());
-                    }
-                }
-                if *selected == BATTERY_ITEM && matches!(action, Action::Primary) {
-                    let value = i18n::toggle_battery_linear()?;
-                    Ui::set_battery_linear(value);
-                    event(&format!(
-                        "BATTERY_INDICATOR {}",
-                        if value { "linear" } else { "system" }
-                    ));
-                    return Ok(());
-                }
-                if *selected == CONSOLE_LEDS_ITEM && matches!(action, Action::Primary) {
-                    let value = i18n::toggle_console_leds()?;
-                    leds::apply(value);
-                    event(&format!(
-                        "CONSOLE_LEDS {}",
-                        if value { "on" } else { "off" }
-                    ));
-                    return Ok(());
-                }
-                if *selected == MEDIA_SYNC_ITEM && matches!(action, Action::Primary) {
-                    if let Some(active) = &media_job {
-                        active.cancel();
-                        event("MEDIA_SYNC_CANCEL");
-                    } else if auth.is_none() {
-                        media_result = Some(i18n::format("failed: {0}", &[&tr("Not logged in")]));
-                        media_notice_until = Instant::now() + Duration::from_secs(3600);
-                    } else {
-                        let priority = backend
-                            .as_mut()
-                            .map(|active| active.priority_media(200))
-                            .unwrap_or_default();
-                        match backend.as_ref() {
-                            Some(active_backend) => {
-                                let index = active_backend.media_index_handle();
-                                match sync::start_media(auth.clone(), &login, priority, index) {
-                                    Ok(job) => {
-                                        media_job = Some(job);
-                                        media_result = None;
-                                        last_media_changed = 0;
-                                        last_media_refresh = Instant::now();
-                                        event("MEDIA_SYNC_MANUAL_START");
-                                    }
-                                    Err(error) => {
-                                        event(&format!("MEDIA_SYNC_MANUAL_ERROR {error}"));
-                                        media_result = Some(i18n::format("failed: {0}", &[&error]));
-                                        media_notice_until =
-                                            Instant::now() + Duration::from_secs(3600);
+            }
+            if let Screen::SettingsCategory {
+                category, selected, ..
+            } = &screen
+            {
+                let category = *category;
+                let index = *selected;
+                let items = settings_items(category);
+                let item = items[index.min(items.len().saturating_sub(1))];
+                match action {
+                    Action::Primary => {
+                        match item {
+                            SettingsItem::Choice(kind) => {
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsCategory {
+                                    category,
+                                    selected,
+                                    previous,
+                                } = old
+                                {
+                                    screen = Screen::SettingsChoice {
+                                        kind,
+                                        selected: choice_selected(kind),
+                                        previous: Box::new(Screen::SettingsCategory {
+                                            category,
+                                            selected,
+                                            previous,
+                                        }),
+                                    };
+                                }
+                            }
+                            SettingsItem::Toggle(kind) => apply_toggle(kind)?,
+                            SettingsItem::Action(Action::MediaSync, _) => {
+                                if let Some(active) = &media_job {
+                                    active.cancel();
+                                    event("MEDIA_SYNC_CANCEL");
+                                } else if auth.is_none() {
+                                    media_result = Some(i18n::format(
+                                        "failed: {0}",
+                                        &[&tr("Not logged in")],
+                                    ));
+                                    media_notice_until = Instant::now() + Duration::from_secs(3600);
+                                } else {
+                                    let priority = backend
+                                        .as_mut()
+                                        .map(|active| active.priority_media(200))
+                                        .unwrap_or_default();
+                                    match backend.as_ref() {
+                                        Some(active_backend) => {
+                                            let index = active_backend.media_index_handle();
+                                            match sync::start_media(
+                                                auth.clone(),
+                                                &login,
+                                                priority,
+                                                index,
+                                            ) {
+                                                Ok(job) => {
+                                                    media_job = Some(job);
+                                                    media_result = None;
+                                                    last_media_changed = 0;
+                                                    last_media_refresh = Instant::now();
+                                                    event("MEDIA_SYNC_MANUAL_START");
+                                                }
+                                                Err(error) => {
+                                                    event(&format!(
+                                                        "MEDIA_SYNC_MANUAL_ERROR {error}"
+                                                    ));
+                                                    media_result = Some(i18n::format(
+                                                        "failed: {0}",
+                                                        &[&error],
+                                                    ));
+                                                    media_notice_until = Instant::now()
+                                                        + Duration::from_secs(3600);
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            media_result = Some(i18n::format(
+                                                "failed: {0}",
+                                                &[&tr("Collection unavailable")],
+                                            ));
+                                            media_notice_until =
+                                                Instant::now() + Duration::from_secs(3600);
+                                        }
                                     }
                                 }
                             }
-                            None => {
-                                media_result = Some(i18n::format(
-                                    "failed: {0}",
-                                    &[&tr("Collection unavailable")],
-                                ));
-                                media_notice_until = Instant::now() + Duration::from_secs(3600);
+                            SettingsItem::Action(chosen, _) => {
+                                action = chosen;
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsCategory { previous, .. } = old {
+                                    screen = *previous;
+                                }
                             }
                         }
+                        return Ok(());
                     }
-                    return Ok(());
+                    Action::Left | Action::Right => {
+                        let direction = if matches!(action, Action::Right) { 1 } else { -1 };
+                        match item {
+                            SettingsItem::Choice(kind) => {
+                                let count = choice_options(kind).len();
+                                let current = choice_selected(kind);
+                                let next = if direction < 0 {
+                                    (current + count - 1) % count
+                                } else {
+                                    (current + 1) % count
+                                };
+                                apply_choice(kind, next)?;
+                                if kind == ChoiceKind::FontScale {
+                                    review_scroll = 0.0;
+                                }
+                            }
+                            SettingsItem::Toggle(kind) => apply_toggle(kind)?,
+                            SettingsItem::Action(_, _) => {}
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
                 }
-                if matches!(action, Action::Primary) {
-                    action = SETTINGS_MENU[*selected].0;
-                    let old = std::mem::replace(&mut screen, Screen::Decks);
-                    if let Screen::Settings { previous, .. } = old {
-                        screen = *previous;
+            }
+            if let Screen::SettingsChoice { kind, selected, .. } = &screen {
+                let kind = *kind;
+                let index = *selected;
+                match action {
+                    Action::Primary => {
+                        apply_choice(kind, index)?;
+                        if kind == ChoiceKind::FontScale {
+                            review_scroll = 0.0;
+                        }
+                        return Ok(());
                     }
+                    Action::Left | Action::Right => {
+                        let count = choice_options(kind).len();
+                        let step = if matches!(action, Action::Right) { 1 } else { -1 };
+                        if let Screen::SettingsChoice { selected, .. } = &mut screen {
+                            *selected = ((*selected as i32 + step + count as i32)
+                                % count as i32) as usize;
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
                 }
             }
             let mut bury = None;
@@ -2803,6 +3055,8 @@ fn main() {
                         Screen::Info { previous, .. }
                         | Screen::Menu { previous, .. }
                         | Screen::Settings { previous, .. }
+                        | Screen::SettingsCategory { previous, .. }
+                        | Screen::SettingsChoice { previous, .. }
                         | Screen::CardChoice { previous, .. } => *previous,
                         Screen::Editor {
                             return_query: Some(query),
@@ -3095,16 +3349,28 @@ fn main() {
                                     selected.saturating_sub(MENU_COLS)
                                 };
                             }
-                            Screen::Settings {
-                                selected, scroll, ..
+                            Screen::Settings { selected, .. } => {
+                                *selected = list_step(
+                                    *selected,
+                                    SettingsCategory::ALL.len(),
+                                    matches!(action, Action::Down),
+                                );
+                            }
+                            Screen::SettingsCategory {
+                                category, selected, ..
                             } => {
-                                let length = SETTINGS_MENU.len();
-                                *selected = if matches!(action, Action::Down) {
-                                    (*selected + 1).min(length - 1)
-                                } else {
-                                    selected.saturating_sub(1)
-                                };
-                                settings_scroll_into_view(*selected, scroll);
+                                *selected = list_step(
+                                    *selected,
+                                    settings_row_count(*category),
+                                    matches!(action, Action::Down),
+                                );
+                            }
+                            Screen::SettingsChoice { kind, selected, .. } => {
+                                *selected = list_step(
+                                    *selected,
+                                    choice_options(*kind).len(),
+                                    matches!(action, Action::Down),
+                                );
                             }
                             _ => {
                                 card_scroll = next(card_scroll, top_max + 1);
@@ -3134,16 +3400,12 @@ fn main() {
                         } else {
                             selected.saturating_sub(1)
                         };
-                    } else if let Screen::Settings {
-                        selected, scroll, ..
-                    } = &mut screen
-                    {
+                    } else if let Screen::Settings { selected, .. } = &mut screen {
                         *selected = if matches!(action, Action::Right) {
-                            (*selected + 1).min(SETTINGS_MENU.len() - 1)
+                            (*selected + 1).min(SettingsCategory::ALL.len() - 1)
                         } else {
                             selected.saturating_sub(1)
                         };
-                        settings_scroll_into_view(*selected, scroll);
                     } else if matches!(
                         screen,
                         Screen::Info { .. } | Screen::Browser(_) | Screen::Editor { .. }
@@ -3155,7 +3417,7 @@ fn main() {
                         };
                     }
                 }
-                Action::None | Action::Menu | Action::Settings | Action::Exit => {}
+                Action::None | Action::Menu | Action::Settings | Action::MediaSync | Action::Exit => {}
             }
             Ok(())
         })();
@@ -3338,6 +3600,8 @@ fn main() {
             Screen::Options { .. } => "OPTIONS",
             Screen::Menu { .. } => "MENU",
             Screen::Settings { .. } => "SETTINGS",
+            Screen::SettingsCategory { .. } => "SETTINGS_CATEGORY",
+            Screen::SettingsChoice { .. } => "SETTINGS_CHOICE",
             Screen::CardChoice { .. } => "CARD_CHOICE",
             Screen::Info { .. } => "INFO",
             Screen::Error(_) => "ERROR",
@@ -3585,7 +3849,57 @@ fn main() {
                     112.0,
                     0.48,
                     current_theme().text_muted,
-                    tr("Preferences, account and help."),
+                    tr("Choose a category. B returns."),
+                );
+            }
+            Screen::SettingsCategory { category, .. } => {
+                Ui::fit_text(
+                    200.0,
+                    38.0,
+                    0.60,
+                    360.0,
+                    current_theme().text,
+                    tr(category.label()),
+                );
+                Ui::fit_text(
+                    200.0,
+                    86.0,
+                    0.48,
+                    360.0,
+                    current_theme().text_muted,
+                    tr(category.hint()),
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    130.0,
+                    0.44,
+                    current_theme().text_faint,
+                    tr("A opens or changes. B returns."),
+                );
+            }
+            Screen::SettingsChoice { kind, .. } => {
+                Ui::fit_text(
+                    200.0,
+                    34.0,
+                    0.62,
+                    360.0,
+                    current_theme().text,
+                    tr(choice_title(*kind)),
+                );
+                Ui::fit_text(
+                    200.0,
+                    76.0,
+                    0.50,
+                    360.0,
+                    current_theme().text_muted,
+                    &choice_label(*kind),
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    128.0,
+                    0.46,
+                    current_theme().text_muted,
+                    tr("Choose an option. A applies. B returns."),
                 );
             }
             Screen::CardChoice { .. } => {
@@ -3887,28 +4201,42 @@ fn main() {
                     Ui::draw_button(x, y, MENU_TILE_W, MENU_TILE_H, &label, None, style, false);
                 }
             }
-            Screen::Settings {
-                selected, scroll, ..
-            } => {
+            Screen::Settings { selected, .. } => {
                 header(320.0, tr("Settings"));
+                for (index, category) in SettingsCategory::ALL.iter().enumerate() {
+                    let (x, y) = settings_tile(index);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let label =
+                        Ui::ellipsize(tr(category.label()), 0.50, SETTINGS_TILE_W - 12.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        SETTINGS_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
+                }
+            }
+            Screen::SettingsCategory {
+                category, selected, ..
+            } => {
+                header(320.0, tr(category.label()));
                 let (media_running, media_files) = media_job
                     .as_ref()
                     .map(|active| (active.is_running(), active.processed_files()))
                     .unwrap_or((false, 0));
-                for row in 0..SETTINGS_VISIBLE_ROWS {
-                    let index = scroll + row;
-                    if index >= SETTINGS_MENU.len() {
-                        break;
-                    }
-                    let (x, y) = settings_tile(row);
+                let media_status = if media_running {
+                    media_status.as_deref()
+                } else {
+                    media_result.as_deref()
+                };
+                for (index, item) in settings_items(*category).iter().enumerate() {
+                    let (x, y) = settings_tile(index);
                     let style = if index == *selected { 0 } else { 6 };
-                    let settings_media_status = if media_running {
-                        media_status.as_deref()
-                    } else {
-                        media_result.as_deref()
-                    };
-                    let label =
-                        settings_label(index, media_running, media_files, settings_media_status);
+                    let label = settings_item_label(*item, media_running, media_files, media_status);
                     let label = Ui::ellipsize(&label, 0.50, SETTINGS_TILE_W - 12.0);
                     Ui::draw_button(
                         x,
@@ -3921,15 +4249,33 @@ fn main() {
                         false,
                     );
                 }
-                Ui::draw_scrollbar(
-                    305.0,
-                    SETTINGS_TILE_Y0,
-                    8.0,
-                    (SETTINGS_TILE_H + SETTINGS_TILE_GAP) * SETTINGS_VISIBLE_ROWS as f32,
-                    SETTINGS_MENU.len(),
-                    SETTINGS_VISIBLE_ROWS,
-                    *scroll,
-                );
+            }
+            Screen::SettingsChoice { kind, selected, .. } => {
+                header(320.0, tr(choice_title(*kind)));
+                let active = choice_selected(*kind);
+                for (index, option) in choice_options(*kind).iter().enumerate() {
+                    let (x, y) = choice_tile(index);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let label = Ui::ellipsize(option, 0.48, SETTINGS_TILE_W - 28.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        CHOICE_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
+                    if index == active {
+                        Ui::draw_sync_icon(
+                            x + SETTINGS_TILE_W - 20.0,
+                            y + (CHOICE_TILE_H - 10.0) * 0.5,
+                            10.0,
+                            0,
+                        );
+                    }
+                }
             }
             Screen::CardChoice { selected, .. } => {
                 header(320.0, tr("Bury / Suspend"));
@@ -3990,6 +4336,9 @@ fn main() {
                 | Screen::Answer { .. }
                 | Screen::SyncChoice { .. }
                 | Screen::CardChoice { .. }
+                | Screen::Settings { .. }
+                | Screen::SettingsCategory { .. }
+                | Screen::SettingsChoice { .. }
         );
         if !hide_footer {
             let text = if let Some(status) = &media_status {
