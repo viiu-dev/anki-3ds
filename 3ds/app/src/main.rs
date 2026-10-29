@@ -5,6 +5,7 @@ mod assets;
 mod auth_store;
 mod backend;
 mod clock;
+mod event_log;
 mod i18n;
 mod media_sync;
 mod review_text;
@@ -14,7 +15,6 @@ mod time_correction;
 mod ui;
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -29,7 +29,6 @@ use theme::current as current_theme;
 use theme::ThemeKind;
 use ui::*;
 
-const LOG: &str = "sdmc:/3ds/anki-3ds/prototype-events.txt";
 #[cfg(feature = "emulator")]
 const TEST_SCRIPT: &str = "sdmc:/3ds/anki-3ds/test-script.txt";
 const ROW_Y: f32 = 43.0;
@@ -37,10 +36,7 @@ const ROW_H: f32 = 24.0;
 const ROWS: usize = 6;
 
 fn event(text: &str) {
-    if let Ok(mut log) = fs::OpenOptions::new().create(true).append(true).open(LOG) {
-        let _ = writeln!(log, "{text}");
-        let _ = log.sync_all();
-    }
+    event_log::append(text);
 }
 fn error_text(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
@@ -1430,6 +1426,7 @@ fn menu_label(index: usize) -> String {
 }
 
 fn main() {
+    event_log::begin_session();
     let apt = match Apt::new() {
         Ok(apt) => apt,
         Err(error) => {
@@ -1461,12 +1458,7 @@ fn main() {
             tracing_subscriber::fmt::layer()
                 .without_time()
                 .with_ansi(false)
-                .with_writer(|| -> Box<dyn std::io::Write + Send> {
-                    match fs::OpenOptions::new().create(true).append(true).open(LOG) {
-                        Ok(file) => Box::new(file),
-                        Err(_) => Box::new(std::io::sink()),
-                    }
-                })
+                .with_writer(event_log::trace_writer)
                 .with_filter(
                     tracing_subscriber::filter::Targets::new()
                         .with_target("anki::sync::collection::normal", tracing::Level::DEBUG)
