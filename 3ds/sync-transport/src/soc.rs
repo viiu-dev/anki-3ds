@@ -3,24 +3,28 @@
 
 //! Explicit ownership of libctru's caller-allocated SOC buffer.
 //!
-//! libctru socExit() closes shared-memory/service handles but does not free the
-//! caller's buffer. Keep the allocation alive until shutdown completes.
-use std::alloc::alloc_zeroed;
-use std::alloc::dealloc;
-use std::alloc::Layout;
+//! The 1 MiB, page-aligned SOC buffer is static storage that lives for the
+//! whole app. It is zero-initialised, so it sits in .bss and does not grow
+//! the 3DSX. Only the reference count is protected by the mutex; socExit
+//! still runs when the last handle closes, but the memory is never freed,
+//! so repeated syncs cannot fragment the heap with 1 MiB aligned
+//! allocations.
+use std::cell::UnsafeCell;
 use std::io;
-use std::ptr::NonNull;
 use std::sync::Mutex;
 
+const SOC_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[repr(C, align(4096))]
+struct SocBuffer(UnsafeCell<[u8; SOC_BUFFER_SIZE]>);
+// Only ever handed to socInit while the SOC_SERVICE mutex is held.
+unsafe impl Sync for SocBuffer {}
+
+static SOC_BUFFER: SocBuffer = SocBuffer(UnsafeCell::new([0; SOC_BUFFER_SIZE]));
+
 struct SocService {
-    buffer: NonNull<u8>,
-    layout: Layout,
     refs: usize,
 }
-
-// The buffer is only handed to socInit/socExit; the service is shared by
-// reference-counted handles, never aliased mutably.
-unsafe impl Send for SocService {}
 
 static SOC_SERVICE: Mutex<Option<SocService>> = Mutex::new(None);
 
@@ -63,19 +67,12 @@ impl NativeSoc {
             state.refs += 1;
             return Ok(Self { active: true });
         }
-        let layout = Layout::from_size_align(1024 * 1024, 4096).unwrap();
-        let buffer = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .ok_or_else(|| io::Error::other("SOC buffer allocation failed"))?;
-        let result = unsafe { socInit(buffer.as_ptr().cast(), layout.size() as u32) };
+        let ptr = SOC_BUFFER.0.get().cast::<u32>();
+        let result = unsafe { socInit(ptr, SOC_BUFFER_SIZE as u32) };
         if result < 0 {
-            unsafe { dealloc(buffer.as_ptr(), layout) };
             return Err(io::Error::other(format!("socInit failed: {result}")));
         }
-        *guard = Some(SocService {
-            buffer,
-            layout,
-            refs: 1,
-        });
+        *guard = Some(SocService { refs: 1 });
         Ok(Self { active: true })
     }
 
@@ -95,13 +92,10 @@ impl NativeSoc {
             }
             guard.take()
         };
-        if let Some(state) = shutdown {
+        if shutdown.is_some() {
             let result = unsafe { socExit() };
-            unsafe { dealloc(state.buffer.as_ptr(), state.layout) };
             if result < 0 {
-                return Err(io::Error::other(format!(
-                    "socExit failed; buffer released: {result}"
-                )));
+                return Err(io::Error::other(format!("socExit failed: {result}")));
             }
         }
         Ok(())

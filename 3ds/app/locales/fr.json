@@ -204,5 +204,9 @@
     "A opens or changes. B returns.": "A ouvre ou modifie. B revient.",
     "Choose an option. A applies. B returns.": "Choisissez une option. A applique. B revient.",
     "Console LEDs": "Voyants de la console",
-    "Console LEDs: {0}": "Voyants de la console : {0}"
+    "Console LEDs: {0}": "Voyants de la console : {0}",
+    "Limits apply to": "Limits apply to",
+    "Preset": "Preset",
+    "This deck": "This deck",
+    "Today only": "Today only"
 }

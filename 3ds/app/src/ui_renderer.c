@@ -7,6 +7,7 @@
 #include <citro2d.h>
 #include <citro3d.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -359,6 +360,9 @@ static bool upload_media_pixels(
     int dst_h
 ) {
     if (!pixels || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return false;
+    if (dst_w > 1024 || dst_h > 1024) return false;
+    if ((size_t)dst_w > SIZE_MAX / 4 / (size_t)dst_h) return false;
+    if (stride != 0 && (size_t)src_h > SIZE_MAX / stride) return false;
     if (s_capture_pixels_active) {
         size_t bytes = (size_t)dst_w * (size_t)dst_h * 4;
         uint8_t* tight = (uint8_t*)malloc(bytes ? bytes : 1);
@@ -495,6 +499,16 @@ static bool decode_svg_image(
     float scale = scale_x < scale_y ? scale_x : scale_y;
     NSVGrasterizer* rasterizer = nsvgCreateRasterizer();
     if (!rasterizer) {
+        nsvgDelete(svg);
+        return false;
+    }
+    if (dst_w > 1024 || dst_h > 1024) {
+        nsvgDeleteRasterizer(rasterizer);
+        nsvgDelete(svg);
+        return false;
+    }
+    if ((size_t)dst_w > SIZE_MAX / 4 / (size_t)dst_h) {
+        nsvgDeleteRasterizer(rasterizer);
         nsvgDelete(svg);
         return false;
     }
@@ -789,6 +803,7 @@ static bool audio_buffer_ensure(void) {
         size /= 2;
     }
     if (!s_audio_pcm) {
+        s_audio_capacity = 0;
         return false;
     }
     memset(s_audio_pcm, 0, s_audio_capacity);
@@ -1086,8 +1101,6 @@ static int s_prefetch_rate = 0;
 static size_t s_prefetch_samples = 0;
 
 void ui_audio_prefetch_clear(void) {
-    free(s_prefetch_pcm);
-    s_prefetch_pcm = NULL;
     s_prefetch_channels = 0;
     s_prefetch_rate = 0;
     s_prefetch_samples = 0;
@@ -1098,11 +1111,13 @@ bool ui_audio_prefetch(const char* path) {
     if (!path || !path[0]) return false;
     if (s_prefetch_pcm && strcmp(s_prefetch_audio_path, path) == 0) return true;
     if (!audio_buffer_ensure()) return false;
+    if (!s_prefetch_pcm) {
+        s_prefetch_pcm = (int16_t*)malloc(AUDIO_PCM_BYTES);
+        if (!s_prefetch_pcm) return false;
+    }
     int16_t* saved_pcm = s_audio_pcm;
     size_t saved_capacity = s_audio_capacity;
-    int16_t* buffer = (int16_t*)malloc(AUDIO_PCM_BYTES);
-    if (!buffer) return false;
-    s_audio_pcm = buffer;
+    s_audio_pcm = s_prefetch_pcm;
     s_audio_capacity = AUDIO_PCM_BYTES;
     int channels = 0;
     int rate = 0;
@@ -1111,11 +1126,12 @@ bool ui_audio_prefetch(const char* path) {
     s_audio_pcm = saved_pcm;
     s_audio_capacity = saved_capacity;
     if (!ok || samples == 0) {
-        free(buffer);
+        s_prefetch_channels = 0;
+        s_prefetch_rate = 0;
+        s_prefetch_samples = 0;
+        s_prefetch_audio_path[0] = '\0';
         return false;
     }
-    free(s_prefetch_pcm);
-    s_prefetch_pcm = buffer;
     s_prefetch_channels = channels;
     s_prefetch_rate = rate;
     s_prefetch_samples = samples;
@@ -1141,10 +1157,11 @@ bool ui_audio_play(const char* path) {
     if (!audio_buffer_ensure()) return false;
     if (s_prefetch_pcm && strcmp(s_prefetch_audio_path, path) == 0
         && s_prefetch_samples > 0
-        && s_prefetch_samples * sizeof(int16_t) <= s_audio_capacity
         && audio_ndsp_ensure()) {
-        memcpy(s_audio_pcm, s_prefetch_pcm, s_prefetch_samples * sizeof(int16_t));
-        if (audio_start(s_prefetch_channels, s_prefetch_rate, s_prefetch_samples)) {
+        size_t need = s_prefetch_samples * sizeof(int16_t);
+        size_t n = need > s_audio_capacity ? s_audio_capacity : need;
+        memcpy(s_audio_pcm, s_prefetch_pcm, n);
+        if (n == need && audio_start(s_prefetch_channels, s_prefetch_rate, s_prefetch_samples)) {
             return true;
         }
     }
@@ -1991,6 +2008,19 @@ void ui_draw_nav_tab(float x, float y, float w, float h, const char* label, int 
     ui_draw_text_centered(icon_cx, y + 26.0f, 0.42f, color, label);
 }
 
+#define TRUNC_CACHE_SLOTS 32
+#define TRUNC_CACHE_TEXT 192
+
+typedef struct {
+    uint32_t hash;
+    size_t len;
+    float max_w;
+    char text[TRUNC_CACHE_TEXT];
+    bool valid;
+} TruncCacheEntry;
+
+static TruncCacheEntry s_trunc_cache[TRUNC_CACHE_SLOTS];
+
 void ui_draw_deck_row(float y, float w, const char* name, int level, bool has_children, bool expanded,
                      uint32_t due_count, uint32_t new_count, uint32_t learn_count, bool selected) {
     float h = 24.0f;
@@ -2016,24 +2046,45 @@ void ui_draw_deck_row(float y, float w, const char* name, int level, bool has_ch
     size_t bytes = strlen(name);
     if (bytes > sizeof(disp_name) - 4) bytes = sizeof(disp_name) - 4;
     while (bytes && ((unsigned char)name[bytes] & 0xc0) == 0x80) bytes--;
-    memcpy(disp_name, name, bytes);
-    disp_name[bytes] = '\0';
-    if (ui_get_text_width(0.50f, disp_name) > max_name_w) {
-        size_t ends[1024], n = 0;
-        for (size_t i = 0; i < bytes; i++) {
-            if (((unsigned char)name[i] & 0xc0) != 0x80) ends[n++] = i;
+    uint32_t trunc_hash = 5381;
+    for (size_t i = 0; i < bytes; i++) trunc_hash = trunc_hash * 33u + (unsigned char)name[i];
+    TruncCacheEntry* trunc_entry = &s_trunc_cache[trunc_hash & (TRUNC_CACHE_SLOTS - 1)];
+    bool trunc_hit = trunc_entry->valid && trunc_entry->hash == trunc_hash
+        && trunc_entry->len == bytes && trunc_entry->max_w == max_name_w;
+    if (trunc_hit) {
+        size_t cached_len = strlen(trunc_entry->text);
+        if (cached_len >= sizeof(disp_name)) cached_len = sizeof(disp_name) - 1;
+        memcpy(disp_name, trunc_entry->text, cached_len);
+        disp_name[cached_len] = '\0';
+    } else {
+        memcpy(disp_name, name, bytes);
+        disp_name[bytes] = '\0';
+        if (ui_get_text_width(0.50f, disp_name) > max_name_w) {
+            uint16_t ends[1024];
+            size_t n = 0;
+            for (size_t i = 0; i < bytes; i++) {
+                if (((unsigned char)name[i] & 0xc0) != 0x80) ends[n++] = (uint16_t)i;
+            }
+            size_t low = 0, high = n;
+            while (low < high) {
+                size_t mid = (low + high + 1) / 2;
+                size_t cut = mid < n ? ends[mid] : bytes;
+                memcpy(disp_name, name, cut);
+                strcpy(disp_name + cut, "...");
+                if (ui_get_text_width(0.50f, disp_name) <= max_name_w) low = mid;
+                else high = mid - 1;
+            }
+            size_t cut = low < n ? ends[low] : bytes;
+            memcpy(disp_name, name, cut); strcpy(disp_name + cut, "...");
         }
-        size_t low = 0, high = n;
-        while (low < high) {
-            size_t mid = (low + high + 1) / 2;
-            size_t cut = mid < n ? ends[mid] : bytes;
-            memcpy(disp_name, name, cut);
-            strcpy(disp_name + cut, "...");
-            if (ui_get_text_width(0.50f, disp_name) <= max_name_w) low = mid;
-            else high = mid - 1;
+        size_t disp_len = strlen(disp_name);
+        if (disp_len < sizeof(trunc_entry->text)) {
+            trunc_entry->hash = trunc_hash;
+            trunc_entry->len = bytes;
+            trunc_entry->max_w = max_name_w;
+            memcpy(trunc_entry->text, disp_name, disp_len + 1);
+            trunc_entry->valid = true;
         }
-        size_t cut = low < n ? ends[low] : bytes;
-        memcpy(disp_name, name, cut); strcpy(disp_name + cut, "...");
     }
 
     ui_draw_text(indent, y + 4.0f, 0.50f, g_theme.text, disp_name);

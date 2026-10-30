@@ -891,11 +891,18 @@ impl Backend {
             .find(|c| c.id == deck.config_id)
             .ok_or("deck config missing")?;
         let inner = config.config.as_ref().ok_or("config missing")?;
-        let limits = deck.limits.as_ref();
-        let new = limits.and_then(|l| l.new).unwrap_or(inner.new_per_day);
-        let reviews = limits
-            .and_then(|l| l.review)
-            .unwrap_or(inner.reviews_per_day);
+        let l = deck.limits.clone().unwrap_or_default();
+        let today_new = l.new_today_active.then_some(l.new_today).flatten();
+        let today_reviews = l.review_today_active.then_some(l.review_today).flatten();
+        let limit_scope = if today_new.is_some() || today_reviews.is_some() {
+            LimitScope::TodayOnly
+        } else if l.new.is_some() || l.review.is_some() {
+            LimitScope::ThisDeck
+        } else {
+            LimitScope::Preset
+        };
+        let new = today_new.or(l.new).unwrap_or(inner.new_per_day);
+        let reviews = today_reviews.or(l.review).unwrap_or(inner.reviews_per_day);
         let learn_steps = inner.learn_steps.clone();
         let relearn_steps = inner.relearn_steps.clone();
         let insert_order = inner.new_card_insert_order;
@@ -914,6 +921,13 @@ impl Backend {
             deck_id,
             new,
             reviews,
+            limit_scope,
+            preset_new: inner.new_per_day,
+            preset_reviews: inner.reviews_per_day,
+            deck_new: l.new,
+            deck_reviews: l.review,
+            today_new,
+            today_reviews,
             learn_steps,
             relearn_steps,
             insert_order,
@@ -942,8 +956,8 @@ impl Backend {
             .find(|c| c.id == current.config_id)
             .ok_or("deck config missing")?;
         let inner = config.config.as_mut().ok_or("config missing")?;
-        inner.new_per_day = options.new;
-        inner.reviews_per_day = options.reviews;
+        inner.new_per_day = options.preset_new;
+        inner.reviews_per_day = options.preset_reviews;
         inner.learn_steps = options.learn_steps.clone();
         inner.relearn_steps = options.relearn_steps.clone();
         inner.new_card_insert_order = options.insert_order;
@@ -964,8 +978,30 @@ impl Backend {
             }
         }
         let mut limits = current.limits.clone().unwrap_or_default();
-        limits.new = Some(options.new);
-        limits.review = Some(options.reviews);
+        match options.limit_scope {
+            LimitScope::Preset => {
+                inner.new_per_day = options.new;
+                inner.reviews_per_day = options.reviews;
+                limits.new = None;
+                limits.review = None;
+                limits.new_today = None;
+                limits.review_today = None;
+            }
+            LimitScope::ThisDeck => {
+                limits.new = Some(options.new);
+                limits.review = Some(options.reviews);
+                limits.new_today = None;
+                limits.review_today = None;
+            }
+            LimitScope::TodayOnly => {
+                limits.new = options.deck_new;
+                limits.review = options.deck_reviews;
+                limits.new_today = Some(options.new);
+                limits.review_today = Some(options.reviews);
+            }
+        }
+        limits.new_today_active = limits.new_today.is_some();
+        limits.review_today_active = limits.review_today.is_some();
         let request = anki_proto::deck_config::UpdateDeckConfigsRequest {
             target_deck_id: options.deck_id,
             configs: vec![config],
@@ -1075,10 +1111,46 @@ pub struct NoteDraft {
     pub deck_id: i64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LimitScope {
+    Preset,
+    ThisDeck,
+    TodayOnly,
+}
+
+impl LimitScope {
+    pub fn cycle(self, delta: i32) -> Self {
+        let order = [Self::Preset, Self::ThisDeck, Self::TodayOnly];
+        let index = order.iter().position(|scope| *scope == self).unwrap_or(0);
+        let count = order.len() as i32;
+        order[((index as i32 + delta).rem_euclid(count)) as usize]
+    }
+}
+
+impl DeckOptions {
+    pub fn set_scope(&mut self, scope: LimitScope) {
+        self.limit_scope = scope;
+        let (n, r) = match scope {
+            LimitScope::Preset => (Some(self.preset_new), Some(self.preset_reviews)),
+            LimitScope::ThisDeck => (self.deck_new, self.deck_reviews),
+            LimitScope::TodayOnly => (self.today_new, self.today_reviews),
+        };
+        self.new = n.or(self.deck_new).unwrap_or(self.preset_new);
+        self.reviews = r.or(self.deck_reviews).unwrap_or(self.preset_reviews);
+    }
+}
+
 pub struct DeckOptions {
     pub deck_id: i64,
     pub new: u32,
     pub reviews: u32,
+    pub limit_scope: LimitScope,
+    pub preset_new: u32,
+    pub preset_reviews: u32,
+    pub deck_new: Option<u32>,
+    pub deck_reviews: Option<u32>,
+    pub today_new: Option<u32>,
+    pub today_reviews: Option<u32>,
     pub learn_steps: Vec<f32>,
     pub relearn_steps: Vec<f32>,
     pub insert_order: i32,

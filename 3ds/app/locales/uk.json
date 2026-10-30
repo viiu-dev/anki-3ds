@@ -204,5 +204,9 @@
     "A opens or changes. B returns.": "A відкриває або змінює. B повертає.",
     "Choose an option. A applies. B returns.": "Виберіть варіант. A застосовує. B повертає.",
     "Console LEDs": "Світлодіоди консолі",
-    "Console LEDs: {0}": "Світлодіоди консолі: {0}"
+    "Console LEDs: {0}": "Світлодіоди консолі: {0}",
+    "Limits apply to": "Limits apply to",
+    "Preset": "Preset",
+    "This deck": "This deck",
+    "Today only": "Today only"
 }

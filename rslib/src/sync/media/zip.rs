@@ -12,6 +12,7 @@ use unicode_normalization::is_nfc;
 use zip::write::FileOptions;
 use zip::ZipWriter;
 
+use crate::media::files::normalize_filename;
 use crate::media::files::sha1_of_data;
 use crate::prelude::*;
 use crate::sync::media::MAX_INDIVIDUAL_MEDIA_FILE_SIZE;
@@ -107,6 +108,14 @@ pub fn unzip_and_validate_files(zip_data: &[u8]) -> Result<Vec<UploadedChange>> 
     entries
         .into_iter()
         .map(|entry| {
+            if entry.actual_filename.is_empty()
+                || entry.actual_filename == "."
+                || entry.actual_filename == ".."
+                || entry.actual_filename.contains(['/', '\\', '\0'])
+                || normalize_filename(&entry.actual_filename).as_ref() != entry.actual_filename
+            {
+                invalid_input!("unsafe filename: {}", entry.actual_filename.len());
+            }
             if entry.actual_filename.len() > MAX_MEDIA_FILENAME_LENGTH_SERVER {
                 invalid_input!("filename too long: {}", entry.actual_filename.len());
             }

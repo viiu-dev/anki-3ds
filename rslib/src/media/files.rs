@@ -798,6 +798,11 @@ pub struct AddedFile {
     pub renamed_from: Option<String>,
 }
 
+/// Largest single media file accepted from a sync download. The zip header
+/// size is untrusted, so the streaming writer below enforces this on the
+/// bytes it actually writes.
+pub(crate) const MAX_DOWNLOADED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Add a file received from AnkiWeb into the media folder.
 ///
 /// Because AnkiWeb did not previously enforce file name limits and invalid
@@ -889,7 +894,13 @@ pub(crate) fn add_file_from_ankiweb_streaming(
             return Err(AnkiError::Interrupted);
         }
         let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
+        // the .take() is because we don't trust the reader to be bounded
+        reader
+            .take(MAX_DOWNLOADED_FILE_BYTES + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > MAX_DOWNLOADED_FILE_BYTES {
+            invalid_input!("media file exceeds download limit");
+        }
         add_file_from_ankiweb(media_folder, fname, &data)
     }
 }
@@ -906,14 +917,20 @@ fn write_file_hashing(
     };
     let mut buf = [0u8; 64 * 1024];
     let mut interrupted = false;
+    let mut total: u64 = 0;
+    // the .take() is because we don't trust the zip header to be correct
+    let mut limited = reader.by_ref().take(MAX_DOWNLOADED_FILE_BYTES + 1);
     loop {
         if cancelled() {
             interrupted = true;
             break;
         }
-        match reader.read(&mut buf) {
+        match limited.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => writer.write_all(&buf[..n])?,
+            Ok(n) => {
+                total += n as u64;
+                writer.write_all(&buf[..n])?
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
@@ -923,6 +940,11 @@ fn write_file_hashing(
         drop(inner);
         let _ = fs::remove_file(path);
         return Err(AnkiError::Interrupted);
+    }
+    if total > MAX_DOWNLOADED_FILE_BYTES {
+        drop(inner);
+        let _ = fs::remove_file(path);
+        invalid_input!("media file exceeds download limit");
     }
     inner.flush()?;
     drop(inner);

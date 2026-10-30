@@ -22,6 +22,7 @@ use std::time::Instant;
 use anki_proto::decks::DeckTreeNode;
 use backend::Backend;
 use backend::DeckOptions;
+use backend::LimitScope;
 use backend::NoteDraft;
 use backend::OfferedCard;
 use ctru::prelude::*;
@@ -776,6 +777,7 @@ fn browse_row(y: f32, title: &str, selected: bool) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OptField {
     Section,
+    LimitScope,
     NewLimit,
     ReviewLimit,
     LearnSteps,
@@ -790,7 +792,7 @@ enum OptField {
     BuryReviews,
 }
 
-const OPTION_ROWS: usize = 17;
+const OPTION_ROWS: usize = 18;
 
 fn format_steps(steps: &[f32]) -> String {
     steps
@@ -889,17 +891,35 @@ fn new_mix_label(value: i32) -> String {
     .to_owned()
 }
 
+fn limit_value(options: &DeckOptions, value: u32, preset: u32) -> String {
+    if options.limit_scope == LimitScope::Preset {
+        value.to_string()
+    } else {
+        format!("{value} ({}: {preset})", tr("Preset"))
+    }
+}
+
 fn option_rows(options: &DeckOptions) -> Vec<(String, String, OptField)> {
     vec![
         (tr("Daily limits").into(), String::new(), OptField::Section),
         (
+            tr("Limits apply to").into(),
+            tr(match options.limit_scope {
+                LimitScope::Preset => "Preset",
+                LimitScope::ThisDeck => "This deck",
+                LimitScope::TodayOnly => "Today only",
+            })
+            .to_owned(),
+            OptField::LimitScope,
+        ),
+        (
             tr("New cards/day").into(),
-            options.new.to_string(),
+            limit_value(options, options.new, options.preset_new),
             OptField::NewLimit,
         ),
         (
             tr("Maximum reviews/day").into(),
-            options.reviews.to_string(),
+            limit_value(options, options.reviews, options.preset_reviews),
             OptField::ReviewLimit,
         ),
         (tr("New cards").into(), String::new(), OptField::Section),
@@ -1666,6 +1686,11 @@ fn main() {
     i18n::init();
     theme::init();
     leds::init();
+    // Hold one SOC handle for the app's lifetime, so the shared service never
+    // drops to zero references between syncs and the static buffer is never
+    // re-initialised.
+    #[cfg(target_os = "horizon")]
+    let _soc_guard = anki_3ds_sync_transport::soc::NativeSoc::new().ok();
     Ui::apply_theme();
     Ui::set_battery_linear(i18n::battery_linear());
     let startup_error = assets::prepare()
@@ -1792,6 +1817,13 @@ fn main() {
     let mut script_step = 0;
     let mut script_cooldown = 120;
     let mut last_state = String::new();
+    let mut last_media_running = false;
+    let mut last_media_processed = usize::MAX;
+    let mut last_media_checked = 0usize;
+    let mut last_media_result: Option<String> = None;
+    let mut last_clock_known = false;
+    let mut cached_media_status: Option<String> = None;
+    let mut cached_footer = String::new();
     let mut daily_studied = String::new();
     let mut rating_feedback: Option<(i32, Instant)> = None;
     let mut leech_notice: Option<(String, Instant)> = None;
@@ -1799,6 +1831,7 @@ fn main() {
     let trace_touch = fs::metadata("sdmc:/3ds/anki-3ds/trace-touch").is_ok();
 
     while apt.main_loop() {
+        leds::poll_wakeup();
         if let Some(result) = clock_job.as_mut().and_then(clock::Job::poll) {
             clock_job = None;
             match result {
@@ -3221,6 +3254,9 @@ fn main() {
                                 .unwrap_or(OptField::Section);
                             match kind {
                                 OptField::Section => {}
+                                OptField::LimitScope => {
+                                    options.set_scope(options.limit_scope.cycle(1))
+                                }
                                 OptField::NewLimit
                                 | OptField::ReviewLimit
                                 | OptField::LeechThreshold
@@ -3422,6 +3458,15 @@ fn main() {
                                 selected = decks.iter().position(|d| d.id == id).unwrap_or(0);
                                 scroll_pos = scroll_pos.min(decks.len().saturating_sub(ROWS));
                             }
+                        }
+                    } else if let Screen::Options { options, field } = &mut screen {
+                        let kind = option_rows(options)
+                            .get(*field)
+                            .map(|row| row.2)
+                            .unwrap_or(OptField::Section);
+                        if kind == OptField::LimitScope {
+                            let delta = if matches!(action, Action::Right) { 1 } else { -1 };
+                            options.set_scope(options.limit_scope.cycle(delta));
                         }
                     } else if let Screen::Menu { selected, .. } = &mut screen {
                         *selected = if matches!(action, Action::Right) {
@@ -3659,27 +3704,52 @@ fn main() {
             last_state = state.into();
         }
 
-        let media_status = media_job
+        let media_running_now = media_job
             .as_ref()
-            .filter(|active| active.is_running())
-            .map(|active| {
-                let processed = active.processed_files();
-                if processed > 0 {
-                    i18n::format("{0} files", &[&processed.to_string()])
+            .is_some_and(|active| active.is_running());
+        let media_processed_now = media_job
+            .as_ref()
+            .map(|active| active.processed_files())
+            .unwrap_or(0);
+        let media_checked_now = media_job
+            .as_ref()
+            .map(|active| active.checked_files())
+            .unwrap_or(0);
+        let media_result_now = media_result.as_ref().and_then(|text| {
+            (Instant::now() < media_notice_until).then(|| text.as_str())
+        });
+        let clock_known_now = clock::is_known();
+        if media_running_now != last_media_running
+            || media_processed_now != last_media_processed
+            || media_checked_now != last_media_checked
+            || media_result_now != last_media_result.as_deref()
+            || clock_known_now != last_clock_known
+        {
+            last_media_running = media_running_now;
+            last_media_processed = media_processed_now;
+            last_media_checked = media_checked_now;
+            last_media_result = media_result_now.map(str::to_owned);
+            last_clock_known = clock_known_now;
+            cached_media_status = if media_running_now {
+                Some(if media_processed_now > 0 {
+                    i18n::format("{0} files", &[&media_processed_now.to_string()])
+                } else if media_checked_now > 0 {
+                    i18n::format("checking {0} files", &[&media_checked_now.to_string()])
                 } else {
-                    let checked = active.checked_files();
-                    if checked > 0 {
-                        i18n::format("checking {0} files", &[&checked.to_string()])
-                    } else {
-                        tr("starting").to_owned()
-                    }
-                }
-            })
-            .or_else(|| {
-                media_result
-                    .as_ref()
-                    .and_then(|text| (Instant::now() < media_notice_until).then(|| text.clone()))
-            });
+                    tr("starting").to_owned()
+                })
+            } else {
+                last_media_result.clone()
+            };
+            cached_footer = if let Some(status) = cached_media_status.as_deref() {
+                i18n::format("Media sync: {0}", &[status])
+            } else if clock_known_now {
+                tr("Menu [SELECT]                      Options").to_owned()
+            } else {
+                tr("Clock will update when connected").to_owned()
+            };
+        }
+        let media_status = cached_media_status.as_deref();
         Ui::frame_begin();
         frame = frame.wrapping_add(1);
         Ui::target_top(current_theme().bg_top);
@@ -4370,14 +4440,7 @@ fn main() {
                 | Screen::SettingsChoice { .. }
         );
         if !hide_footer {
-            let text = if let Some(status) = &media_status {
-                i18n::format("Media sync: {0}", &[status])
-            } else if clock::is_known() {
-                tr("Menu [SELECT]                      Options").to_owned()
-            } else {
-                tr("Clock will update when connected").to_owned()
-            };
-            footer(&text);
+            footer(&cached_footer);
         }
         Ui::frame_end();
     }
@@ -4393,7 +4456,7 @@ fn main() {
     drop(media_job.take());
     prefetch.stop();
     Ui::fini();
-    leds::restore();
+    leds::shutdown();
     if let Some(backend) = backend {
         match backend.close() {
             Ok(()) => event("CLOSE_OK"),

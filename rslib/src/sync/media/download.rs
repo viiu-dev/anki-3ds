@@ -11,9 +11,9 @@ use tracing::warn;
 
 use crate::error;
 use crate::media::files::add_file_from_ankiweb_streaming;
+use crate::media::files::normalize_filename;
 use crate::media::files::AddedFile;
-
-const MAX_DOWNLOADED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+use crate::media::files::MAX_DOWNLOADED_FILE_BYTES;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DownloadFilesRequest {
@@ -61,6 +61,15 @@ pub(crate) fn extract_into_media_folder(
             continue;
         };
         let real_name = real_name.as_str();
+        if real_name.is_empty()
+            || real_name.contains(['/', '\\', '\0'])
+            || real_name == "."
+            || real_name == ".."
+            || normalize_filename(real_name).as_ref() != real_name
+        {
+            warn!(name = real_name, "skipping unsafe media filename");
+            continue;
+        }
 
         if file.size() > MAX_DOWNLOADED_FILE_BYTES {
             warn!(

@@ -5,6 +5,7 @@
 #include <3ds.h>
 #include <curl/curl.h>
 #include <malloc.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -30,6 +31,8 @@ struct ResponseBuffer {
     uint32_t sampled_heap_peak;
     FILE *file;
     const Anki3dsRequestOptions *options;
+    Anki3dsHttpResponse *resp;
+    curl_off_t content_length;
 };
 
 static CURL *g_easy[HTTPS_SLOT_COUNT];
@@ -47,7 +50,8 @@ static int g_dns_cache_next[HTTPS_SLOT_COUNT];
 static size_t header_cb(char *data, size_t size, size_t count, void *context) {
     if (size && count > SIZE_MAX / size) return 0;
     size_t bytes = size * count;
-    Anki3dsHttpResponse *response = context;
+    struct ResponseBuffer *buf = context;
+    Anki3dsHttpResponse *response = buf->resp;
     if (bytes >= 5 && !strncmp(data, "HTTP/", 5)) response->server_time = 0;
     if (bytes > 5 && bytes < 128 && !strncasecmp(data, "Date:", 5)) {
         char value[128];
@@ -55,6 +59,21 @@ static size_t header_cb(char *data, size_t size, size_t count, void *context) {
         value[bytes - 5] = 0;
         time_t date = curl_getdate(value, NULL);
         if (date > 0) response->server_time = (int64_t)date;
+    }
+    if (bytes > 15 && !strncasecmp(data, "Content-Length:", 15)) {
+        size_t i = 15;
+        while (i < bytes && (data[i] == ' ' || data[i] == '\t')) i++;
+        uint64_t length = 0;
+        while (i < bytes && data[i] >= '0' && data[i] <= '9') {
+            length = length * 10 + (uint64_t)(data[i] - '0');
+            if (length > (uint64_t)SIZE_MAX) {
+                length = (uint64_t)SIZE_MAX;
+                break;
+            }
+            i++;
+        }
+        buf->content_length = (curl_off_t)(length > (uint64_t)INT64_MAX
+            ? INT64_MAX : length);
     }
     return bytes;
 }
@@ -73,8 +92,15 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
     }
     if (bytes > MAX_RESPONSE_BYTES - buf->size) return 0;
     if (buf->size + bytes > buf->capacity) {
-        size_t new_cap = (buf->capacity == 0) ? IO_BUFFER_BYTES : buf->capacity * 2;
-        while (new_cap < buf->size + bytes) {
+        size_t need = buf->size + bytes;            /* safe: bytes <= MAX - size */
+        size_t new_cap = buf->capacity ? buf->capacity : IO_BUFFER_BYTES;
+        if (buf->capacity == 0 && buf->content_length > 0
+            && (uint64_t)buf->content_length <= MAX_RESPONSE_BYTES
+            && (size_t)buf->content_length > new_cap) {
+            new_cap = (size_t)buf->content_length;
+        }
+        while (new_cap < need) {
+            if (new_cap > MAX_RESPONSE_BYTES / 2) { new_cap = MAX_RESPONSE_BYTES; break; }
             new_cap *= 2;
         }
         uint8_t *new_ptr = realloc(buf->data, new_cap);
@@ -196,6 +222,8 @@ static int request_with_ip(
 
     struct ResponseBuffer rx_buf = {0};
     rx_buf.options = options;
+    rx_buf.resp = out_resp;
+    rx_buf.content_length = -1;
     rx_buf.io_timeout_ms = timeout_ms;
     rx_buf.deadline = osGetTime() + (uint64_t)timeout_ms;
 
@@ -236,7 +264,7 @@ static int request_with_ip(
 
     curl_easy_setopt(easy, CURLOPT_URL, url);
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, header_cb);
-    curl_easy_setopt(easy, CURLOPT_HEADERDATA, out_resp);
+    curl_easy_setopt(easy, CURLOPT_HEADERDATA, &rx_buf);
     curl_easy_setopt(easy, CURLOPT_RESOLVE, resolve);
     curl_easy_setopt(easy, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS_STR, "https");

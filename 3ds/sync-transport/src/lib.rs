@@ -67,6 +67,37 @@ use thiserror::Error;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
+const ZSTD_LEVEL_3DS: i32 = 1;
+const ZSTD_WINDOW_LOG_3DS: u32 = 17; // 128 KiB window
+
+fn low_mem_encoder<W: std::io::Write>(
+    w: W,
+    pledged: Option<u64>,
+) -> std::io::Result<zstd::Encoder<'static, W>> {
+    use zstd::zstd_safe::CParameter;
+    let mut enc = zstd::Encoder::new(w, ZSTD_LEVEL_3DS)?;
+    enc.set_parameter(CParameter::WindowLog(ZSTD_WINDOW_LOG_3DS))?;
+    enc.set_parameter(CParameter::HashLog(15))?;
+    enc.set_parameter(CParameter::ChainLog(15))?;
+    enc.set_parameter(CParameter::Strategy(zstd::zstd_safe::Strategy::ZSTD_fast))?;
+    enc.set_parameter(CParameter::NbWorkers(0))?;
+    if let Some(n) = pledged {
+        enc.set_pledged_src_size(Some(n))?;
+    }
+    enc.include_checksum(false)?;
+    Ok(enc)
+}
+
+fn compress_low_mem(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let cap = zstd::zstd_safe::compress_bound(data.len()).min(MAX_RESPONSE_BYTES);
+    let mut out = Vec::new();
+    out.try_reserve_exact(cap)
+        .map_err(|_| std::io::Error::other("out of memory reserving compression buffer"))?;
+    let mut enc = low_mem_encoder(out, Some(data.len() as u64))?;
+    std::io::Write::write_all(&mut enc, data)?;
+    enc.finish()
+}
+
 pub const DEFAULT_ANKIWEB_HOST: &str = "sync.ankiweb.net";
 pub const DEFAULT_SYNC_PATH_META: &str = "/sync/meta";
 pub const DEFAULT_SYNC_PATH_HOSTKEY: &str = "/sync/hostKey";
@@ -442,7 +473,7 @@ impl NativeSyncClient {
             source: None,
         })?;
 
-        let compressed_body = zstd::encode_all(&request.data[..], 0).map_err(|e| HttpError {
+        let compressed_body = compress_low_mem(&request.data).map_err(|e| HttpError {
             code: StatusCode::INTERNAL_SERVER_ERROR,
             context: format!("failed to compress request body: {e}"),
             source: None,
@@ -940,7 +971,11 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
         use anki::sync::request::IntoSyncRequest;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let compressed = storage::tempfile(parent, ".sync-").map_err(io_http)?;
-        let mut encoder = zstd::Encoder::new(compressed.as_file(), 0).map_err(io_http)?;
+        let mut encoder = low_mem_encoder(
+            compressed.as_file(),
+            std::fs::metadata(path).ok().map(|m| m.len()),
+        )
+        .map_err(io_http)?;
         let mut input = std::fs::File::open(path).map_err(io_http)?;
         copy_with_cancel(&mut input, &mut encoder, &self.cancel).map_err(|e| self.file_error(e))?;
         encoder
