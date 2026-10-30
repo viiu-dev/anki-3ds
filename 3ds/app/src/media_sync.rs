@@ -289,7 +289,7 @@ fn sync_with_recovery(
     if cancel.load(Ordering::Acquire) {
         return Err(State::Cancelled);
     }
-    let error = match run_with_resume(&manager, progress, client, config, cancel) {
+    let error = match run_with_resume(manager, progress, client, config, cancel) {
         Ok(()) => return Ok(()),
         Err(error) if is_interrupted(&error) => return Err(State::Cancelled),
         Err(error) => error,
@@ -308,7 +308,7 @@ fn sync_with_recovery(
             changed.fetch_add(1, Ordering::Release);
         }
     }
-    match run_with_resume(&manager, progress, client, config, cancel) {
+    match run_with_resume(manager, progress, client, config, cancel) {
         Ok(()) => Ok(()),
         Err(error) if is_interrupted(&error) => Err(State::Cancelled),
         Err(error) => Err(State::Failed(super::error_text(&error))),
@@ -316,16 +316,30 @@ fn sync_with_recovery(
 }
 
 fn run_with_resume(
-    manager: &anki::media::MediaManager,
+    initial: anki::media::MediaManager,
     progress: &Arc<Mutex<ProgressState>>,
     client: &NativeSyncClient,
     config: &impl Fn() -> MediaSyncConfig,
     cancel: &AtomicBool,
 ) -> Result<(), anki::error::AnkiError> {
+    // sync_media_with_config consumes the manager, so each resume attempt
+    // re-opens it; the first attempt reuses the already-opened one.
+    let mut manager = Some(initial);
+    let mut last_error: Option<anki::error::AnkiError> = None;
     let mut attempts = 0u32;
     loop {
+        let mgr = match manager.take() {
+            Some(m) => m,
+            None => match super::backend::open_media_manager() {
+                Ok(m) => m,
+                Err(open_error) => {
+                    super::event(&format!("MEDIA_DB_REOPEN_ERROR {open_error}"));
+                    return Err(last_error.unwrap_or(anki::error::AnkiError::Interrupted));
+                }
+            },
+        };
         let handler = ThrottlingProgressHandler::<MediaSyncProgress>::new(progress.clone());
-        match block_on(manager.sync_media_with_config(handler, client.clone(), None, config())) {
+        match block_on(mgr.sync_media_with_config(handler, client.clone(), None, config())) {
             Ok(()) => return Ok(()),
             Err(e) if is_interrupted(&e) => return Err(e),
             Err(e)
@@ -341,6 +355,7 @@ fn run_with_resume(
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
+                last_error = Some(e);
             }
             Err(e) => return Err(e),
         }

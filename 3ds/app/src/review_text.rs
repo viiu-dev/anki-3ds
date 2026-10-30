@@ -332,18 +332,31 @@ pub enum MediaKind {
     Video,
 }
 
-/// Classify a media filename by extension. Video extensions (mp4, webm, avi,
-/// mov, mkv) and animated images (gif, webp) are `Video` so that
-/// `[sound:clip.mp4]` is routed to the animated-media player instead of the
-/// audio/image paths.
+/// Whether a media filename names a real video container. Animated images
+/// (gif, webp) are handled separately because they need a decoded frame count.
+pub fn is_video_filename(filename: &str) -> bool {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "mp4" | "webm" | "avi" | "mov" | "mkv" | "ogv")
+}
+
+/// Classify a media filename by extension. Video files and animated-image
+/// candidates (gif, webp) are `Video` so that `[sound:clip.mp4]` is routed to
+/// the animated-media player instead of the audio/image paths.
 pub fn media_kind_for_filename(filename: &str) -> MediaKind {
+    if is_video_filename(filename) {
+        return MediaKind::Video;
+    }
     let ext = filename
         .rsplit('.')
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "mp4" | "webm" | "avi" | "mov" | "mkv" | "gif" | "webp" => MediaKind::Video,
+        "gif" | "webp" => MediaKind::Video,
         "mp3" | "ogg" | "oga" | "opus" | "wav" | "wave" => MediaKind::Audio,
         _ => MediaKind::Image,
     }
@@ -3429,6 +3442,22 @@ mod tests {
                 _ => [].iter(),
             })
             .any(|inline| matches!(inline, Inline::Media { .. })));
+    }
+
+    #[test]
+    fn media_extensions_distinguish_video_audio_and_stills() {
+        for name in ["clip.mp4", "clip.WEBM", "clip.avi", "clip.mkv", "clip.ogv"] {
+            assert!(is_video_filename(name), "{name}");
+            assert_eq!(media_kind_for_filename(name), MediaKind::Video);
+        }
+        assert_eq!(media_kind_for_filename("still.webp"), MediaKind::Video);
+        assert_eq!(media_kind_for_filename("still.gif"), MediaKind::Video);
+        assert_eq!(media_kind_for_filename("sound.mp3"), MediaKind::Audio);
+        assert_eq!(media_kind_for_filename("sound.opus"), MediaKind::Audio);
+        assert_eq!(media_kind_for_filename("picture.svg"), MediaKind::Image);
+        assert_eq!(media_kind_for_filename("picture.png"), MediaKind::Image);
+        assert_eq!(media_kind_for_filename("picture.jpg"), MediaKind::Image);
+        assert_eq!(media_kind_for_filename("picture.bmp"), MediaKind::Image);
     }
 
     #[test]

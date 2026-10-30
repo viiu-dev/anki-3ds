@@ -407,13 +407,13 @@ impl Ui {
 
     /// Open animated media. Returns the slot id, or `None` when the format
     /// is unsupported on this device (the caller draws a poster instead).
-    pub fn anim_open(path: &str) -> Option<(i32, i32, i32)> {
+    pub fn anim_open(path: &str) -> Option<(i32, i32, i32, i32)> {
         let c_str = CString::new(path.as_bytes()).ok()?;
         let mut width = 0;
         let mut height = 0;
         let mut frames = 0;
         let id = unsafe { ui_anim_open(c_str.as_ptr(), &mut width, &mut height, &mut frames) };
-        (id >= 0).then_some((id, width, height))
+        (id >= 0).then_some((id, width, height, frames))
     }
 
     pub fn anim_tick(id: i32, elapsed_ms: u32) {
@@ -810,10 +810,18 @@ pub struct AnimHandle {
     pub id: i32,
     pub width: f32,
     pub height: f32,
+    pub frames: i32,
     pub playing: bool,
     pub supported: bool,
     pub video: bool,
     pub autoplay: bool,
+}
+
+impl AnimHandle {
+    fn has_video_controls(&self) -> bool {
+        super::review_text::is_video_filename(&self.path)
+            || (self.supported && self.frames > 1 && is_animated_image(&self.path))
+    }
 }
 
 struct PlacedAnim {
@@ -907,6 +915,7 @@ pub struct RichTextLayout {
     codes: Vec<PlacedCode>,
     quote_bars: Vec<(f32, f32, f32)>,
     anims: Vec<AnimHandle>,
+    controls: Vec<AnimHandle>,
     placed_anims: Vec<PlacedAnim>,
     content_height: f32,
     ready: bool,
@@ -1038,9 +1047,9 @@ impl RichTextLayout {
         self.hint_order.clone()
     }
 
-    /// Animated media backing the card's `Inline::Media` boxes.
+    /// Media that should expose video controls on the bottom screen.
     pub fn media_items(&self) -> &[AnimHandle] {
-        &self.anims
+        &self.controls
     }
 
     /// Advance playing animations by the frame time. Call once per frame
@@ -1243,7 +1252,8 @@ impl RichTextLayout {
 
     /// Open animated media for the card, capped at one video and two animated
     /// images so a card cannot exhaust the frame budget. Rebuilds preserve
-    /// the playback state of already-open slots.
+    /// the playback state of already-open slots; clips beyond the cap remain
+    /// as posters so every video ref can still expose controls.
     fn open_anims(&mut self, blocks: &[Block]) {
         let known: Vec<i32> = self
             .anims
@@ -1251,25 +1261,28 @@ impl RichTextLayout {
             .filter_map(|anim| (anim.id >= 0).then_some(anim.id))
             .collect();
         self.anims.clear();
+        self.controls.clear();
         let mut medias = Vec::new();
         collect_media(blocks, &mut medias);
         let mut videos = 0usize;
         let mut animated = 0usize;
         for (path, autoplay, loop_) in medias {
             let animated_image = is_animated_image(&path);
-            if animated_image {
-                if animated >= 2 {
-                    continue;
-                }
+            let can_open = if animated_image {
+                let can = animated < 2;
                 animated += 1;
+                can
             } else {
-                if videos >= 1 {
-                    continue;
-                }
+                let can = videos < 1;
                 videos += 1;
-            }
-            let opened = resolve_anim_path(&path);
-            let (id, width, height) = opened.unwrap_or((-1, 0, 0));
+                can
+            };
+            let opened = if can_open {
+                resolve_anim_path(&path)
+            } else {
+                None
+            };
+            let (id, width, height, frames) = opened.unwrap_or((-1, 0, 0, 0));
             let supported = id >= 0 && width > 0 && height > 0;
             let fresh = supported && !known.contains(&id);
             let playing = if !supported {
@@ -1292,12 +1305,19 @@ impl RichTextLayout {
                 id,
                 width: width as f32,
                 height: height as f32,
+                frames,
                 playing,
                 supported,
                 video: !animated_image,
                 autoplay,
             });
         }
+        self.controls = self
+            .anims
+            .iter()
+            .filter(|anim| anim.has_video_controls())
+            .cloned()
+            .collect();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2913,7 +2933,7 @@ fn is_animated_image(path: &str) -> bool {
 
 /// Resolve a media filename to an open animation slot, trying the sharded
 /// media path first and the flat path second.
-fn resolve_anim_path(path: &str) -> Option<(i32, i32, i32)> {
+fn resolve_anim_path(path: &str) -> Option<(i32, i32, i32, i32)> {
     let name = path
         .rsplit(|ch| ch == '/' || ch == '\\')
         .next()

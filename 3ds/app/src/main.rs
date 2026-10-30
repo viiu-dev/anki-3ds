@@ -777,9 +777,19 @@ fn draw_media_bar(top_card: &RichTextLayout, review: &ReviewState, answer_side: 
         6,
         false,
     );
-    let label = format!("< {}/{} >", selected + 1, items.len());
-    Ui::draw_button(sel.0, y, sel.1, 24.0, &label, None, 6, false);
-    let bar_w = sel.0 + sel.1 - 8.0;
+    let show_selector = items.len() > 1;
+    if show_selector {
+        let label = format!("< {}/{} >", selected + 1, items.len());
+        Ui::draw_button(sel.0, y, sel.1, 24.0, &label, None, 6, false);
+    }
+    let bar_right = if show_selector {
+        sel.0 + sel.1
+    } else if answer_side {
+        228.0
+    } else {
+        312.0
+    };
+    let bar_w = bar_right - 8.0;
     Ui::draw_rect(8.0, y + 26.0, bar_w, 3.0, current_theme().surface_alt);
     let (fraction, state) = if finished {
         (1.0, current_theme().text_faint)
@@ -881,7 +891,8 @@ fn hint_chip_tap(top_card: &RichTextLayout, review: &ReviewState, x: f32) -> Act
 }
 
 fn media_bar_tap(top_card: &RichTextLayout, x: f32, answer_side: bool) -> Action {
-    if top_card.media_items().is_empty() {
+    let items = top_card.media_items();
+    if items.is_empty() {
         return Action::None;
     }
     // Must match draw_media_bar geometry.
@@ -894,7 +905,7 @@ fn media_bar_tap(top_card: &RichTextLayout, x: f32, answer_side: bool) -> Action
         Action::MediaReplay
     } else if x >= play.0 && x < play.0 + play.1 {
         Action::MediaToggle
-    } else if x >= sel.0 && x < sel.0 + sel.1 {
+    } else if items.len() > 1 && x >= sel.0 && x < sel.0 + sel.1 {
         Action::MediaSelect(if x < sel.0 + sel.1 / 2.0 { -1 } else { 1 })
     } else {
         Action::None
@@ -3476,7 +3487,10 @@ fn main() {
                     ));
                 }
                 Action::MediaToggle => {
-                    if let Some(anim) = top_card.media_items().get(review.media_sel) {
+                    let items = top_card.media_items();
+                    if let Some(anim) =
+                        items.get(review.media_sel.min(items.len().saturating_sub(1)))
+                    {
                         if anim.supported {
                             review.media_playing = !review.media_playing;
                             if review.media_playing && Ui::anim_finished(anim.id) {
