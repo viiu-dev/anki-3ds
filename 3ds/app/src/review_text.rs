@@ -20,7 +20,20 @@ pub fn plain(text: &str) -> String {
 /// Only Anki's generated cloze span changes color; other HTML remains intact
 /// for the rich renderer. Track nested spans so a formatting span inside a
 /// cloze cannot end its emphasis early.
+///
+/// Both the classic `class="cloze"` markup and newer variants (extra classes,
+/// single quotes, `data-cloze`/`data-ordinal` attributes) are recognised, as
+/// are `cloze-inactive` spans, which are tracked for nesting but get no
+/// markers of their own (the parser styles them muted via the class). Cloze
+/// hints such as `[...]` sit inside the active span, so they keep the active
+/// style automatically.
 pub fn mark_clozes(html: &str) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Span {
+        Other,
+        Active,
+        Inactive,
+    }
     let mut output = String::new();
     let mut spans = Vec::new();
     let mut remaining = html;
@@ -43,18 +56,22 @@ pub fn mark_clozes(html: &str) -> Option<String> {
         });
         let Some(end) = end else { break };
         let tag = &remaining[..end];
-        if tag.starts_with("</span") {
-            if spans.pop().unwrap_or(false) {
+        if is_span_close(tag) {
+            if spans.pop().unwrap_or(Span::Other) == Span::Active {
                 output.push(CLOZE_END);
             }
             output.push_str(tag);
-        } else if tag.starts_with("<span ") || tag == "<span>" {
-            // This exact class attribute is emitted by upstream cloze
-            // rendering.
-            let cloze = tag.starts_with("<span class=\"cloze\"");
-            spans.push(cloze);
+        } else if is_span_open(tag) {
+            let kind = if tag_is_active_cloze(tag) {
+                Span::Active
+            } else if tag_is_inactive_cloze(tag) {
+                Span::Inactive
+            } else {
+                Span::Other
+            };
+            spans.push(kind);
             output.push_str(tag);
-            if cloze {
+            if kind == Span::Active {
                 output.push(CLOZE_START);
                 found = true;
             }
@@ -65,6 +82,90 @@ pub fn mark_clozes(html: &str) -> Option<String> {
     }
     output.push_str(remaining);
     found.then_some(output)
+}
+
+fn tag_name_is(tag: &str, name: &str) -> bool {
+    let bytes = tag.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return false;
+    }
+    let mut rest = &tag[1..];
+    if let Some(stripped) = rest.strip_prefix('/') {
+        rest = stripped.trim_start();
+    }
+    rest.len() >= name.len()
+        && rest[..name.len()].eq_ignore_ascii_case(name)
+        && rest[name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '-' || ch == '_'))
+}
+
+fn is_span_open(tag: &str) -> bool {
+    tag_name_is(tag, "span") && !tag.trim_start_matches('<').starts_with('/')
+}
+
+fn is_span_close(tag: &str) -> bool {
+    tag_name_is(tag, "span") && tag.trim_start_matches('<').starts_with('/')
+}
+
+/// Read a `name=value` attribute from a raw tag. Handles double quotes,
+/// single quotes and bare values; the name match is case-insensitive.
+fn tag_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let lower = tag.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    while let Some(mut index) = search.find(name.to_lowercase().as_str()) {
+        // `search` borrows `lower`, so map the index back onto `tag`.
+        index += lower.len() - search.len();
+        let before = tag[..index].chars().next_back();
+        if before.is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | ':')) {
+            search = &lower[index + name.len()..];
+            continue;
+        }
+        let after = tag[index + name.len()..].trim_start();
+        let Some(value) = after.strip_prefix('=') else {
+            search = &lower[index + name.len()..];
+            continue;
+        };
+        let value = value.trim_start();
+        let start = tag.len() - value.len();
+        if let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            let quoted = &value[quote.len_utf8()..];
+            let end = quoted.find(quote).unwrap_or(quoted.len());
+            return Some(&tag[start + quote.len_utf8()..start + quote.len_utf8() + end]);
+        }
+        let end = value
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .unwrap_or(value.len());
+        return Some(&tag[start..start + end]);
+    }
+    None
+}
+
+fn tag_is_active_cloze(tag: &str) -> bool {
+    if let Some(class) = tag_attribute(tag, "class") {
+        let mut active = false;
+        for token in class.split_whitespace() {
+            if token.eq_ignore_ascii_case("cloze-inactive") {
+                return false;
+            }
+            if token.eq_ignore_ascii_case("cloze") {
+                active = true;
+            }
+        }
+        if active {
+            return true;
+        }
+    }
+    tag_attribute(tag, "data-cloze").is_some() || tag_attribute(tag, "data-ordinal").is_some()
+}
+
+fn tag_is_inactive_cloze(tag: &str) -> bool {
+    tag_attribute(tag, "class").is_some_and(|class| {
+        class
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("cloze-inactive"))
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,6 +179,25 @@ pub struct PitchStyle {
     pub accent: Option<u8>,
 }
 
+/// Baseline shift for an inline run. The parser keeps the legacy `sub`/`sup`
+/// booleans on [`Style`] in sync with this value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Script {
+    #[default]
+    Normal,
+    Sub,
+    Sup,
+}
+
+/// Diff colouring for type-answer comparisons (`typeGood`/`typeBad`/
+/// `typeMissed` spans emitted by the backend's answer comparison).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffClass {
+    Good,
+    Bad,
+    Missed,
+}
+
 /// Visual attributes for an inline run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Style {
@@ -87,6 +207,14 @@ pub struct Style {
     pub sub: bool,
     pub sup: bool,
     pub cloze: bool,
+    /// Active cloze deletion. [`Style::cloze`] mirrors this field.
+    pub cloze_active: bool,
+    /// Inactive cloze deletion (muted colour, no cloze background).
+    pub cloze_inactive: bool,
+    /// Monospace (`<code>` or a type-answer comparison block).
+    pub mono: bool,
+    pub script: Script,
+    pub diff: Option<DiffClass>,
     pub color: Option<[u8; 3]>,
     pub highlight: Option<[u8; 3]>,
     pub pitch: PitchStyle,
@@ -99,7 +227,34 @@ impl Style {
         self.underline |= other.underline;
         self.sub |= other.sub;
         self.sup |= other.sup;
-        self.cloze |= other.cloze;
+        self.mono |= other.mono;
+        if other.script != Script::Normal {
+            self.script = other.script;
+        }
+        if other.diff.is_some() {
+            self.diff = other.diff;
+        }
+        if other.cloze_inactive {
+            self.cloze_inactive = true;
+            self.cloze = false;
+            self.cloze_active = false;
+        }
+        if other.cloze || other.cloze_active {
+            self.cloze = true;
+            self.cloze_active = true;
+            self.cloze_inactive = false;
+        }
+        // Keep the legacy flags in sync with the structured fields.
+        match self.script {
+            Script::Sub => self.sub = true,
+            Script::Sup => self.sup = true,
+            Script::Normal => {}
+        }
+        if self.sub && self.script == Script::Normal {
+            self.script = Script::Sub;
+        } else if self.sup && self.script == Script::Normal {
+            self.script = Script::Sup;
+        }
         if other.color.is_some() {
             self.color = other.color;
         }
@@ -147,6 +302,58 @@ pub enum Inline {
     },
     Marker(PitchMarker),
     Break,
+    /// Placeholder box for a `[[type:...]]` answer field on the question
+    /// side. The typed text is supplied at layout time.
+    TypeInput,
+    /// Pill button that toggles a [`Block::Hint`]. The `id` is the order the
+    /// hint appeared in the card HTML.
+    HintToggle {
+        id: u16,
+        label: String,
+    },
+    /// Animated or video media (`<video>`, `<img src=*.gif|*.webp>` and
+    /// synthesized `<video>` markers for video `[sound:...]` tags).
+    Media {
+        path: String,
+        kind: MediaKind,
+        autoplay: bool,
+        loop_: bool,
+    },
+}
+
+/// How a media reference should be presented. The backend classifies every
+/// `[sound:...]`/`<img>` reference with [`media_kind_for_filename`]; the
+/// parser uses the same helper for inline `<video>`/`<source>`/`<img>` tags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediaKind {
+    #[default]
+    Image,
+    Audio,
+    Video,
+}
+
+/// Classify a media filename by extension. Video extensions (mp4, webm, avi,
+/// mov, mkv) and animated images (gif, webp) are `Video` so that
+/// `[sound:clip.mp4]` is routed to the animated-media player instead of the
+/// audio/image paths.
+pub fn media_kind_for_filename(filename: &str) -> MediaKind {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" | "webm" | "avi" | "mov" | "mkv" | "gif" | "webp" => MediaKind::Video,
+        "mp3" | "ogg" | "oga" | "opus" | "wav" | "wave" => MediaKind::Audio,
+        _ => MediaKind::Image,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cell {
+    pub header: bool,
+    pub colspan: u8,
+    pub content: Vec<Inline>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +365,22 @@ pub enum Block {
         content: Vec<Inline>,
     },
     Rule,
+    Table {
+        rows: Vec<Vec<Cell>>,
+    },
+    /// `<pre>` content with whitespace preserved exactly.
+    Code {
+        text: String,
+    },
+    /// Hidden hint body. Drawn only when its id is in the open set; toggled
+    /// by [`Inline::HintToggle`].
+    Hint {
+        id: u16,
+        content: Vec<Block>,
+    },
+    /// `<blockquote>` content. The nesting depth is the number of enclosing
+    /// `Quote` blocks.
+    Quote(Vec<Block>),
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +416,34 @@ enum BlockKind {
     ListItem,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CellDraft {
+    header: bool,
+    colspan: u8,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TableBuilder {
+    rows: Vec<Vec<Cell>>,
+    current_row: Vec<Cell>,
+    in_cell: Option<CellDraft>,
+    /// Depth of nested `<table>` tags whose content is flattened into text.
+    nested: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HintLabel {
+    id: u16,
+    label: String,
+}
+
+#[derive(Clone, Debug)]
+struct HintBody {
+    id: u16,
+    depth: usize,
+    html: String,
+}
+
 #[derive(Default)]
 struct Parser {
     blocks: Vec<Block>,
@@ -207,6 +458,32 @@ struct Parser {
     ruby: Option<RubyState>,
     svg: Option<String>,
     skip: Option<String>,
+    table_stack: Vec<TableBuilder>,
+    /// Raw text collected inside `<pre>`; whitespace is preserved exactly.
+    pre: Option<String>,
+    /// Outer block buffers while inside `<blockquote>` elements.
+    quote_stack: Vec<Vec<Block>>,
+    /// Label text collected inside `<a class=hint>`.
+    hint_label: Option<HintLabel>,
+    /// Raw HTML collected inside a hint `<div>`.
+    hint_body: Option<HintBody>,
+    /// Id of the most recent hint toggle waiting for its body `<div>`.
+    pending_hint: Option<u16>,
+    hints_seen: u16,
+    /// Inside a `<video>` element that already produced media.
+    in_video: bool,
+}
+
+impl Parser {
+    fn push_block(&mut self, block: Block) {
+        self.blocks.push(block);
+    }
+
+    fn in_table_cell(&self) -> bool {
+        self.table_stack
+            .last()
+            .is_some_and(|builder| builder.in_cell.is_some())
+    }
 }
 
 /// Parse the rendered HTML used by Anki cards into simple display blocks.
@@ -291,6 +568,39 @@ impl Parser {
             return;
         }
 
+        if self.pre.is_some() && !(closing && name == "pre") {
+            return;
+        }
+        if self.hint_body.is_some() {
+            let finished = closing
+                && name == "div"
+                && self.hint_body.as_ref().is_some_and(|body| body.depth == 0);
+            if finished {
+                let body = self.hint_body.take().expect("hint body present");
+                self.finish_hint_body(body);
+            } else {
+                if let Some(body) = self.hint_body.as_mut() {
+                    if name == "div" {
+                        if closing {
+                            body.depth = body.depth.saturating_sub(1);
+                        } else {
+                            body.depth += 1;
+                        }
+                    }
+                    body.html.push_str(raw);
+                }
+            }
+            return;
+        }
+        if self.hint_label.is_some() {
+            if closing && name == "a" {
+                if let Some(cap) = self.hint_label.take() {
+                    self.finish_hint_label(cap);
+                }
+            }
+            return;
+        }
+
         if self.svg.is_some() {
             if closing && name == "svg" {
                 let svg = self.svg.take().unwrap_or_default();
@@ -317,6 +627,49 @@ impl Parser {
         if !closing && matches!(name.as_str(), "style" | "script" | "head" | "title") {
             self.skip = Some(name);
             return;
+        }
+
+        if name == "a" && !closing {
+            let attributes = parse_attributes(inner, name_end);
+            let is_hint = attributes.iter().any(|(key, value)| {
+                key == "class"
+                    && value
+                        .split_whitespace()
+                        .any(|class| class.eq_ignore_ascii_case("hint"))
+            });
+            if is_hint {
+                let id = self.hints_seen;
+                self.hints_seen = self.hints_seen.saturating_add(1);
+                self.hint_label = Some(HintLabel {
+                    id,
+                    label: String::new(),
+                });
+                return;
+            }
+        }
+        if name == "div" && !closing && self.hint_body.is_none() {
+            // Hint bodies inside table cells degrade to normal content:
+            // a block-level body cannot live inside a cell.
+            if let Some(id) = self.pending_hint.filter(|_| !self.in_table_cell()) {
+                let attributes = parse_attributes(inner, name_end);
+                let is_hint_div = attribute(&attributes, "id")
+                    .is_some_and(|value| value.starts_with("hint"))
+                    || attributes.iter().any(|(key, value)| {
+                        key == "class"
+                            && value
+                                .split_whitespace()
+                                .any(|class| class.eq_ignore_ascii_case("hint"))
+                    });
+                if is_hint_div {
+                    self.pending_hint = None;
+                    self.hint_body = Some(HintBody {
+                        id,
+                        depth: 0,
+                        html: String::new(),
+                    });
+                    return;
+                }
+            }
         }
 
         if name == "ruby" {
@@ -379,7 +732,7 @@ impl Parser {
             "hr" => {
                 if !closing {
                     self.flush();
-                    self.blocks.push(Block::Rule);
+                    self.push_block(Block::Rule);
                 }
             }
             "ul" | "ol" => {
@@ -417,12 +770,92 @@ impl Parser {
                     self.block_kind = BlockKind::Paragraph;
                 }
             }
-            "div" | "section" | "article" | "header" | "footer" | "main" | "nav" | "blockquote"
-            | "address" | "aside" | "figure" | "figcaption" | "pre" | "table" | "tr" | "h1"
-            | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            "div" | "section" | "article" | "header" | "footer" | "main" | "nav" | "address"
+            | "aside" | "figure" | "figcaption" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.flush();
                 if !closing {
                     self.block_kind = BlockKind::Section;
+                }
+            }
+            "table" | "tr" | "th" | "td" => {
+                let attributes = parse_attributes(inner, name_end);
+                self.handle_table_tag(&name, closing, &attributes);
+            }
+            "thead" | "tbody" | "tfoot" | "caption" | "colgroup" | "col" => {
+                // Structural table tags carry no content of their own.
+            }
+            "pre" => {
+                if closing {
+                    if let Some(text) = self.pre.take() {
+                        if self.in_table_cell() {
+                            let mut style = self.style.clone();
+                            style.mono = true;
+                            push_text_with_furigana(&mut self.current, &text, style);
+                        } else {
+                            self.flush();
+                            self.push_block(Block::Code { text });
+                        }
+                    }
+                } else {
+                    self.flush();
+                    self.pre = Some(String::new());
+                }
+            }
+            "blockquote" => {
+                self.flush();
+                if closing {
+                    if !self.quote_stack.is_empty() {
+                        let inner = std::mem::take(&mut self.blocks);
+                        if let Some(mut outer) = self.quote_stack.pop() {
+                            if !inner.is_empty() {
+                                outer.push(Block::Quote(inner));
+                            }
+                            self.blocks = outer;
+                        }
+                    }
+                } else {
+                    let buffer = std::mem::take(&mut self.blocks);
+                    self.quote_stack.push(buffer);
+                }
+            }
+            "input" => {
+                if !closing {
+                    let attributes = parse_attributes(inner, name_end);
+                    if attribute(&attributes, "id")
+                        .is_some_and(|id| id.eq_ignore_ascii_case("typeans"))
+                    {
+                        self.current.push(Inline::TypeInput);
+                    }
+                }
+            }
+            "video" => {
+                if closing {
+                    self.in_video = false;
+                } else {
+                    let attributes = parse_attributes(inner, name_end);
+                    let src = attribute(&attributes, "src").unwrap_or("").to_owned();
+                    if !src.trim().is_empty() {
+                        self.push_media_tag(&src, MediaKind::Video, &attributes);
+                    }
+                    self.in_video = true;
+                }
+            }
+            "source" => {
+                if !closing && !self.in_video {
+                    let attributes = parse_attributes(inner, name_end);
+                    let src = attribute(&attributes, "src").unwrap_or("").to_owned();
+                    if !src.trim().is_empty() {
+                        self.push_media_tag(&src, MediaKind::Video, &attributes);
+                    }
+                }
+            }
+            "img" => {
+                if !closing {
+                    let attributes = parse_attributes(inner, name_end);
+                    let src = attribute(&attributes, "src").unwrap_or("").to_owned();
+                    if media_kind_for_filename(&src) == MediaKind::Video {
+                        self.push_media_tag(&src, MediaKind::Video, &attributes);
+                    }
                 }
             }
             _ => {
@@ -568,6 +1001,18 @@ impl Parser {
         if text.is_empty() || self.skip.is_some() {
             return;
         }
+        if let Some(pre) = self.pre.as_mut() {
+            pre.push_str(&decode_entities(text));
+            return;
+        }
+        if let Some(body) = self.hint_body.as_mut() {
+            body.html.push_str(text);
+            return;
+        }
+        if let Some(label) = self.hint_label.as_mut() {
+            label.label.push_str(&decode_entities(text));
+            return;
+        }
         if let Some(svg) = self.svg.as_mut() {
             svg.push_str(text);
             return;
@@ -610,8 +1055,34 @@ impl Parser {
         let mut style = self.style.clone();
         if self.cloze_depth > 0 {
             style.cloze = true;
+            style.cloze_active = true;
         }
-        push_text_with_furigana(&mut self.current, text, style);
+        for part in split_math(text) {
+            match part {
+                MathPart::Text(segment) => {
+                    push_text_with_furigana(&mut self.current, &segment, style.clone())
+                }
+                MathPart::Math(src) => self.push_math(&src, style.clone()),
+            }
+        }
+    }
+
+    fn push_math(&mut self, src: &str, style: Style) {
+        for (text, script) in render_math_runs(src) {
+            if text.is_empty() {
+                continue;
+            }
+            let mut run_style = style.clone();
+            if script != Script::Normal {
+                run_style.script = script;
+                match script {
+                    Script::Sub => run_style.sub = true,
+                    Script::Sup => run_style.sup = true,
+                    Script::Normal => {}
+                }
+            }
+            push_text_plain(&mut self.current, &text, run_style);
+        }
     }
 
     fn finish_ruby(&mut self) {
@@ -642,6 +1113,14 @@ impl Parser {
     }
 
     fn flush(&mut self) {
+        if self.in_table_cell() {
+            // Block boundaries inside a table cell become line breaks; the
+            // cell is flushed into a `Cell` on `</td>`.
+            if !self.current.is_empty() && !matches!(self.current.last(), Some(Inline::Break)) {
+                self.current.push(Inline::Break);
+            }
+            return;
+        }
         while matches!(self.current.first(), Some(Inline::Break)) {
             self.current.remove(0);
         }
@@ -660,19 +1139,219 @@ impl Parser {
         }
         let content = std::mem::take(&mut self.current);
         if let Some(marker) = self.current_marker.take() {
-            self.blocks.push(Block::ListItem { marker, content });
+            self.push_block(Block::ListItem { marker, content });
         } else if self.block_kind == BlockKind::Section {
-            self.blocks.push(Block::Section(content));
+            self.push_block(Block::Section(content));
         } else {
-            self.blocks.push(Block::Paragraph(content));
+            self.push_block(Block::Paragraph(content));
         }
         self.block_kind = BlockKind::Paragraph;
     }
 
     fn finish(&mut self) {
         self.finish_ruby();
+        if let Some(text) = self.pre.take() {
+            if self.in_table_cell() {
+                let mut style = self.style.clone();
+                style.mono = true;
+                push_text_with_furigana(&mut self.current, &text, style);
+            } else {
+                self.flush();
+                self.push_block(Block::Code { text });
+            }
+        }
+        if let Some(cap) = self.hint_label.take() {
+            self.finish_hint_label(cap);
+        }
+        if let Some(body) = self.hint_body.take() {
+            self.finish_hint_body(body);
+        }
+        while !self.table_stack.is_empty() {
+            self.flush_cell();
+            self.end_row();
+            if let Some(builder) = self.table_stack.pop() {
+                if !builder.rows.is_empty() {
+                    self.flush();
+                    self.push_block(Block::Table { rows: builder.rows });
+                }
+            }
+        }
         self.flush();
+        while let Some(mut outer) = self.quote_stack.pop() {
+            let inner = std::mem::take(&mut self.blocks);
+            if !inner.is_empty() {
+                outer.push(Block::Quote(inner));
+            }
+            self.blocks = outer;
+        }
     }
+
+    fn finish_hint_label(&mut self, cap: HintLabel) {
+        let label = cap.label.trim().to_owned();
+        let label = if label.is_empty() {
+            format!("Hint {}", cap.id + 1)
+        } else {
+            label
+        };
+        self.current.push(Inline::HintToggle { id: cap.id, label });
+        self.pending_hint = Some(cap.id);
+    }
+
+    fn finish_hint_body(&mut self, body: HintBody) {
+        let content = parse_html(&body.html);
+        self.flush();
+        self.push_block(Block::Hint {
+            id: body.id,
+            content,
+        });
+    }
+
+    /// Close the open cell, moving `current` into the current row.
+    fn flush_cell(&mut self) {
+        if !self.in_table_cell() {
+            return;
+        }
+        let mut content = std::mem::take(&mut self.current);
+        while matches!(content.first(), Some(Inline::Break)) {
+            content.remove(0);
+        }
+        while matches!(content.last(), Some(Inline::Break)) {
+            content.pop();
+        }
+        content.retain(|inline| match inline {
+            Inline::Text { text, .. } => !text.is_empty(),
+            _ => true,
+        });
+        let draft = self
+            .table_stack
+            .last_mut()
+            .and_then(|builder| builder.in_cell.take());
+        if let Some(draft) = draft {
+            if let Some(builder) = self.table_stack.last_mut() {
+                builder.current_row.push(Cell {
+                    header: draft.header,
+                    colspan: draft.colspan.max(1),
+                    content,
+                });
+            }
+        }
+        self.current_marker = None;
+        self.block_kind = BlockKind::Paragraph;
+    }
+
+    fn end_row(&mut self) {
+        if let Some(builder) = self.table_stack.last_mut() {
+            if !builder.current_row.is_empty() {
+                let row = std::mem::take(&mut builder.current_row);
+                builder.rows.push(row);
+            }
+        }
+    }
+
+    fn close_table(&mut self) {
+        self.flush_cell();
+        self.end_row();
+        if let Some(builder) = self.table_stack.pop() {
+            if !builder.rows.is_empty() {
+                self.flush();
+                self.push_block(Block::Table { rows: builder.rows });
+            }
+        }
+    }
+
+    fn handle_table_tag(&mut self, name: &str, closing: bool, attributes: &[(String, String)]) {
+        if let Some(builder) = self.table_stack.last_mut() {
+            if builder.nested > 0 {
+                if name == "table" {
+                    if closing {
+                        builder.nested -= 1;
+                    } else {
+                        builder.nested += 1;
+                    }
+                }
+                return;
+            }
+            if name == "table" && !closing {
+                builder.nested += 1;
+                return;
+            }
+        } else if name != "table" || closing {
+            return;
+        }
+        match name {
+            "table" => {
+                if closing {
+                    self.close_table();
+                } else {
+                    self.flush();
+                    self.table_stack.push(TableBuilder::default());
+                }
+            }
+            "tr" => {
+                if self.table_stack.is_empty() {
+                    return;
+                }
+                self.flush_cell();
+                self.end_row();
+            }
+            "th" | "td" => {
+                if self.table_stack.is_empty() {
+                    return;
+                }
+                if closing {
+                    self.flush_cell();
+                } else {
+                    self.flush_cell();
+                    let colspan = attributes
+                        .iter()
+                        .find(|(key, _)| key == "colspan")
+                        .and_then(|(_, value)| value.trim().parse::<u8>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, 12);
+                    if let Some(builder) = self.table_stack.last_mut() {
+                        builder.in_cell = Some(CellDraft {
+                            header: name == "th",
+                            colspan,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Push animated/video media for a `<video>`/`<source>`/`<img>` tag.
+    fn push_media_tag(&mut self, src: &str, kind: MediaKind, attributes: &[(String, String)]) {
+        let decoded = decode_entities(src);
+        let name = decoded
+            .rsplit(|ch| ch == '/' || ch == '\\')
+            .next()
+            .unwrap_or(decoded.as_str())
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if name.is_empty() {
+            return;
+        }
+        let animated = is_animated_image(name);
+        let autoplay = has_attr(attributes, "autoplay") || animated;
+        let loop_ = has_attr(attributes, "loop") || animated;
+        self.current.push(Inline::Media {
+            path: name.to_owned(),
+            kind,
+            autoplay,
+            loop_,
+        });
+    }
+}
+
+fn has_attr(attributes: &[(String, String)], name: &str) -> bool {
+    attributes.iter().any(|(key, _)| key == name)
+}
+
+fn is_animated_image(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "gif" | "webp")
 }
 
 fn has_style_effect(tag: &str, attributes: &[(String, String)]) -> bool {
@@ -703,17 +1382,51 @@ fn apply_tag_style(tag: &str, attributes: &[(String, String)], style: &mut Style
         "b" | "strong" => style.bold = true,
         "i" | "em" => style.italic = true,
         "u" | "ins" => style.underline = true,
-        "sub" => style.sub = true,
-        "sup" => style.sup = true,
+        "sub" => {
+            style.sub = true;
+            style.script = Script::Sub;
+        }
+        "sup" => {
+            style.sup = true;
+            style.script = Script::Sup;
+        }
+        "code" => style.mono = true,
         "mark" => style.highlight = Some([255, 235, 120]),
         _ => {}
     }
-    if tag == "span"
-        && attributes.iter().any(|(name, value)| {
-            name == "class" && value.split_whitespace().any(|class| class == "cloze")
-        })
-    {
-        style.cloze = true;
+    if tag == "span" {
+        let mut active = false;
+        let mut inactive = false;
+        for (_, value) in attributes.iter().filter(|(name, _)| name == "class") {
+            for class in value.split_whitespace() {
+                if class.eq_ignore_ascii_case("cloze-inactive") {
+                    inactive = true;
+                } else if class.eq_ignore_ascii_case("cloze") {
+                    active = true;
+                } else if class == "typeGood" {
+                    style.diff = Some(DiffClass::Good);
+                } else if class == "typeBad" {
+                    style.diff = Some(DiffClass::Bad);
+                } else if class == "typeMissed" {
+                    style.diff = Some(DiffClass::Missed);
+                }
+            }
+        }
+        // Newer renderers also mark clozes with data attributes.
+        if attributes
+            .iter()
+            .any(|(name, _)| name == "data-cloze" || name == "data-ordinal")
+        {
+            active = true;
+        }
+        if inactive {
+            style.cloze_inactive = true;
+            style.cloze = false;
+            style.cloze_active = false;
+        } else if active {
+            style.cloze = true;
+            style.cloze_active = true;
+        }
     }
     for (name, value) in attributes {
         match name.as_str() {
@@ -979,7 +1692,11 @@ fn inline_style_mut(inline: &mut Inline) -> Option<&mut Style> {
         Inline::Text { style, .. }
         | Inline::Ruby { style, .. }
         | Inline::PitchWord { style, .. } => Some(style),
-        Inline::Marker(_) | Inline::Break => None,
+        Inline::Marker(_)
+        | Inline::Break
+        | Inline::TypeInput
+        | Inline::HintToggle { .. }
+        | Inline::Media { .. } => None,
     }
 }
 
@@ -1024,6 +1741,426 @@ fn is_nasal_overlay(attributes: &[(String, String)]) -> bool {
                 )
             })
         })
+}
+
+/// Math and LaTeX handling.
+///
+/// Card text may embed MathJax groups (`\(…\)`, `\[…\]`, `$…$`, `$$…$$`).
+/// They are swapped for readable Unicode approximations before layout:
+/// Greek letters and common operators are substituted, `\frac{a}{b}`
+/// becomes `(a)/(b)`, `^{x}`/`_{x}` use Unicode super/subscripts when every
+/// character has one (otherwise the run keeps a [`Script`] style), and
+/// `\ce{H2O}` (mhchem) subscripts digit runs after letters. `\mathrm`,
+/// `\text`, `\left` and `\right` are stripped; unknown `\cmd` stays as-is.
+
+/// A text segment split out of [`split_math`]: either plain text or the inner
+/// content of a `\(…\)`, `\[…\]`, `$…$` or `$$…$$` group.
+enum MathPart {
+    Text(String),
+    Math(String),
+}
+
+/// Split card text into plain and math segments. An opener without a closer
+/// stays plain text.
+fn split_math(text: &str) -> Vec<MathPart> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        if rest.starts_with("\\(") || rest.starts_with("\\[") {
+            let close = if rest.starts_with("\\(") {
+                "\\)"
+            } else {
+                "\\]"
+            };
+            if let Some(end) = rest[2..].find(close) {
+                if !current.is_empty() {
+                    parts.push(MathPart::Text(std::mem::take(&mut current)));
+                }
+                parts.push(MathPart::Math(rest[2..2 + end].to_owned()));
+                index += 2 + end + 2;
+                continue;
+            }
+        } else if rest.starts_with("$$") {
+            if let Some(end) = rest[2..].find("$$") {
+                if !current.is_empty() {
+                    parts.push(MathPart::Text(std::mem::take(&mut current)));
+                }
+                parts.push(MathPart::Math(rest[2..2 + end].to_owned()));
+                index += 2 + end + 2;
+                continue;
+            }
+        } else if rest.starts_with("\\$") {
+            current.push('$');
+            index += 2;
+            continue;
+        } else if rest.starts_with('$') {
+            if let Some(end) = rest[1..].find('$') {
+                // A `$$` closer belongs to display math, not to this group.
+                if end > 0 && !rest[1..1 + end].contains("$$") {
+                    if !current.is_empty() {
+                        parts.push(MathPart::Text(std::mem::take(&mut current)));
+                    }
+                    parts.push(MathPart::Math(rest[1..1 + end].to_owned()));
+                    index += 1 + end + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().expect("non-empty rest");
+        current.push(ch);
+        index += ch.len_utf8();
+    }
+    if !current.is_empty() {
+        parts.push(MathPart::Text(current));
+    }
+    parts
+}
+
+/// Render a math group to readable text, keeping runs that need super/sub
+/// script styling separate. [`render_math`] is the plain-string projection of
+/// this function.
+fn render_math_runs(src: &str) -> Vec<(String, Script)> {
+    let mut runs: Vec<(String, Script)> = vec![(String::new(), Script::Normal)];
+    let mut chars = src.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    if matches!(
+                        next,
+                        '$' | '{' | '}' | '#' | '&' | '_' | '%' | '|' | '<' | '>'
+                    ) {
+                        chars.next();
+                        push_math_text(&mut runs, &next.to_string());
+                        continue;
+                    }
+                    if next == '\\' {
+                        chars.next();
+                        push_math_text(&mut runs, " ");
+                        continue;
+                    }
+                }
+                let mut name = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphabetic() {
+                        name.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if name.is_empty() {
+                    match chars.next() {
+                        Some(',') | Some(';') | Some(':') | Some(' ') => {
+                            push_math_text(&mut runs, " ")
+                        }
+                        Some('!') => {}
+                        Some(other) => push_math_text(&mut runs, &other.to_string()),
+                        None => push_math_text(&mut runs, "\\"),
+                    }
+                    continue;
+                }
+                match name.as_str() {
+                    "frac" => {
+                        let over = read_brace_group(&mut chars);
+                        let under = read_brace_group(&mut chars);
+                        push_math_text(&mut runs, &format!("({over})/({under})"));
+                    }
+                    "sqrt" => {
+                        if chars.peek() == Some(&'{') {
+                            let inner = read_brace_group(&mut chars);
+                            push_math_text(&mut runs, &format!("√({inner})"));
+                        } else if let Some(next) = chars.next() {
+                            push_math_text(&mut runs, "√");
+                            push_math_text(&mut runs, &next.to_string());
+                        } else {
+                            push_math_text(&mut runs, "√");
+                        }
+                    }
+                    "ce" => {
+                        let inner = read_brace_group(&mut chars);
+                        push_math_text(&mut runs, &convert_mhchem(&inner));
+                    }
+                    "text" | "mathrm" | "mathbf" | "mathit" | "mathsf" | "mathtt" | "textrm" => {
+                        let inner = read_brace_group(&mut chars);
+                        push_math_text(&mut runs, &inner);
+                    }
+                    "left" | "right" => {}
+                    "quad" | "qquad" => push_math_text(&mut runs, " "),
+                    _ => {
+                        if let Some(symbol) = latex_symbol(&name) {
+                            push_math_text(&mut runs, &symbol.to_string());
+                        } else {
+                            push_math_text(&mut runs, "\\");
+                            push_math_text(&mut runs, &name);
+                        }
+                    }
+                }
+            }
+            '^' | '_' => {
+                let script = if ch == '^' { Script::Sup } else { Script::Sub };
+                let atom = if chars.peek() == Some(&'{') {
+                    chars.next();
+                    read_brace_inner(&mut chars)
+                } else if let Some(next) = chars.next() {
+                    next.to_string()
+                } else {
+                    continue;
+                };
+                if !atom.is_empty() && atom.chars().all(|c| shift_char(c, script).is_some()) {
+                    let mapped: String =
+                        atom.chars().filter_map(|c| shift_char(c, script)).collect();
+                    push_math_text(&mut runs, &mapped);
+                } else if !atom.is_empty() {
+                    runs.push((atom, script));
+                    runs.push((String::new(), Script::Normal));
+                }
+            }
+            '{' => {
+                let inner = read_brace_inner(&mut chars);
+                for (text, script) in render_math_runs(&inner) {
+                    if script == Script::Normal {
+                        push_math_text(&mut runs, &text);
+                    } else if !text.is_empty() {
+                        runs.push((text, script));
+                        runs.push((String::new(), Script::Normal));
+                    }
+                }
+            }
+            '}' => {}
+            '-' => push_math_text(&mut runs, "−"),
+            '*' => push_math_text(&mut runs, "×"),
+            _ => push_math_text(&mut runs, &ch.to_string()),
+        }
+    }
+    runs.retain(|(text, _)| !text.is_empty());
+    runs
+}
+
+fn push_math_text(runs: &mut Vec<(String, Script)>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some((current, Script::Normal)) = runs.last_mut() {
+        current.push_str(text);
+    } else {
+        runs.push((text.to_owned(), Script::Normal));
+    }
+}
+
+/// Read a `{…}` group, consuming the opening brace when present. Nested
+/// braces are honoured.
+fn read_brace_group(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    if chars.peek() == Some(&'{') {
+        chars.next();
+        read_brace_inner(chars)
+    } else if let Some(ch) = chars.next() {
+        ch.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn read_brace_inner(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut inner = String::new();
+    let mut depth = 0usize;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                depth += 1;
+                inner.push(ch);
+            }
+            '}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                inner.push(ch);
+            }
+            _ => inner.push(ch),
+        }
+    }
+    inner
+}
+
+/// Map a LaTeX command to a readable Unicode character.
+fn latex_symbol(name: &str) -> Option<char> {
+    Some(match name {
+        "alpha" => 'α',
+        "beta" => 'β',
+        "gamma" => 'γ',
+        "delta" => 'δ',
+        "epsilon" => 'ε',
+        "varepsilon" => 'ε',
+        "zeta" => 'ζ',
+        "eta" => 'η',
+        "theta" => 'θ',
+        "vartheta" => 'θ',
+        "iota" => 'ι',
+        "kappa" => 'κ',
+        "lambda" => 'λ',
+        "mu" => 'μ',
+        "nu" => 'ν',
+        "xi" => 'ξ',
+        "pi" => 'π',
+        "varpi" => 'π',
+        "rho" => 'ρ',
+        "varrho" => 'ρ',
+        "sigma" => 'σ',
+        "varsigma" => 'ς',
+        "tau" => 'τ',
+        "upsilon" => 'υ',
+        "phi" => 'φ',
+        "varphi" => 'φ',
+        "chi" => 'χ',
+        "psi" => 'ψ',
+        "omega" => 'ω',
+        "Gamma" => 'Γ',
+        "Delta" => 'Δ',
+        "Theta" => 'Θ',
+        "Lambda" => 'Λ',
+        "Xi" => 'Ξ',
+        "Pi" => 'Π',
+        "Sigma" => 'Σ',
+        "Upsilon" => 'Υ',
+        "Phi" => 'Φ',
+        "Psi" => 'Ψ',
+        "Omega" => 'Ω',
+        "times" => '×',
+        "cdot" => '·',
+        "pm" => '±',
+        "mp" => '∓',
+        "leq" | "le" => '≤',
+        "geq" | "ge" => '≥',
+        "neq" | "ne" => '≠',
+        "approx" => '≈',
+        "equiv" => '≡',
+        "infty" | "inf" => '∞',
+        "sum" => '∑',
+        "prod" => '∏',
+        "int" => '∫',
+        "oint" => '∮',
+        "partial" => '∂',
+        "nabla" => '∇',
+        "to" | "rightarrow" => '→',
+        "leftarrow" => '←',
+        "uparrow" => '↑',
+        "downarrow" => '↓',
+        "leftrightarrow" => '↔',
+        "rightleftharpoons" => '⇋',
+        "Rightarrow" => '⇒',
+        "Leftarrow" => '⇐',
+        "Leftrightarrow" => '⇔',
+        "degree" => '°',
+        "prime" => '′',
+        "ldots" => '…',
+        "cdots" => '⋯',
+        "forall" => '∀',
+        "exists" => '∃',
+        "in" => '∈',
+        "notin" => '∉',
+        "ni" => '∋',
+        "cap" => '∩',
+        "cup" => '∪',
+        "subset" => '⊂',
+        "supset" => '⊃',
+        "subseteq" => '⊆',
+        "supseteq" => '⊇',
+        "oplus" => '⊕',
+        "otimes" => '⊗',
+        "perp" => '⊥',
+        "angle" => '∠',
+        "wedge" | "land" => '∧',
+        "vee" | "lor" => '∨',
+        "neg" | "lnot" => '¬',
+        "ast" => '∗',
+        "bullet" => '∙',
+        "div" => '÷',
+        "propto" => '∝',
+        "odot" => '⊙',
+        _ => return None,
+    })
+}
+
+/// Map a character to its Unicode super/subscript form, if one exists. Only
+/// the characters named by the card spec (digits, `+−=()`, `n`, `i`) qualify;
+/// anything else falls back to [`Script`] styling.
+fn shift_char(ch: char, script: Script) -> Option<char> {
+    Some(match script {
+        Script::Normal => return None,
+        Script::Sup => match ch {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            '+' => '⁺',
+            '-' | '−' => '⁻',
+            '=' => '⁼',
+            '(' => '⁽',
+            ')' => '⁾',
+            'n' => 'ⁿ',
+            'i' => 'ⁱ',
+            _ => return None,
+        },
+        Script::Sub => match ch {
+            '0' => '₀',
+            '1' => '₁',
+            '2' => '₂',
+            '3' => '₃',
+            '4' => '₄',
+            '5' => '₅',
+            '6' => '₆',
+            '7' => '₇',
+            '8' => '₈',
+            '9' => '₉',
+            '+' => '₊',
+            '-' | '−' => '₋',
+            '=' => '₌',
+            '(' => '₍',
+            ')' => '₎',
+            'n' => 'ₙ',
+            'i' => 'ᵢ',
+            _ => return None,
+        },
+    })
+}
+
+/// Convert mhchem `\ce{…}` content: digits following a letter (or an ongoing
+/// digit run, for multi-digit counts) become subscripts.
+fn convert_mhchem(src: &str) -> String {
+    let mut output = String::new();
+    let mut prev_letter = false;
+    let mut sub_run = false;
+    for ch in src.chars() {
+        if ch.is_ascii_digit() && (prev_letter || sub_run) {
+            output.push(shift_char(ch, Script::Sub).unwrap_or(ch));
+            sub_run = true;
+            prev_letter = false;
+        } else {
+            output.push(ch);
+            prev_letter = ch.is_alphabetic();
+            sub_run = false;
+        }
+    }
+    output
+}
+
+/// Render a LaTeX math group to readable text. Super/subscripts whose
+/// characters all have Unicode forms are substituted inline; other markup is
+/// dropped or passed through by [`render_math_runs`].
+pub fn render_math(src: &str) -> String {
+    render_math_runs(src)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
 }
 
 fn push_text_with_furigana(output: &mut Vec<Inline>, text: &str, style: Style) {
@@ -1450,6 +2587,89 @@ fn named_entity(entity: &str) -> Option<char> {
         "sup1" => '¹',
         "sup2" => '²',
         "sup3" => '³',
+        "sum" => '∑',
+        "prod" => '∏',
+        "infin" => '∞',
+        "le" => '≤',
+        "ge" => '≥',
+        "ne" => '≠',
+        "approx" => '≈',
+        "equiv" => '≡',
+        "prime" => '′',
+        "Prime" => '″',
+        "nabla" => '∇',
+        "part" => '∂',
+        "forall" => '∀',
+        "exist" => '∃',
+        "empty" => '∅',
+        "isin" => '∈',
+        "notin" => '∉',
+        "ni" => '∋',
+        "cap" => '∩',
+        "cup" => '∪',
+        "sub" => '⊂',
+        "sup" => '⊃',
+        "sube" => '⊆',
+        "supe" => '⊇',
+        "oplus" => '⊕',
+        "otimes" => '⊗',
+        "perp" => '⊥',
+        "lang" => '⟨',
+        "rang" => '⟩',
+        "lArr" => '⇐',
+        "uArr" => '⇑',
+        "rArr" => '⇒',
+        "dArr" => '⇓',
+        "hArr" => '⇔',
+        "alpha" => 'α',
+        "beta" => 'β',
+        "gamma" => 'γ',
+        "delta" => 'δ',
+        "epsilon" => 'ε',
+        "zeta" => 'ζ',
+        "eta" => 'η',
+        "theta" => 'θ',
+        "iota" => 'ι',
+        "kappa" => 'κ',
+        "lambda" => 'λ',
+        "mu" => 'μ',
+        "nu" => 'ν',
+        "xi" => 'ξ',
+        "omicron" => 'ο',
+        "pi" => 'π',
+        "rho" => 'ρ',
+        "sigmaf" => 'ς',
+        "sigma" => 'σ',
+        "tau" => 'τ',
+        "upsilon" => 'υ',
+        "phi" => 'φ',
+        "chi" => 'χ',
+        "psi" => 'ψ',
+        "omega" => 'ω',
+        "Alpha" => 'Α',
+        "Beta" => 'Β',
+        "Gamma" => 'Γ',
+        "Delta" => 'Δ',
+        "Epsilon" => 'Ε',
+        "Zeta" => 'Ζ',
+        "Eta" => 'Η',
+        "Theta" => 'Θ',
+        "Iota" => 'Ι',
+        "Kappa" => 'Κ',
+        "Lambda" => 'Λ',
+        "Mu" => 'Μ',
+        "Nu" => 'Ν',
+        "Xi" => 'Ξ',
+        "Omicron" => 'Ο',
+        "Pi" => 'Π',
+        "Rho" => 'Ρ',
+        "Sigma" => 'Σ',
+        "Tau" => 'Τ',
+        "Upsilon" => 'Υ',
+        "Phi" => 'Φ',
+        "Chi" => 'Χ',
+        "Psi" => 'Ψ',
+        "Omega" => 'Ω',
         _ => return None,
     })
 }
@@ -1946,5 +3166,314 @@ mod tests {
             inline,
             Inline::Text { text, style, .. } if text == "answer" && style.cloze
         )));
+    }
+
+    #[test]
+    fn tables_are_parsed_with_headers_and_spans() {
+        let blocks = parse_html(
+            "<table><thead><tr><th>Name</th><th colspan=2>Value</th></tr></thead>\
+             <tbody><tr><td>a</td><td>b</td><td>c</td></tr></tbody></table>",
+        );
+        assert_eq!(blocks.len(), 1);
+        let Block::Table { rows } = &blocks[0] else {
+            panic!("expected table, got {blocks:?}");
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0][0].header);
+        assert_eq!(rows[0][1].colspan, 2);
+        assert!(!rows[1][0].header);
+        let first: String = rows[1][0]
+            .content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(first, "a");
+    }
+
+    #[test]
+    fn nested_tables_flatten_into_text() {
+        let blocks = parse_html(
+            "<table><tr><td>outer<table><tr><td>inner</td></tr></table>done</td></tr></table>",
+        );
+        let Block::Table { rows } = &blocks[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        let text: String = rows[0][0]
+            .content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(text.contains("outer"));
+        assert!(text.contains("inner"));
+        assert!(text.contains("done"));
+    }
+
+    #[test]
+    fn hints_become_toggles_with_hidden_bodies() {
+        let blocks = parse_html(
+            "Q <a class=hint href=\"#\" onclick=\"return false;\">Field</a>\
+             <div id=\"hintabc123\" class=hint style=\"display: none\">Answer <b>bold</b></div> after",
+        );
+        let toggle: Option<(u16, String)> = blocks.iter().find_map(|block| match block {
+            Block::Paragraph(content) | Block::Section(content) => {
+                content.iter().find_map(|inline| match inline {
+                    Inline::HintToggle { id, label } => Some((*id, label.clone())),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        assert_eq!(
+            toggle.as_ref().map(|(id, label)| (*id, label.as_str())),
+            Some((0, "Field"))
+        );
+        let body = blocks.iter().find_map(|block| match block {
+            Block::Hint { id, content } => Some((*id, content)),
+            _ => None,
+        });
+        let (id, content) = body.expect("hint body");
+        assert_eq!(id, 0);
+        let text: String = content
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => inlines.as_slice(),
+                _ => &[],
+            })
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(text.contains("Answer"));
+        assert!(text.contains("bold"));
+    }
+
+    #[test]
+    fn type_answer_diff_spans_set_diff_styles() {
+        let blocks = parse_html(
+            "<code id=typeans><span class=typeGood>abc</span>\
+             <span class=typeBad>x</span><span class=typeMissed>y</span></code>",
+        );
+        let inlines: Vec<&Inline> = blocks
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph(content) | Block::Section(content) => content.iter(),
+                _ => [].iter(),
+            })
+            .collect();
+        let diff_of = |text: &str| -> DiffClass {
+            inlines
+                .iter()
+                .find_map(|inline| match inline {
+                    Inline::Text { text: value, style } if value == text => style.diff,
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {text}"))
+        };
+        assert_eq!(diff_of("abc"), DiffClass::Good);
+        assert_eq!(diff_of("x"), DiffClass::Bad);
+        assert_eq!(diff_of("y"), DiffClass::Missed);
+        assert!(inlines
+            .iter()
+            .all(|inline| !matches!(inline, Inline::Text { style, .. } if !style.mono)));
+    }
+
+    #[test]
+    fn cloze_active_and_inactive_are_distinguished() {
+        let html =
+            "<span class=\"cloze\">active</span> <span class=\"cloze-inactive\">muted</span>";
+        let blocks = parse_html(html);
+        let content: Vec<&Inline> = blocks
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => inlines.iter(),
+                _ => [].iter(),
+            })
+            .collect();
+        let style_of = |text: &str| -> Style {
+            content
+                .iter()
+                .find_map(|inline| match inline {
+                    Inline::Text { text: value, style } if value == text => Some(style.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {text}"))
+        };
+        let active = style_of("active");
+        assert!(active.cloze && active.cloze_active && !active.cloze_inactive);
+        let muted = style_of("muted");
+        assert!(muted.cloze_inactive && !muted.cloze && !muted.cloze_active);
+
+        // Newer data-attribute markup counts as active.
+        let blocks = parse_html("<span data-cloze=\"x\" data-ordinal=\"1\">new</span>");
+        let (Block::Paragraph(content) | Block::Section(content)) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            &content[0],
+            Inline::Text { style, .. } if style.cloze_active
+        ));
+
+        // Marked answer HTML keeps active markers through nesting.
+        let marked =
+            mark_clozes("<span class=\"cloze-inactive\">[<span class=\"cloze\">a</span>]</span>")
+                .unwrap();
+        assert_eq!(marked.matches(CLOZE_START).count(), 1);
+        let blocks = parse_html(&marked);
+        let found = blocks.iter().flat_map(|block| match block {
+            Block::Paragraph(inlines) | Block::Section(inlines) => inlines.iter(),
+            _ => [].iter(),
+        });
+        assert!(found.clone().any(|inline| matches!(
+            inline,
+            Inline::Text { text, style, .. } if text == "a" && style.cloze_active
+        )));
+    }
+
+    #[test]
+    fn sub_sup_code_and_pre_are_captured() {
+        let blocks = parse_html("H<sub>2</sub> x<sup>n</sup> <code>mono</code>");
+        let (Block::Paragraph(content) | Block::Section(content)) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(content.iter().any(
+            |inline| matches!(inline, Inline::Text { text, style, .. } if text == "2" && style.script == Script::Sub)
+        ));
+        assert!(content.iter().any(
+            |inline| matches!(inline, Inline::Text { text, style, .. } if text == "n" && style.script == Script::Sup)
+        ));
+        assert!(content.iter().any(
+            |inline| matches!(inline, Inline::Text { text, style, .. } if text == "mono" && style.mono)
+        ));
+
+        let blocks = parse_html("<pre>  keep\n\tspace  </pre>");
+        let Block::Code { text } = &blocks[0] else {
+            panic!("expected code, got {blocks:?}");
+        };
+        assert_eq!(text, "  keep\n\tspace  ");
+    }
+
+    #[test]
+    fn blockquotes_nest_and_type_input_parses() {
+        let blocks = parse_html("<blockquote>one<blockquote>two</blockquote></blockquote>");
+        let Block::Quote(outer) = &blocks[0] else {
+            panic!("expected quote, got {blocks:?}");
+        };
+        assert!(outer.iter().any(|block| matches!(block, Block::Quote(_))));
+
+        let blocks = parse_html("a<input type=text id=typeans> b");
+        assert!(blocks
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => inlines.iter(),
+                _ => [].iter(),
+            })
+            .any(|inline| matches!(inline, Inline::TypeInput)));
+    }
+
+    #[test]
+    fn video_source_and_animated_images_become_media() {
+        let blocks = parse_html("<video src=\"clip.mp4\" autoplay loop></video>");
+        let media = blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => {
+                    inlines.iter().find_map(|inline| match inline {
+                        Inline::Media {
+                            path,
+                            kind,
+                            autoplay,
+                            loop_,
+                        } => Some((path.clone(), *kind, *autoplay, *loop_)),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("media");
+        assert_eq!(media.0, "clip.mp4");
+        assert_eq!(media.1, MediaKind::Video);
+        assert!(media.2 && media.3);
+
+        let blocks = parse_html("<img src=\"anim.gif\">");
+        assert!(blocks
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => inlines.iter(),
+                _ => [].iter(),
+            })
+            .any(|inline| matches!(
+                inline,
+                Inline::Media {
+                    kind: MediaKind::Video,
+                    autoplay: true,
+                    loop_: true,
+                    ..
+                }
+            )));
+
+        // Still images stay out of the media path.
+        let blocks = parse_html("<img src=\"photo.jpg\">");
+        assert!(!blocks
+            .iter()
+            .flat_map(|block| match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => inlines.iter(),
+                _ => [].iter(),
+            })
+            .any(|inline| matches!(inline, Inline::Media { .. })));
+    }
+
+    #[test]
+    fn math_groups_become_readable_text() {
+        assert_eq!(render_math("\\alpha + \\times"), "α + ×");
+        assert_eq!(render_math("\\frac{a}{b}"), "(a)/(b)");
+        assert_eq!(render_math("x^2"), "x²");
+        assert_eq!(render_math("H_2O"), "H₂O");
+        assert_eq!(render_math("\\ce{H2O}"), "H₂O");
+        assert_eq!(render_math("\\mathrm{AB}"), "AB");
+        assert_eq!(render_math("\\unknowncmd"), "\\unknowncmd");
+        assert_eq!(render_math("\\sum_{i}"), "∑ᵢ");
+
+        let blocks = parse_html("Solve \\(x^2 + \\alpha\\) now");
+        let (Block::Paragraph(content) | Block::Section(content)) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let text: String = content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(text.contains("x²"), "{text}");
+        assert!(text.contains('α'), "{text}");
+
+        // Runs without a Unicode form keep a Script style.
+        let runs = render_math_runs("x^{ab}");
+        assert!(runs
+            .iter()
+            .any(|(text, script)| text == "ab" && *script == Script::Sup));
+
+        // Math entities decode as well.
+        let blocks = parse_html("&sum; &alpha;");
+        let (Block::Paragraph(content) | Block::Section(content)) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let text: String = content
+            .iter()
+            .map(|inline| match inline {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert!(text.contains('∑') && text.contains('α'), "{text}");
     }
 }

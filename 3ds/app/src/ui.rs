@@ -2,6 +2,7 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
@@ -11,6 +12,8 @@ use std::sync::Mutex;
 
 use super::i18n::tr;
 use super::review_text::Block;
+use super::review_text::Cell;
+use super::review_text::DiffClass;
 use super::review_text::Inline;
 use super::review_text::PitchMarker;
 use super::review_text::Style;
@@ -101,6 +104,22 @@ extern "C" {
     );
     fn ui_draw_triangle(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, color: u32);
     fn ui_get_card_text_width(scale: f32, str: *const c_char) -> f32;
+    fn ui_draw_card_text_mono(x: f32, y: f32, scale: f32, color: u32, str: *const c_char);
+    fn ui_get_card_text_width_mono(scale: f32, str: *const c_char) -> f32;
+    fn ui_anim_open(
+        path: *const c_char,
+        width: *mut c_int,
+        height: *mut c_int,
+        frames: *mut c_int,
+    ) -> c_int;
+    fn ui_anim_tick(id: c_int, elapsed_ms: u32);
+    fn ui_anim_draw(id: c_int, x: f32, y: f32, w: f32, h: f32);
+    fn ui_anim_set_playing(id: c_int, playing: bool);
+    fn ui_anim_set_loop(id: c_int, loop_: bool);
+    fn ui_anim_restart(id: c_int);
+    fn ui_anim_is_playing(id: c_int) -> bool;
+    fn ui_anim_finished(id: c_int) -> bool;
+    fn ui_anim_close_all();
     fn ui_prepare_card_text_checked(scale: f32, str: *const c_char) -> bool;
     fn ui_commit_card_text();
     fn ui_reset_card_text();
@@ -370,6 +389,63 @@ impl Ui {
         } else {
             0.0
         }
+    }
+
+    pub fn draw_card_text_mono(x: f32, y: f32, scale: f32, color: u32, s: &str) {
+        if let Ok(c_str) = CString::new(display_text(s).as_bytes()) {
+            unsafe { ui_draw_card_text_mono(x, y, scale, color, c_str.as_ptr()) }
+        }
+    }
+
+    pub fn get_card_text_width_mono(scale: f32, s: &str) -> f32 {
+        if let Ok(c_str) = CString::new(display_text(s).as_bytes()) {
+            unsafe { ui_get_card_text_width_mono(scale, c_str.as_ptr()) }
+        } else {
+            0.0
+        }
+    }
+
+    /// Open animated media. Returns the slot id, or `None` when the format
+    /// is unsupported on this device (the caller draws a poster instead).
+    pub fn anim_open(path: &str) -> Option<(i32, i32, i32)> {
+        let c_str = CString::new(path.as_bytes()).ok()?;
+        let mut width = 0;
+        let mut height = 0;
+        let mut frames = 0;
+        let id = unsafe { ui_anim_open(c_str.as_ptr(), &mut width, &mut height, &mut frames) };
+        (id >= 0).then_some((id, width, height))
+    }
+
+    pub fn anim_tick(id: i32, elapsed_ms: u32) {
+        unsafe { ui_anim_tick(id as c_int, elapsed_ms) }
+    }
+
+    pub fn anim_draw(id: i32, x: f32, y: f32, w: f32, h: f32) {
+        unsafe { ui_anim_draw(id as c_int, x, y, w, h) }
+    }
+
+    pub fn anim_set_playing(id: i32, playing: bool) {
+        unsafe { ui_anim_set_playing(id as c_int, playing) }
+    }
+
+    pub fn anim_set_loop(id: i32, loop_: bool) {
+        unsafe { ui_anim_set_loop(id as c_int, loop_) }
+    }
+
+    pub fn anim_restart(id: i32) {
+        unsafe { ui_anim_restart(id as c_int) }
+    }
+
+    pub fn anim_is_playing(id: i32) -> bool {
+        unsafe { ui_anim_is_playing(id as c_int) }
+    }
+
+    pub fn anim_finished(id: i32) -> bool {
+        unsafe { ui_anim_finished(id as c_int) }
+    }
+
+    pub fn anim_close_all() {
+        unsafe { ui_anim_close_all() }
     }
 
     pub fn prepare_card_text(scale: f32, s: &str) -> bool {
@@ -661,6 +737,10 @@ struct CardPiece {
     rise: f32,
     scale: f32,
     pitch_marker: Option<PitchMarker>,
+    /// Hint toggle pill (`Inline::HintToggle` id).
+    hint: Option<u16>,
+    /// Type-answer input box (`Inline::TypeInput`).
+    typebox: bool,
 }
 
 struct CardLine {
@@ -673,6 +753,9 @@ struct CardLine {
     marker: Option<String>,
     pieces: Vec<CardPiece>,
     rule: bool,
+    /// Left indent in layout space (quotes, table columns). Positive indents
+    /// are left-aligned; zero-indent lines keep the centered layout.
+    indent: f32,
 }
 
 struct LineDraft {
@@ -717,6 +800,43 @@ struct CardMetrics {
     font_scale: f32,
     nominal: f32,
     content_left: f32,
+    indent: f32,
+}
+
+/// An opened animated-media item backing an `Inline::Media` box.
+#[derive(Clone, Debug, Default)]
+pub struct AnimHandle {
+    pub path: String,
+    pub id: i32,
+    pub width: f32,
+    pub height: f32,
+    pub playing: bool,
+    pub supported: bool,
+    pub video: bool,
+    pub autoplay: bool,
+}
+
+struct PlacedAnim {
+    handle: usize,
+    top: f32,
+    x: f32,
+    width: f32,
+    height: f32,
+}
+
+struct PlacedCode {
+    top: f32,
+    height: f32,
+    indent: f32,
+    lines: Vec<String>,
+}
+
+struct TableGrid {
+    top: f32,
+    height: f32,
+    col_x: Vec<f32>,
+    row_y: Vec<f32>,
+    header: Vec<(f32, f32, f32, f32)>,
 }
 
 struct CardImage {
@@ -778,8 +898,16 @@ pub struct RichTextLayout {
     image_paths: Vec<String>,
     width: f32,
     font_scale: f32,
+    typed: String,
+    open_hints: HashSet<u16>,
+    hint_order: Vec<u16>,
     lines: Vec<CardLine>,
     images: Vec<CardImage>,
+    tables: Vec<TableGrid>,
+    codes: Vec<PlacedCode>,
+    quote_bars: Vec<(f32, f32, f32)>,
+    anims: Vec<AnimHandle>,
+    placed_anims: Vec<PlacedAnim>,
     content_height: f32,
     ready: bool,
 }
@@ -791,13 +919,23 @@ impl RichTextLayout {
         self.ready = false;
     }
 
-    pub fn set_text(&mut self, html: &str, images: &[String], width: f32, font_scale: f32) {
+    pub fn set_text(
+        &mut self,
+        html: &str,
+        images: &[String],
+        width: f32,
+        font_scale: f32,
+        hints_open: &HashSet<u16>,
+        typed: &str,
+    ) {
         let font_scale = font_scale.clamp(0.5, 2.5);
         if self.ready
             && self.html == html
             && self.image_paths == images
             && (self.width - width).abs() < 0.01
             && (self.font_scale - font_scale).abs() < 0.001
+            && &self.open_hints == hints_open
+            && self.typed == typed
         {
             return;
         }
@@ -808,94 +946,45 @@ impl RichTextLayout {
         self.images.clear();
         self.width = width;
         self.font_scale = font_scale;
+        self.typed.clear();
+        self.typed.push_str(typed);
+        self.open_hints = hints_open.clone();
 
         let blocks = super::review_text::parse_html(html);
+        self.hint_order = collect_hint_ids(&blocks);
+        self.open_anims(&blocks);
         let nominal = CARD_LINE_HEIGHT * font_scale;
         let block_gap = CARD_BLOCK_GAP * font_scale;
         let section_gap = CARD_SECTION_GAP * font_scale;
         let list_gap = CARD_LIST_GAP * font_scale;
         let rule_height = CARD_RULE_HEIGHT * font_scale;
         let mut lines = Vec::new();
+        let mut tables = Vec::new();
+        let mut codes = Vec::new();
+        let mut bars = Vec::new();
+        let mut placed = Vec::new();
         let mut cursor = 0.0f32;
         let mut first = true;
-        for block in blocks {
-            let between = if first {
-                0.0
-            } else if matches!(&block, Block::ListItem { .. }) {
-                list_gap
-            } else if matches!(&block, Block::Section(_)) {
-                section_gap
-            } else {
-                block_gap
-            };
-            match block {
-                Block::Rule => {
-                    cursor += between;
-                    lines.push(CardLine {
-                        top: cursor,
-                        height: rule_height,
-                        ruby_height: 0.0,
-                        upper: 0.0,
-                        width,
-                        pitch_height: 0.0,
-                        marker: None,
-                        pieces: Vec::new(),
-                        rule: true,
-                    });
-                    cursor += rule_height;
-                }
-                Block::Paragraph(content) => {
-                    cursor += between;
-                    let block_scale = if first {
-                        headword_multiplier(&content)
-                    } else {
-                        1.0
-                    };
-                    self.layout_inlines(
-                        &content,
-                        None,
-                        width,
-                        font_scale,
-                        block_scale,
-                        &mut lines,
-                        &mut cursor,
-                        nominal,
-                    );
-                }
-                Block::Section(content) => {
-                    cursor += between;
-                    let block_scale = if first {
-                        headword_multiplier(&content)
-                    } else {
-                        1.0
-                    };
-                    self.layout_inlines(
-                        &content,
-                        None,
-                        width,
-                        font_scale,
-                        block_scale,
-                        &mut lines,
-                        &mut cursor,
-                        nominal,
-                    );
-                }
-                Block::ListItem { marker, content } => {
-                    cursor += between;
-                    self.layout_inlines(
-                        &content,
-                        Some(marker),
-                        width,
-                        font_scale,
-                        1.0,
-                        &mut lines,
-                        &mut cursor,
-                        nominal,
-                    );
-                }
-            }
-            first = false;
-        }
+        self.layout_blocks(
+            &blocks,
+            0.0,
+            0,
+            true,
+            width,
+            font_scale,
+            nominal,
+            block_gap,
+            section_gap,
+            list_gap,
+            rule_height,
+            &mut lines,
+            &mut tables,
+            &mut codes,
+            &mut bars,
+            &mut placed,
+            &mut cursor,
+            &mut first,
+        );
         let max_width = (width - 8.0).max(32.0);
         let max_height = TOP_HEIGHT - 60.0;
         let mut busy = false;
@@ -937,15 +1026,424 @@ impl RichTextLayout {
         }
         self.content_height = cursor;
         self.lines = lines;
+        self.tables = tables;
+        self.codes = codes;
+        self.quote_bars = bars;
+        self.placed_anims = placed;
         self.ready = !busy;
+    }
+
+    /// Hint ids in document order for the bottom-screen toggle buttons.
+    pub fn hint_ids(&self) -> Vec<u16> {
+        self.hint_order.clone()
+    }
+
+    /// Animated media backing the card's `Inline::Media` boxes.
+    pub fn media_items(&self) -> &[AnimHandle] {
+        &self.anims
+    }
+
+    /// Advance playing animations by the frame time. Call once per frame
+    /// before drawing.
+    pub fn tick_anims(&self, elapsed_ms: u32) {
+        for anim in &self.anims {
+            if anim.supported && anim.playing {
+                Ui::anim_tick(anim.id, elapsed_ms);
+            }
+        }
+    }
+
+    /// Hint toggle at top-screen content coordinates, if any.
+    pub fn hint_at(&self, x: f32, y: f32, scroll: f32) -> Option<u16> {
+        let total = self.content_height + 2.0 * CARD_Y_PADDING;
+        let origin = if total <= TOP_HEIGHT {
+            CARD_Y_PADDING + (TOP_HEIGHT - total) / 2.0
+        } else {
+            CARD_Y_PADDING - scroll.max(0.0)
+        };
+        let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0;
+        for line in &self.lines {
+            let top = origin + line.top;
+            if y < top || y >= top + line.height {
+                continue;
+            }
+            let line_left = if line.indent > 0.01 {
+                content_left + line.indent
+            } else {
+                content_left + (self.width - line.width).max(0.0) / 2.0
+            };
+            for piece in &line.pieces {
+                if let Some(id) = piece.hint {
+                    let left = line_left + piece.x;
+                    if x >= left && x < left + piece.width {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn max_scroll(&self) -> f32 {
         (self.content_height + 2.0 * CARD_Y_PADDING - TOP_HEIGHT).max(0.0)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn layout_blocks(
+        &self,
+        blocks: &[Block],
+        indent: f32,
+        depth: u8,
+        headword: bool,
+        width: f32,
+        font_scale: f32,
+        nominal: f32,
+        block_gap: f32,
+        section_gap: f32,
+        list_gap: f32,
+        rule_height: f32,
+        lines: &mut Vec<CardLine>,
+        tables: &mut Vec<TableGrid>,
+        codes: &mut Vec<PlacedCode>,
+        bars: &mut Vec<(f32, f32, f32)>,
+        placed: &mut Vec<PlacedAnim>,
+        cursor: &mut f32,
+        first: &mut bool,
+    ) {
+        for block in blocks {
+            let between = if *first {
+                0.0
+            } else if matches!(block, Block::ListItem { .. }) {
+                list_gap
+            } else if matches!(block, Block::Section(_)) {
+                section_gap
+            } else {
+                block_gap
+            };
+            match block {
+                Block::Rule => {
+                    *cursor += between;
+                    lines.push(CardLine {
+                        top: *cursor,
+                        height: rule_height,
+                        ruby_height: 0.0,
+                        upper: 0.0,
+                        width,
+                        pitch_height: 0.0,
+                        marker: None,
+                        pieces: Vec::new(),
+                        rule: true,
+                        indent: 0.0,
+                    });
+                    *cursor += rule_height;
+                }
+                Block::Paragraph(content) | Block::Section(content) => {
+                    *cursor += between;
+                    let block_scale = if *first && headword {
+                        headword_multiplier(content)
+                    } else {
+                        1.0
+                    };
+                    self.layout_inlines(
+                        content,
+                        None,
+                        width,
+                        font_scale,
+                        block_scale,
+                        indent,
+                        lines,
+                        placed,
+                        cursor,
+                        nominal,
+                    );
+                }
+                Block::ListItem { marker, content } => {
+                    *cursor += between;
+                    self.layout_inlines(
+                        content,
+                        Some(marker.clone()),
+                        width,
+                        font_scale,
+                        1.0,
+                        indent,
+                        lines,
+                        placed,
+                        cursor,
+                        nominal,
+                    );
+                }
+                Block::Table { rows } => {
+                    *cursor += between;
+                    self.layout_table(
+                        rows, indent, width, font_scale, nominal, lines, tables, placed, cursor,
+                    );
+                }
+                Block::Code { text } => {
+                    *cursor += between;
+                    layout_code(text, indent, font_scale, nominal, codes, cursor);
+                }
+                Block::Hint { id, content } => {
+                    *cursor += between;
+                    if self.open_hints.contains(id) {
+                        let mut nested_first = true;
+                        self.layout_blocks(
+                            content,
+                            indent,
+                            depth,
+                            false,
+                            width,
+                            font_scale,
+                            nominal,
+                            block_gap,
+                            section_gap,
+                            list_gap,
+                            rule_height,
+                            lines,
+                            tables,
+                            codes,
+                            bars,
+                            placed,
+                            cursor,
+                            &mut nested_first,
+                        );
+                    }
+                }
+                Block::Quote(inner) => {
+                    *cursor += between;
+                    let top = *cursor;
+                    let mut nested_first = true;
+                    self.layout_blocks(
+                        inner,
+                        indent + 10.0,
+                        depth + 1,
+                        false,
+                        width,
+                        font_scale,
+                        nominal,
+                        block_gap,
+                        section_gap,
+                        list_gap,
+                        rule_height,
+                        lines,
+                        tables,
+                        codes,
+                        bars,
+                        placed,
+                        cursor,
+                        &mut nested_first,
+                    );
+                    if *cursor > top {
+                        bars.push((top, *cursor - top, indent + 3.0));
+                    }
+                }
+            }
+            *first = false;
+        }
+    }
+
+    /// Open animated media for the card, capped at one video and two animated
+    /// images so a card cannot exhaust the frame budget. Rebuilds preserve
+    /// the playback state of already-open slots.
+    fn open_anims(&mut self, blocks: &[Block]) {
+        let known: Vec<i32> = self
+            .anims
+            .iter()
+            .filter_map(|anim| (anim.id >= 0).then_some(anim.id))
+            .collect();
+        self.anims.clear();
+        let mut medias = Vec::new();
+        collect_media(blocks, &mut medias);
+        let mut videos = 0usize;
+        let mut animated = 0usize;
+        for (path, autoplay, loop_) in medias {
+            let animated_image = is_animated_image(&path);
+            if animated_image {
+                if animated >= 2 {
+                    continue;
+                }
+                animated += 1;
+            } else {
+                if videos >= 1 {
+                    continue;
+                }
+                videos += 1;
+            }
+            let opened = resolve_anim_path(&path);
+            let (id, width, height) = opened.unwrap_or((-1, 0, 0));
+            let supported = id >= 0 && width > 0 && height > 0;
+            let fresh = supported && !known.contains(&id);
+            let playing = if !supported {
+                false
+            } else if fresh {
+                if animated_image {
+                    true
+                } else {
+                    autoplay || super::i18n::autoplay_video()
+                }
+            } else {
+                Ui::anim_is_playing(id)
+            };
+            if fresh {
+                Ui::anim_set_playing(id, playing);
+                Ui::anim_set_loop(id, loop_);
+            }
+            self.anims.push(AnimHandle {
+                path,
+                id,
+                width: width as f32,
+                height: height as f32,
+                playing,
+                supported,
+                video: !animated_image,
+                autoplay,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_table(
+        &self,
+        rows: &[Vec<Cell>],
+        indent: f32,
+        width: f32,
+        font_scale: f32,
+        nominal: f32,
+        lines: &mut Vec<CardLine>,
+        tables: &mut Vec<TableGrid>,
+        placed: &mut Vec<PlacedAnim>,
+        cursor: &mut f32,
+    ) {
+        let columns = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.colspan as usize).sum())
+            .max()
+            .unwrap_or(0);
+        if columns == 0 {
+            return;
+        }
+        // First pass: each column's minimum width (longest word) and
+        // preferred width (unwrapped text), colspan shares split evenly.
+        let scale = CARD_TEXT_SCALE * font_scale;
+        let mut min_widths = vec![0.0f32; columns];
+        let mut pref_widths = vec![0.0f32; columns];
+        for row in rows {
+            let mut column = 0usize;
+            for cell in row {
+                let span = cell.colspan.max(1) as usize;
+                let text = cell_text(&cell.content);
+                let mut longest = 0.0f32;
+                for word in text.split_whitespace() {
+                    longest = longest.max(Ui::get_card_text_width(scale, word));
+                }
+                let preferred = Ui::get_card_text_width(scale, &text);
+                let pad = 8.0 * font_scale;
+                for offset in 0..span {
+                    if column + offset < columns {
+                        min_widths[column + offset] =
+                            min_widths[column + offset].max(longest / span as f32 + pad);
+                        pref_widths[column + offset] =
+                            pref_widths[column + offset].max(preferred / span as f32 + pad);
+                    }
+                }
+                column += span;
+            }
+        }
+        let avail = (width - indent).max(40.0);
+        let total_min: f32 = min_widths.iter().sum();
+        let total_pref: f32 = pref_widths.iter().sum();
+        // Spread the width across columns in proportion; shrink the font to
+        // 0.7x when even the minimum widths do not fit.
+        let mut cell_scale = 1.0f32;
+        let mut col_widths = vec![0.0f32; columns];
+        if total_pref <= avail {
+            let extra = avail - total_pref;
+            for (index, width) in col_widths.iter_mut().enumerate() {
+                let share = if total_pref > 0.0 {
+                    pref_widths[index] / total_pref
+                } else {
+                    1.0 / columns as f32
+                };
+                *width = pref_widths[index] + extra * share;
+            }
+        } else if total_min <= avail {
+            let extra = avail - total_min;
+            let room: f32 = pref_widths
+                .iter()
+                .zip(min_widths.iter())
+                .map(|(pref, min)| (pref - min).max(0.0))
+                .sum();
+            for (index, width) in col_widths.iter_mut().enumerate() {
+                let share = if room > 0.0 {
+                    (pref_widths[index] - min_widths[index]).max(0.0) / room
+                } else {
+                    1.0 / columns as f32
+                };
+                *width = min_widths[index] + extra * share;
+            }
+        } else {
+            cell_scale = 0.7;
+            for (index, width) in col_widths.iter_mut().enumerate() {
+                *width = min_widths[index] * avail / total_min.max(1.0);
+            }
+        }
+        let mut col_x = vec![0.0f32; columns + 1];
+        for index in 0..columns {
+            col_x[index + 1] = col_x[index] + col_widths[index];
+        }
+        let table_top = *cursor;
+        let mut row_y = vec![table_top];
+        let mut header = Vec::new();
+        for row in rows {
+            let row_top = *cursor;
+            let mut height = 0.0f32;
+            let mut column = 0usize;
+            let mut pending_headers = Vec::new();
+            for cell in row {
+                let span = cell.colspan.max(1) as usize;
+                let last = (column + span).min(columns);
+                let cell_w = (col_x[last] - col_x[column]).max(8.0);
+                *cursor = row_top;
+                self.layout_inlines(
+                    &cell.content,
+                    None,
+                    indent + col_x[last],
+                    font_scale * cell_scale,
+                    1.0,
+                    indent + col_x[column],
+                    lines,
+                    placed,
+                    cursor,
+                    nominal * cell_scale,
+                );
+                height = height.max(*cursor - row_top);
+                if cell.header {
+                    pending_headers.push((indent + col_x[column], cell_w));
+                }
+                column += span;
+            }
+            *cursor = row_top + height;
+            row_y.push(*cursor);
+            for (x, w) in pending_headers {
+                header.push((x, row_top, w, height.max(1.0)));
+            }
+        }
+        // Header backgrounds use the row height, now known.
+        tables.push(TableGrid {
+            top: table_top,
+            height: (*cursor - table_top).max(0.0),
+            col_x: col_x.iter().map(|x| indent + x).collect(),
+            row_y,
+            header,
+        });
+    }
+
     pub fn draw(&self, scroll: f32) {
-        if self.lines.is_empty() && self.images.is_empty() {
+        if self.lines.is_empty()
+            && self.images.is_empty()
+            && self.tables.is_empty()
+            && self.codes.is_empty()
+            && self.placed_anims.is_empty()
+        {
             return;
         }
         let total = self.content_height + 2.0 * CARD_Y_PADDING;
@@ -965,6 +1463,11 @@ impl RichTextLayout {
         }
         Ui::commit_card_text();
         let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0;
+        for grid in &self.tables {
+            for (x, y, w, h) in &grid.header {
+                Ui::draw_rect(content_left + x, origin + y, *w, *h, theme().surface);
+            }
+        }
         for line in &self.lines {
             let top = origin + line.top;
             if top > TOP_HEIGHT || top + line.height < 0.0 {
@@ -982,7 +1485,11 @@ impl RichTextLayout {
                 );
                 continue;
             }
-            let line_left = content_left + (self.width - line.width).max(0.0) / 2.0;
+            let line_left = if line.indent > 0.01 {
+                content_left + line.indent
+            } else {
+                content_left + (self.width - line.width).max(0.0) / 2.0
+            };
             let pitch_top = top + line.pitch_height + line.upper;
             let text_top = pitch_top + line.ruby_height;
             if let Some(marker) = &line.marker {
@@ -1010,54 +1517,95 @@ impl RichTextLayout {
                 let text_scale = scale
                     * piece.scale
                     * if piece.style.sub || piece.style.sup {
-                        0.75
+                        0.7
                     } else {
                         1.0
                     };
                 let y = text_top + piece.rise;
                 let base_x = x + (piece.width - piece.base_width) / 2.0;
-                let bar_y =
-                    pitch_top - CARD_PITCH_GAP * self.font_scale * piece.scale.max(1.0);
-                let color = if let Some(rgb) = piece.style.color {
-                    rgba(rgb[0], rgb[1], rgb[2], 255)
-                } else if piece.style.cloze {
-                    theme().new
-                } else if piece.style.bold {
-                    theme().accent
-                } else {
-                    theme().text
+                let bar_y = pitch_top - CARD_PITCH_GAP * self.font_scale * piece.scale.max(1.0);
+                let (color, diff_bg) = match piece.style.diff {
+                    Some(DiffClass::Good) => (rgba(255, 255, 255, 255), Some(theme().diff_good)),
+                    Some(DiffClass::Bad) => (rgba(255, 255, 255, 255), Some(theme().diff_bad)),
+                    Some(DiffClass::Missed) => (theme().text_muted, None),
+                    None => {
+                        let color = if let Some(rgb) = piece.style.color {
+                            rgba(rgb[0], rgb[1], rgb[2], 255)
+                        } else if piece.style.cloze_inactive {
+                            theme().text_muted
+                        } else if piece.style.cloze {
+                            theme().new
+                        } else if piece.style.bold {
+                            theme().accent
+                        } else {
+                            theme().text
+                        };
+                        (color, None)
+                    }
                 };
-                let highlight = piece
-                    .style
-                    .highlight
-                    .map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255))
-                    .or_else(|| piece.style.cloze.then_some(theme().cloze_bg));
+                let highlight = diff_bg.or_else(|| {
+                    piece
+                        .style
+                        .highlight
+                        .map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255))
+                        .or_else(|| {
+                            (!piece.style.cloze_inactive && piece.style.cloze)
+                                .then_some(theme().cloze_bg)
+                        })
+                });
                 if let Some(highlight) = highlight {
                     let height = 15.0
                         * self.font_scale
                         * piece.scale
                         * if piece.style.sub || piece.style.sup {
-                            0.75
+                            0.7
                         } else {
                             1.0
                         };
                     Ui::draw_rect(base_x, y - 1.0, piece.base_width, height, highlight);
                 }
-                Ui::draw_card_text(
-                    base_x,
-                    y,
-                    text_scale,
-                    color,
-                    &piece.text,
-                    piece.style.bold,
-                    piece.style.italic,
-                );
-                if piece.style.underline {
+                if piece.hint.is_some() {
+                    let height = 17.0 * self.font_scale * piece.scale.max(1.0);
+                    Ui::draw_rounded_rect(
+                        x - 5.0,
+                        y - 2.0,
+                        piece.width + 10.0,
+                        height,
+                        height * 0.5,
+                        theme().surface_alt,
+                    );
+                }
+                if piece.typebox {
+                    let height = 17.0 * self.font_scale;
+                    Ui::draw_rounded_rect(x, y - 2.0, piece.width, height, 4.0, theme().surface);
+                    Ui::draw_line(
+                        x,
+                        y + height - 2.0,
+                        x + piece.width,
+                        y + height - 2.0,
+                        1.0,
+                        theme().border,
+                    );
+                }
+                if piece.style.mono {
+                    Ui::draw_card_text_mono(base_x, y, text_scale, color, &piece.text);
+                } else {
+                    Ui::draw_card_text(
+                        base_x,
+                        y,
+                        text_scale,
+                        color,
+                        &piece.text,
+                        piece.style.bold || piece.style.cloze_active,
+                        piece.style.italic,
+                    );
+                }
+                if piece.style.underline || piece.style.diff == Some(DiffClass::Missed) {
                     let underline_y = y + 15.0
                         * self.font_scale
                         * piece.scale
                         * if piece.style.sub || piece.style.sup {
-                            0.75
+                            0.7
                         } else {
                             1.0
                         };
@@ -1119,7 +1667,12 @@ impl RichTextLayout {
                         .pitch
                         .nasal_color
                         .map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255))
-                        .or_else(|| piece.style.color.map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255)))
+                        .or_else(|| {
+                            piece
+                                .style
+                                .color
+                                .map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255))
+                        })
                         .unwrap_or(theme().again_fg);
                     let radius = (2.1 * self.font_scale * piece.scale).clamp(1.7, 4.5);
                     let stroke = (1.1 * self.font_scale).clamp(1.0, 1.8);
@@ -1166,6 +1719,105 @@ impl RichTextLayout {
             let x = (TOP_WIDTH - image.width) / 2.0;
             Ui::media_draw(image.texture, x, top, image.width, image.height);
         }
+        for code in &self.codes {
+            let top = origin + code.top;
+            if top > TOP_HEIGHT || top + code.height < 0.0 {
+                continue;
+            }
+            let x = content_left + code.indent;
+            let width = (self.width - code.indent).max(16.0);
+            Ui::draw_rounded_rect(x, top, width, code.height, 6.0, theme().surface_alt);
+            let mono_scale = scale;
+            let advance = Ui::get_card_text_width_mono(mono_scale, "M").max(1.0);
+            let line_height = CARD_LINE_HEIGHT * self.font_scale;
+            let max_text = (width - 12.0).max(advance);
+            for (index, line) in code.lines.iter().enumerate() {
+                let y = top + 4.0 * self.font_scale + index as f32 * line_height;
+                let mut display = line.clone();
+                while Ui::get_card_text_width_mono(mono_scale, &display) > max_text
+                    && !display.is_empty()
+                {
+                    display.pop();
+                }
+                if display.len() < line.len() {
+                    while Ui::get_card_text_width_mono(mono_scale, &format!("{display}…"))
+                        > max_text
+                        && !display.is_empty()
+                    {
+                        display.pop();
+                    }
+                    display.push('…');
+                }
+                Ui::draw_card_text_mono(x + 6.0, y, mono_scale, theme().text, &display);
+            }
+        }
+        for grid in &self.tables {
+            let top = origin + grid.top;
+            for x in &grid.col_x {
+                Ui::draw_line(
+                    content_left + x,
+                    top,
+                    content_left + x,
+                    top + grid.height,
+                    1.0,
+                    theme().border,
+                );
+            }
+            for y in &grid.row_y {
+                Ui::draw_line(
+                    content_left + grid.col_x.first().copied().unwrap_or(0.0),
+                    origin + y,
+                    content_left + grid.col_x.last().copied().unwrap_or(self.width),
+                    origin + y,
+                    1.0,
+                    theme().border,
+                );
+            }
+        }
+        for (top, height, x) in &self.quote_bars {
+            Ui::draw_rect(content_left + x, origin + top, 3.0, *height, theme().accent);
+        }
+        for placed in &self.placed_anims {
+            let top = origin + placed.top;
+            if top > TOP_HEIGHT || top + placed.height < 0.0 {
+                continue;
+            }
+            let x = content_left + placed.x;
+            let handle = self.anims.get(placed.handle);
+            match handle {
+                Some(anim) if anim.supported => {
+                    Ui::anim_draw(anim.id, x, top, placed.width, placed.height);
+                }
+                _ => {
+                    Ui::draw_rounded_rect(
+                        x,
+                        top,
+                        placed.width,
+                        placed.height,
+                        6.0,
+                        theme().surface_alt,
+                    );
+                    let center_x = x + placed.width / 2.0;
+                    let center_y = top + placed.height / 2.0 - 6.0;
+                    Ui::draw_triangle(
+                        center_x - 8.0,
+                        center_y - 10.0,
+                        center_x - 8.0,
+                        center_y + 10.0,
+                        center_x + 10.0,
+                        center_y,
+                        theme().text_muted,
+                    );
+                    Ui::draw_text_centered(
+                        center_x,
+                        top + placed.height - 16.0,
+                        0.36,
+                        theme().text_muted,
+                        tr("Unsupported video"),
+                    );
+                }
+            }
+        }
     }
 
     fn prepare_visible(&self, origin: f32, scale: f32, ruby_scale: f32) -> bool {
@@ -1191,7 +1843,7 @@ impl RichTextLayout {
                 let text_scale = scale
                     * piece.scale
                     * if piece.style.sub || piece.style.sup {
-                        0.75
+                        0.7
                     } else {
                         1.0
                     };
@@ -1284,7 +1936,9 @@ impl RichTextLayout {
         width: f32,
         font_scale: f32,
         block_scale: f32,
+        indent: f32,
         lines: &mut Vec<CardLine>,
+        placed: &mut Vec<PlacedAnim>,
         cursor: &mut f32,
         nominal: f32,
     ) {
@@ -1293,16 +1947,18 @@ impl RichTextLayout {
             .as_ref()
             .map(|marker| Ui::get_card_text_width(scale, marker))
             .unwrap_or(0.0);
-        let content_left = if marker.is_some() {
-            marker_width + 4.0 * font_scale
-        } else {
-            0.0
-        };
+        let content_left = indent
+            + if marker.is_some() {
+                marker_width + 4.0 * font_scale
+            } else {
+                0.0
+            };
         let metrics = CardMetrics {
             width,
             font_scale,
             nominal,
             content_left,
+            indent,
         };
         let mut draft = LineDraft::new(content_left, marker);
         let mut pending_space = false;
@@ -1387,6 +2043,23 @@ impl RichTextLayout {
                         lines,
                         cursor,
                     );
+                }
+                Inline::TypeInput => {
+                    self.place_typebox(metrics, &mut draft, &mut pending_space, lines, cursor);
+                }
+                Inline::HintToggle { id, label } => {
+                    self.place_hint(
+                        *id,
+                        label,
+                        metrics,
+                        &mut draft,
+                        &mut pending_space,
+                        lines,
+                        cursor,
+                    );
+                }
+                Inline::Media { path, .. } => {
+                    self.place_anim(path, metrics, &mut draft, lines, placed, cursor);
                 }
                 Inline::Break => {
                     let force = !(draft.pieces.is_empty() && draft.marker.is_none());
@@ -1576,6 +2249,8 @@ impl RichTextLayout {
             rise: 0.0,
             scale: 1.0,
             pitch_marker: Some(marker.clone()),
+            hint: None,
+            typebox: false,
         });
         draft.x += width;
         if matches!(
@@ -1585,6 +2260,132 @@ impl RichTextLayout {
             draft.pitch_height = draft.pitch_height.max(CARD_PITCH_HEIGHT * factor);
         }
         *pending_space = false;
+    }
+
+    /// Lay out a type-answer input box showing the text typed so far.
+    fn place_typebox(
+        &self,
+        metrics: CardMetrics,
+        draft: &mut LineDraft,
+        pending_space: &mut bool,
+        lines: &mut Vec<CardLine>,
+        cursor: &mut f32,
+    ) {
+        let scale = CARD_TEXT_SCALE * metrics.font_scale;
+        let text_width = Ui::get_card_text_width(scale, &self.typed);
+        let min_width = 120.0 * metrics.font_scale;
+        let width = (text_width + 14.0)
+            .max(min_width)
+            .min((metrics.width - metrics.content_left).max(min_width));
+        let gap = if draft.has_content() && *pending_space {
+            self.space_width(metrics)
+        } else {
+            0.0
+        };
+        if draft.has_content() && draft.x + gap + width > metrics.width {
+            finish_line(draft, lines, cursor, metrics, true);
+        }
+        let x = draft.x + if draft.has_content() { gap } else { 0.0 };
+        draft.pieces.push(CardPiece {
+            text: self.typed.clone(),
+            style: Style::default(),
+            x,
+            width,
+            base_width: width,
+            ruby_width: 0.0,
+            ruby: None,
+            rise: 0.0,
+            scale: 1.0,
+            pitch_marker: None,
+            hint: None,
+            typebox: true,
+        });
+        draft.x = x + width;
+        *pending_space = false;
+    }
+
+    /// Lay out a hint toggle pill.
+    #[allow(clippy::too_many_arguments)]
+    fn place_hint(
+        &self,
+        id: u16,
+        label: &str,
+        metrics: CardMetrics,
+        draft: &mut LineDraft,
+        pending_space: &mut bool,
+        lines: &mut Vec<CardLine>,
+        cursor: &mut f32,
+    ) {
+        let open = self.open_hints.contains(&id);
+        let text = if open {
+            format!("{label} ▾")
+        } else {
+            format!("{label} ▸")
+        };
+        let scale = CARD_TEXT_SCALE * metrics.font_scale;
+        let width = Ui::get_card_text_width(scale, &text) + 16.0;
+        let gap = if draft.has_content() && *pending_space {
+            self.space_width(metrics)
+        } else {
+            0.0
+        };
+        if draft.has_content() && draft.x + gap + width > metrics.width {
+            finish_line(draft, lines, cursor, metrics, true);
+        }
+        let x = draft.x + if draft.has_content() { gap } else { 0.0 };
+        draft.pieces.push(CardPiece {
+            text,
+            style: Style::default(),
+            x,
+            width,
+            base_width: width,
+            ruby_width: 0.0,
+            ruby: None,
+            rise: 0.0,
+            scale: 1.0,
+            pitch_marker: None,
+            hint: Some(id),
+            typebox: false,
+        });
+        draft.x = x + width;
+        *pending_space = false;
+    }
+
+    /// Reserve a box for animated/video media, sized to the media aspect
+    /// ratio (at most 360x200). Unsupported media gets a poster box.
+    fn place_anim(
+        &self,
+        path: &str,
+        metrics: CardMetrics,
+        draft: &mut LineDraft,
+        lines: &mut Vec<CardLine>,
+        placed: &mut Vec<PlacedAnim>,
+        cursor: &mut f32,
+    ) {
+        if draft.has_content() || draft.marker.is_some() {
+            finish_line(draft, lines, cursor, metrics, true);
+        }
+        let avail = (metrics.width - metrics.indent).max(40.0);
+        let handle = self.anims.iter().position(|anim| anim.path == path);
+        let (width, height) = match handle.and_then(|index| self.anims.get(index)) {
+            Some(anim) if anim.supported && anim.width > 0.0 && anim.height > 0.0 => {
+                let fit = (avail / anim.width)
+                    .min(200.0 / anim.height)
+                    .min(4.0)
+                    .max(0.05);
+                (anim.width * fit, anim.height * fit)
+            }
+            _ => (160.0_f32.min(avail), 90.0),
+        };
+        let x = metrics.indent + (avail - width).max(0.0) / 2.0;
+        placed.push(PlacedAnim {
+            handle: handle.unwrap_or(usize::MAX),
+            top: *cursor,
+            x,
+            width,
+            height,
+        });
+        *cursor += height + CARD_BLOCK_GAP * metrics.font_scale;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1682,6 +2483,8 @@ impl RichTextLayout {
             rise,
             scale: scale_multiplier,
             pitch_marker: None,
+            hint: None,
+            typebox: false,
         });
         draft.x += width;
         draft.ruby_height = draft.ruby_height.max(ruby_height);
@@ -1696,10 +2499,17 @@ impl RichTextLayout {
                 CARD_PITCH_HEIGHT * metrics.font_scale * scale_multiplier.max(1.0),
             );
         }
-        if draft.pieces.last().is_some_and(|piece| piece.ruby.is_some()) {
+        if draft
+            .pieces
+            .last()
+            .is_some_and(|piece| piece.ruby.is_some())
+        {
             let ruby_right = piece_x + (width + ruby_width) * 0.5;
-            draft.last_ruby_right =
-                Some(draft.last_ruby_right.map_or(ruby_right, |previous| previous.max(ruby_right)));
+            draft.last_ruby_right = Some(
+                draft
+                    .last_ruby_right
+                    .map_or(ruby_right, |previous| previous.max(ruby_right)),
+            );
             draft.last_ruby_piece = Some(draft.pieces.len() - 1);
             draft.had_space_since_ruby = false;
         } else if *pending_space {
@@ -1749,6 +2559,8 @@ impl RichTextLayout {
                 rise,
                 scale: piece_scale,
                 pitch_marker: None,
+                hint: None,
+                typebox: false,
             });
             draft.x = x + width;
             draft.ruby_height = draft.ruby_height.max(ruby_height);
@@ -1776,8 +2588,12 @@ impl RichTextLayout {
         scale_multiplier: f32,
     ) -> (f32, f32, f32, f32, f32) {
         let scale = CARD_TEXT_SCALE * font_scale * scale_multiplier;
-        let text_scale = scale * if style.sub || style.sup { 0.75 } else { 1.0 };
-        let mut base_width = Ui::get_card_text_width(text_scale, text);
+        let text_scale = scale * if style.sub || style.sup { 0.7 } else { 1.0 };
+        let mut base_width = if style.mono {
+            Ui::get_card_text_width_mono(text_scale, text)
+        } else {
+            Ui::get_card_text_width(text_scale, text)
+        };
         if style.pitch.nasal {
             base_width += nasal_pad(text, font_scale, scale_multiplier);
         }
@@ -1795,9 +2611,9 @@ impl RichTextLayout {
             0.0
         };
         let rise = if style.sup {
-            -5.0 * font_scale * scale_multiplier
+            -0.35 * CARD_LINE_HEIGHT * font_scale * scale_multiplier
         } else if style.sub {
-            4.0 * font_scale * scale_multiplier
+            0.35 * CARD_LINE_HEIGHT * font_scale * scale_multiplier
         } else {
             0.0
         };
@@ -1841,6 +2657,7 @@ fn finish_line(
         marker: draft.marker.take(),
         pieces: std::mem::take(&mut draft.pieces),
         rule: false,
+        indent: metrics.indent,
     });
     *cursor += height;
     draft.x = metrics.content_left;
@@ -1953,8 +2770,10 @@ fn block_text(content: &[Inline]) -> String {
         match inline {
             Inline::Text { text: value, .. } => text.push_str(value),
             Inline::Ruby { base, .. } | Inline::PitchWord { base, .. } => text.push_str(base),
+            Inline::HintToggle { label, .. } => text.push_str(label),
             Inline::Marker(_) => {}
             Inline::Break => text.push(' '),
+            Inline::TypeInput | Inline::Media { .. } => {}
         }
     }
     text
@@ -1967,5 +2786,149 @@ fn headword_multiplier(content: &[Inline]) -> f32 {
         CARD_HEADWORD_SCALE
     } else {
         1.0
+    }
+}
+
+/// Plain text of a table cell for width measurement.
+fn cell_text(content: &[Inline]) -> String {
+    block_text(content)
+}
+
+/// Hint ids in document order (toggles and bodies, deduplicated).
+fn collect_hint_ids(blocks: &[Block]) -> Vec<u16> {
+    fn walk(blocks: &[Block], ids: &mut Vec<u16>) {
+        for block in blocks {
+            match block {
+                Block::Paragraph(inlines) | Block::Section(inlines) => {
+                    for inline in inlines {
+                        if let Inline::HintToggle { id, .. } = inline {
+                            if !ids.contains(id) {
+                                ids.push(*id);
+                            }
+                        }
+                    }
+                }
+                Block::ListItem { content, .. } => {
+                    for inline in content {
+                        if let Inline::HintToggle { id, .. } = inline {
+                            if !ids.contains(id) {
+                                ids.push(*id);
+                            }
+                        }
+                    }
+                }
+                Block::Table { rows } => {
+                    for row in rows {
+                        for cell in row {
+                            for inline in &cell.content {
+                                if let Inline::HintToggle { id, .. } = inline {
+                                    if !ids.contains(id) {
+                                        ids.push(*id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Block::Hint { id, content } => {
+                    if !ids.contains(id) {
+                        ids.push(*id);
+                    }
+                    walk(content, ids);
+                }
+                Block::Quote(inner) => walk(inner, ids),
+                Block::Code { .. } | Block::Rule => {}
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    walk(blocks, &mut ids);
+    ids
+}
+
+/// `(path, autoplay, loop_)` triples of every media box in document order.
+fn collect_media<'a>(blocks: &'a [Block], out: &mut Vec<(String, bool, bool)>) {
+    fn walk_inlines(inlines: &[Inline], out: &mut Vec<(String, bool, bool)>) {
+        for inline in inlines {
+            if let Inline::Media {
+                path,
+                autoplay,
+                loop_,
+                ..
+            } = inline
+            {
+                out.push((path.clone(), *autoplay, *loop_));
+            }
+        }
+    }
+    for block in blocks {
+        match block {
+            Block::Paragraph(inlines) | Block::Section(inlines) => walk_inlines(inlines, out),
+            Block::ListItem { content, .. } => walk_inlines(content, out),
+            Block::Table { rows } => {
+                for row in rows {
+                    for cell in row {
+                        walk_inlines(&cell.content, out);
+                    }
+                }
+            }
+            Block::Hint { content, .. } => collect_media(content, out),
+            Block::Quote(inner) => collect_media(inner, out),
+            Block::Code { .. } | Block::Rule => {}
+        }
+    }
+}
+
+/// Lay out a `<pre>` code block: rounded background, monospace, no wrapping.
+fn layout_code(
+    text: &str,
+    indent: f32,
+    font_scale: f32,
+    nominal: f32,
+    codes: &mut Vec<PlacedCode>,
+    cursor: &mut f32,
+) {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    if lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let pad = 4.0 * font_scale;
+    let height = pad * 2.0 + lines.len() as f32 * nominal;
+    codes.push(PlacedCode {
+        top: *cursor,
+        height,
+        indent,
+        lines,
+    });
+    *cursor += height;
+}
+
+fn is_animated_image(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "gif" | "webp")
+}
+
+/// Resolve a media filename to an open animation slot, trying the sharded
+/// media path first and the flat path second.
+fn resolve_anim_path(path: &str) -> Option<(i32, i32, i32)> {
+    let name = path
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(path);
+    let sharded =
+        anki::media::files::sharded_path(std::path::Path::new(super::backend::MEDIA_DIR), name)
+            .to_string_lossy()
+            .into_owned();
+    if let Some(opened) = Ui::anim_open(&sharded) {
+        return Some(opened);
+    }
+    let root = format!("{}/{name}", super::backend::MEDIA_DIR);
+    if root != sharded {
+        Ui::anim_open(&root)
+    } else {
+        None
     }
 }

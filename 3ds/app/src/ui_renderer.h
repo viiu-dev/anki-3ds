@@ -52,6 +52,9 @@ typedef struct {
     uint32_t easy_bg;
     uint32_t easy_fg;
     uint32_t shadow;
+    uint32_t diff_good;
+    uint32_t diff_bad;
+    uint32_t diff_missed;
 } UiTheme;
 
 // `font_data` is the bundled TrueType font and must remain valid for the
@@ -88,6 +91,10 @@ void ui_commit_card_text(void);
 void ui_reset_card_text(void);
 void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char* str, bool bold, bool italic);
 float ui_get_card_text_width(float scale, const char* str);
+// Monospace card text at a fixed advance (the advance of 'M' in the main
+// font), so no extra font asset is needed.
+void ui_draw_card_text_mono(float x, float y, float scale, uint32_t color, const char* str);
+float ui_get_card_text_width_mono(float scale, const char* str);
 
 // Compact clock + battery cluster without the old status-bar banner.
 float ui_draw_status_compact(float x_right, float y, float scale, int sync_state,
@@ -112,6 +119,21 @@ void ui_media_reset(void);
 void ui_media_refresh(void);
 bool ui_media_prefetch(const char* path);
 void ui_media_prefetch_clear(void);
+
+// Animated card media (GIF / animated WebP posters and video). Slots are
+// capped so a card holds at most a few megabytes of decoded frames; video
+// decoding beyond MJPEG-in-AVI reports -1 (unsupported on this device) and
+// the caller draws a poster instead.
+typedef enum { UI_ANIM_GIF, UI_ANIM_WEBP, UI_ANIM_VIDEO } UiAnimKind;
+int  ui_anim_open(const char* path, int* w, int* h, int* frame_count); // -1 = unsupported
+void ui_anim_tick(int id, uint32_t elapsed_ms);   // advance by frame delays
+void ui_anim_draw(int id, float x, float y, float w, float h);
+void ui_anim_set_playing(int id, bool playing);
+void ui_anim_set_loop(int id, bool loop_);
+void ui_anim_restart(int id);
+bool ui_anim_is_playing(int id);
+bool ui_anim_finished(int id);
+void ui_anim_close_all(void);
 
 bool ui_audio_play(const char* path);
 bool ui_audio_decode(const char* path);

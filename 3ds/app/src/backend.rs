@@ -27,6 +27,9 @@ use anki_proto::scheduler::GetQueuedCardsRequest;
 use regex::Regex;
 
 use super::i18n::tr;
+use super::review_text::media_kind_for_filename;
+
+pub use super::review_text::MediaKind;
 
 pub const PATH: &str = "sdmc:/3ds/anki-3ds/prototype.anki2";
 pub const MEDIA_DIR: &str = "sdmc:/3ds/anki-3ds/prototype.media";
@@ -77,6 +80,19 @@ pub struct Backend {
 pub struct MediaRef {
     pub filename: String,
     pub audio: bool,
+    pub kind: MediaKind,
+}
+
+/// A `[[type:...]]` answer field found in the rendered question. `expected`
+/// is the note field text (narrowed to the active cloze ordinal for
+/// `cloze:`), `combining` is false for the `nc` modifier, and `ignore_case`
+/// is true for the `ci` modifier.
+#[derive(Clone, Debug)]
+pub struct TypeAnswer {
+    pub field: String,
+    pub expected: String,
+    pub combining: bool,
+    pub ignore_case: bool,
 }
 
 impl MediaRef {
@@ -87,16 +103,8 @@ impl MediaRef {
     }
 }
 
-const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "ogg", "oga", "opus", "wav", "wave"];
-
-fn is_audio_file(filename: &str) -> bool {
-    let ext = filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    AUDIO_EXTENSIONS.contains(&ext.as_str())
-}
+static TYPE_ANSWER_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[type:(.+?)\]\]").expect("static type-answer pattern"));
 
 fn media_names(field: &str) -> Vec<String> {
     let mut names = Vec::new();
@@ -173,6 +181,26 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Replace every `[[type:...]]` placeholder in card HTML with `replacement`.
+/// The replacement is inserted literally (no `$` expansion), so compared
+/// answer HTML passes through unchanged.
+pub fn fill_type_answer(html: &str, replacement: &str) -> String {
+    TYPE_ANSWER_TAG
+        .replace_all(html, regex::NoExpand(replacement))
+        .into_owned()
+}
+
+/// Surface video refs as `<video>` markers so the card parser routes them to
+/// the animated-media player. The original `[sound:...]` tags were already
+/// removed by AV stripping, so the markers are appended at the end of the
+/// side's HTML.
+fn append_video_markers(html: &mut String, media: &[MediaRef]) {
+    for item in media.iter().filter(|item| item.kind == MediaKind::Video) {
+        let src = item.filename.replace('&', "&amp;").replace('"', "&quot;");
+        html.push_str(&format!("<video src=\"{src}\"></video>"));
+    }
+}
+
 fn clear_stale_locks() {
     static CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if CLEARED.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -231,6 +259,7 @@ pub struct OfferedCard {
     pub question_html: String,
     pub answer_html: String,
     pub cloze_answer_html: Option<String>,
+    pub type_answer: Option<TypeAnswer>,
     pub question_media: Vec<MediaRef>,
     pub answer_media: Vec<MediaRef>,
     pub new_count: u32,
@@ -572,12 +601,23 @@ impl Backend {
         }
         let question_nodes = render_nodes(rendered.question_nodes);
         let answer_nodes = render_nodes(rendered.answer_nodes);
-        let question_html = self.to_html(&question_nodes)?;
-        let answer_html_full = self.to_html(&answer_nodes)?;
+        let mut question_html = self.to_html(&question_nodes)?;
+        let mut answer_html_full = self.to_html(&answer_nodes)?;
         let mut question_media = self.media_refs(&question_nodes, true)?;
+        // AV stripping removed the original `[sound:clip.mp4]` tags; surface
+        // video refs as `<video>` markers so the parser routes them to the
+        // animated-media player instead of the still-image list. (Animated
+        // `<img>` tags are handled by the parser directly.)
+        append_video_markers(&mut question_html, &question_media);
         question_media.extend(self.image_refs(&question_nodes));
         let mut answer_media = self.media_refs(&answer_nodes, false)?;
+        append_video_markers(&mut answer_html_full, &answer_media);
         answer_media.extend(self.image_refs(&answer_nodes));
+        let type_answer = self.type_answer_for_card(
+            &question_html,
+            queued_card.note_id,
+            queued_card.template_idx,
+        );
         let cloze_answer_html = super::review_text::mark_clozes(&answer_html_full);
         let answer_html = self.answer_html(&answer_html_full);
         let intervals = SchedulerService::describe_next_states(
@@ -594,6 +634,7 @@ impl Backend {
             question_html,
             answer_html,
             cloze_answer_html,
+            type_answer,
             question_media,
             answer_media,
             queued,
@@ -602,6 +643,85 @@ impl Backend {
             review_count,
             shown_at: TimestampMillis::now().0,
         })
+    }
+
+    /// Look for a `[[type:...]]` placeholder in the rendered question and
+    /// resolve the expected answer from the note field. For `cloze:`, the
+    /// active cloze ordinal's text is collected (multiple entries joined with
+    /// `, `) as upstream does. Returns `None` when there is no placeholder,
+    /// the field is unknown, or the expected text is empty.
+    fn type_answer_for_card(
+        &mut self,
+        question_html: &str,
+        note_id: i64,
+        template_idx: u32,
+    ) -> Option<TypeAnswer> {
+        let captures = TYPE_ANSWER_TAG.captures(question_html)?;
+        let spec = captures.get(1)?.as_str();
+        // Field names cannot contain a colon, so anything before the last
+        // one is a modifier.
+        let (modifiers, field) = spec.rsplit_once(':').unwrap_or(("", spec));
+        let mut combining = true;
+        let mut ignore_case = false;
+        let mut cloze = false;
+        for modifier in modifiers.split(':') {
+            match modifier {
+                "cloze" => cloze = true,
+                "nc" => combining = false,
+                "ci" => ignore_case = true,
+                _ => {}
+            }
+        }
+        if field.is_empty() {
+            return None;
+        }
+        let note = self.collection.storage.get_note(note_id.into()).ok()??;
+        let notetype = self.collection.get_notetype(note.notetype_id).ok()??;
+        let index = notetype.fields.iter().position(|f| f.name == field)?;
+        let field_text = note.fields().get(index)?.clone();
+        let expected = if cloze {
+            anki::cloze::extract_cloze_for_typing(&field_text, (template_idx + 1) as u16)
+                .into_owned()
+        } else {
+            field_text
+        };
+        if expected.trim().is_empty() {
+            return None;
+        }
+        Some(TypeAnswer {
+            field: field.to_owned(),
+            expected,
+            combining,
+            ignore_case,
+        })
+    }
+
+    /// Compare a typed answer against the expected text, returning
+    /// `<code id=typeans>` HTML with `typeGood`/`typeBad`/`typeMissed`
+    /// spans. Thin wrapper over the core type-answer comparison.
+    pub fn compare_answer(&mut self, expected: &str, provided: &str, combining: bool) -> String {
+        self.compare_answer_full(expected, provided, combining, false)
+    }
+
+    /// [`Backend::compare_answer`] with an explicit `ci` (ignore-case) flag.
+    pub fn compare_answer_full(
+        &mut self,
+        expected: &str,
+        provided: &str,
+        combining: bool,
+        ignore_case: bool,
+    ) -> String {
+        CardRenderingService::compare_answer(
+            &mut self.collection,
+            anki_proto::card_rendering::CompareAnswerRequest {
+                expected: expected.to_owned(),
+                provided: provided.to_owned(),
+                combining,
+                ignore_case,
+            },
+        )
+        .map(|response| response.val)
+        .unwrap_or_else(|_| expected.to_owned())
     }
 
     pub fn collection_modified_ms(&mut self) -> Result<i64> {
@@ -650,10 +770,14 @@ impl Backend {
                 continue;
             }
             match clean_media_ref(src) {
-                Some(filename) => refs.push(MediaRef {
-                    filename,
-                    audio: false,
-                }),
+                Some(filename) => {
+                    let kind = media_kind_for_filename(&filename);
+                    refs.push(MediaRef {
+                        audio: kind == MediaKind::Audio,
+                        kind,
+                        filename,
+                    })
+                }
                 None => super::event(&format!(
                     "IMAGE_REF_SKIP reason=bad_name src={}",
                     src.chars().take(160).collect::<String>()
@@ -687,8 +811,12 @@ impl Backend {
             .filter_map(|tag| match tag.value {
                 Some(anki_proto::card_rendering::av_tag::Value::SoundOrVideo(filename)) => {
                     let filename = clean_media_ref(&filename)?;
-                    let audio = is_audio_file(&filename);
-                    Some(MediaRef { filename, audio })
+                    let kind = media_kind_for_filename(&filename);
+                    Some(MediaRef {
+                        audio: kind == MediaKind::Audio,
+                        kind,
+                        filename,
+                    })
                 }
                 _ => None,
             })

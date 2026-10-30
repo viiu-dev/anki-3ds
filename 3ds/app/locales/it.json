@@ -221,5 +221,14 @@
     "Clock": "Orologio",
     "Move up [Y]": "Su [Y]",
     "Move down [X]": "Giù [X]",
-    "A toggles. LEFT/RIGHT reorders. B returns.": "A attiva. SIN/DES sposta. B indietro."
+    "A toggles. LEFT/RIGHT reorders. B returns.": "A attiva. SIN/DES sposta. B indietro.",
+    "Type answer": "Type answer",
+    "Show Hint {0}": "Show Hint {0}",
+    "Hide Hint {0}": "Hide Hint {0}",
+    "Replay": "Replay",
+    "Play": "Play",
+    "Pause": "Pause",
+    "Unsupported video": "Unsupported video",
+    "Auto-play video": "Auto-play video",
+    "Auto-play video: {0}": "Auto-play video: {0}"
 }

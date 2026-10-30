@@ -33,9 +33,13 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
   The bottom screen shows the deck, counters, a large Show Answer button, and
   rating buttons with their intervals. Y Again, X Hard, A Good, R Easy.
   Touch ratings also work. Revealed cloze answers appear highlighted in their
-  context on the top screen. Scroll with the Circle Pad, D-pad, C-stick, ZL or
-  ZR; a subtle scrollbar appears at the right edge when the card is taller
-  than the screen.
+  context on the top screen. Tables, code blocks, blockquotes, hint pills
+  ("Show Hint N" buttons on the bottom screen, L opens the next one) and
+  LaTeX/MathJax approximations render inline. Cards with a type-answer field
+  show a "Type answer" button (or press Y); the typed text appears in the
+  input box, and the answer screen shows the green/red comparison. Scroll
+  with the Circle Pad, D-pad, C-stick, ZL or ZR; a subtle scrollbar appears
+  at the right edge when the card is taller than the screen.
 - Font scale: Settings → Font scale offers 85%, 100%, 125%, 150%, 175%, 200%
   and 250%. A advances the setting and Left/Right adjusts it. It scales card
   text, furigana and line spacing, and is saved in `settings.json`. Card text is
@@ -65,7 +69,11 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
   twice before replacement.
 - Card images referenced by a card render on the top screen, scaled to fit with
   their aspect ratio preserved and included in the vertical scroll. PNG, JPEG,
-  GIF, BMP, WebP and SVG are supported.
+  BMP and SVG are supported; GIF and animated WebP play inline, and video
+  (`[sound:clip.mp4]`, `<video>`, MJPEG AVI) shows a player with Replay and
+  Play/Pause controls on the bottom screen. H.264 MP4 and VP8/VP9 WebM cannot
+  be decoded on this hardware and show an "Unsupported video" poster instead.
+  Settings → Auto-play video starts card video without tapping.
 - Card audio appears as tappable Audio buttons on the bottom screen; press L to
   replay/cycle. Settings → Auto-play audio plays the first clip when a card is
   revealed. MP3, Ogg Vorbis, Opus and WAV audio are decoded on the console.

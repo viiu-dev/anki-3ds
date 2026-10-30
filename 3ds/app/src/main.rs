@@ -207,6 +207,47 @@ fn browse_status(status: &backend::CardStatus) -> String {
     }
 }
 
+/// Per-card review extras: typed answer text, open hints, animated-media
+/// selection/playback, and the cached reveal HTML. Reset whenever the
+/// reviewed card id changes; kept across the question/answer transition of
+/// the same card.
+#[derive(Default)]
+struct ReviewState {
+    typed: Option<String>,
+    hints_open: Vec<u16>,
+    media_sel: usize,
+    media_playing: bool,
+    media_ready: bool,
+    revealed: Option<RevealedHtml>,
+}
+
+struct RevealedHtml {
+    card_id: i64,
+    answer: String,
+}
+
+impl ReviewState {
+    fn hints_set(&self) -> HashSet<u16> {
+        self.hints_open.iter().copied().collect()
+    }
+
+    fn toggle_hint(&mut self, id: u16) {
+        if let Some(index) = self.hints_open.iter().position(|hint| *hint == id) {
+            self.hints_open.remove(index);
+        } else {
+            self.hints_open.push(id);
+        }
+    }
+}
+
+/// Next unopened hint, if any, for the L button.
+fn next_closed_hint(top_card: &RichTextLayout, review: &ReviewState) -> Option<u16> {
+    top_card
+        .hint_ids()
+        .into_iter()
+        .find(|id| !review.hints_open.contains(id))
+}
+
 fn browse_chip_rects() -> [(f32, f32); 5] {
     let labels = [
         tr("All"),
@@ -628,7 +669,7 @@ fn prefetch_for_card(backend: &Backend, card: &backend::OfferedCard) -> Vec<Pref
         .answer_media
         .iter()
         .chain(card.question_media.iter())
-        .filter(|item| !item.audio)
+        .filter(|item| item.kind == backend::MediaKind::Image)
     {
         if backend.media_exists(&item.filename) {
             files.push(PrefetchFile::Image(backend.media_path(&item.filename)));
@@ -686,6 +727,70 @@ impl Prefetch {
 
 const MEDIA_STATUS_Y: f32 = 28.0;
 
+fn draw_hint_chips(top_card: &RichTextLayout, review: &ReviewState, y: f32) {
+    let ids = top_card.hint_ids();
+    if ids.is_empty() {
+        return;
+    }
+    for (index, (x, width)) in hint_chip_rects(&ids, review).into_iter().enumerate() {
+        let id = ids[index];
+        let open = review.hints_open.contains(&id);
+        Ui::draw_button(
+            x,
+            y,
+            width,
+            18.0,
+            &hint_chip_label(index, open),
+            None,
+            if open { 0 } else { 6 },
+            false,
+        );
+    }
+}
+
+fn draw_media_bar(top_card: &RichTextLayout, review: &ReviewState, answer_side: bool) {
+    let items = top_card.media_items();
+    if items.is_empty() {
+        return;
+    }
+    let selected = review.media_sel.min(items.len() - 1);
+    let playing = review.media_playing
+        && items
+            .get(selected)
+            .is_some_and(|anim| anim.supported && Ui::anim_is_playing(anim.id));
+    let finished = items
+        .get(selected)
+        .is_some_and(|anim| anim.supported && Ui::anim_finished(anim.id));
+    let (y, replay, play, sel) = if answer_side {
+        (150.0, (8.0, 68.0), (80.0, 68.0), (152.0, 76.0))
+    } else {
+        (206.0, (8.0, 70.0), (82.0, 70.0), (156.0, 100.0))
+    };
+    Ui::draw_button(replay.0, y, replay.1, 24.0, tr("Replay"), None, 6, false);
+    Ui::draw_button(
+        play.0,
+        y,
+        play.1,
+        24.0,
+        if playing { tr("Pause") } else { tr("Play") },
+        None,
+        6,
+        false,
+    );
+    let label = format!("< {}/{} >", selected + 1, items.len());
+    Ui::draw_button(sel.0, y, sel.1, 24.0, &label, None, 6, false);
+    let bar_w = sel.0 + sel.1 - 8.0;
+    Ui::draw_rect(8.0, y + 26.0, bar_w, 3.0, current_theme().surface_alt);
+    let (fraction, state) = if finished {
+        (1.0, current_theme().text_faint)
+    } else if playing {
+        (1.0, current_theme().review)
+    } else {
+        (0.33, current_theme().accent)
+    };
+    Ui::draw_rect(8.0, y + 26.0, bar_w * fraction, 3.0, state);
+}
+
 fn draw_media_strip(status: Option<&str>, pending: bool) {
     if pending {
         Ui::draw_text_centered(
@@ -730,6 +835,70 @@ fn audio_tap(audio: &[backend::MediaRef], page: usize, x: f32) -> Action {
         }
     }
     Action::None
+}
+
+fn hint_chip_label(index: usize, open: bool) -> String {
+    let key = if open {
+        "Hide Hint {0}"
+    } else {
+        "Show Hint {0}"
+    };
+    i18n::format(key, &[&(index + 1).to_string()])
+}
+
+/// Centered row of hint chips for the bottom screen.
+fn hint_chip_rects(ids: &[u16], review: &ReviewState) -> Vec<(f32, f32)> {
+    let widths: Vec<f32> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            Ui::get_text_width(
+                0.38,
+                &hint_chip_label(index, review.hints_open.contains(id)),
+            ) + 16.0
+        })
+        .collect();
+    let total: f32 = widths.iter().sum::<f32>() + 4.0 * (widths.len().saturating_sub(1) as f32);
+    let mut x = ((320.0 - total) * 0.5).max(2.0);
+    let mut rects = Vec::with_capacity(widths.len());
+    for width in widths {
+        rects.push((x, width));
+        x += width + 4.0;
+    }
+    rects
+}
+
+fn hint_chip_tap(top_card: &RichTextLayout, review: &ReviewState, x: f32) -> Action {
+    let ids = top_card.hint_ids();
+    for (index, (cx, cw)) in hint_chip_rects(&ids, review).into_iter().enumerate() {
+        if x >= cx && x < cx + cw {
+            if let Some(id) = ids.get(index) {
+                return Action::HintToggle(*id);
+            }
+        }
+    }
+    Action::None
+}
+
+fn media_bar_tap(top_card: &RichTextLayout, x: f32, answer_side: bool) -> Action {
+    if top_card.media_items().is_empty() {
+        return Action::None;
+    }
+    // Must match draw_media_bar geometry.
+    let (replay, play, sel) = if answer_side {
+        ((8.0, 68.0), (80.0, 68.0), (152.0, 76.0))
+    } else {
+        ((8.0, 70.0), (82.0, 70.0), (156.0, 100.0))
+    };
+    if x >= replay.0 && x < replay.0 + replay.1 {
+        Action::MediaReplay
+    } else if x >= play.0 && x < play.0 + play.1 {
+        Action::MediaToggle
+    } else if x >= sel.0 && x < sel.0 + sel.1 {
+        Action::MediaSelect(if x < sel.0 + sel.1 / 2.0 { -1 } else { 1 })
+    } else {
+        Action::None
+    }
 }
 
 fn browse_row(y: f32, title: &str, selected: bool) {
@@ -1097,6 +1266,11 @@ enum Action {
     Restore,
     PlayAudio(Option<usize>),
     AudioPage(i32),
+    TypeAnswer,
+    HintToggle(u16),
+    MediaToggle,
+    MediaReplay,
+    MediaSelect(i32),
     MediaSync,
     Exit,
 }
@@ -1370,6 +1544,7 @@ enum ChoiceKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToggleKind {
     Autoplay,
+    AutoplayVideo,
     ConsoleLeds,
     RatingIcon,
     CardCounts,
@@ -1389,8 +1564,9 @@ const APPEARANCE_ITEMS: [SettingsItem; 4] = [
     SettingsItem::Choice(ChoiceKind::Battery),
     SettingsItem::Toolbar,
 ];
-const AUDIO_ITEMS: [SettingsItem; 3] = [
+const AUDIO_ITEMS: [SettingsItem; 4] = [
     SettingsItem::Toggle(ToggleKind::Autoplay),
+    SettingsItem::Toggle(ToggleKind::AutoplayVideo),
     SettingsItem::Toggle(ToggleKind::RatingIcon),
     SettingsItem::Toggle(ToggleKind::CardCounts),
 ];
@@ -1516,6 +1692,13 @@ fn apply_toggle(kind: ToggleKind) -> std::io::Result<()> {
             let value = i18n::toggle_autoplay_audio()?;
             event(&format!("AUTOPLAY {}", if value { "on" } else { "off" }));
         }
+        ToggleKind::AutoplayVideo => {
+            let value = i18n::toggle_autoplay_video()?;
+            event(&format!(
+                "AUTOPLAY_VIDEO {}",
+                if value { "on" } else { "off" }
+            ));
+        }
         ToggleKind::ConsoleLeds => {
             let value = i18n::toggle_console_leds()?;
             leds::apply(value);
@@ -1551,6 +1734,10 @@ fn settings_item_label(
             } else {
                 "Off"
             })],
+        ),
+        SettingsItem::Toggle(ToggleKind::AutoplayVideo) => i18n::format(
+            "Auto-play video: {0}",
+            &[tr(if i18n::autoplay_video() { "On" } else { "Off" })],
         ),
         SettingsItem::Toggle(ToggleKind::ConsoleLeds) => i18n::format(
             "Console LEDs: {0}",
@@ -1827,6 +2014,8 @@ fn main() {
     let mut card_scroll = 0usize;
     let mut review_scroll = 0.0f32;
     let mut review_max_scroll = 0.0f32;
+    let mut review = ReviewState::default();
+    let mut last_frame = Instant::now();
     let mut audio_index = 0usize;
     let mut audio_page = 0usize;
     let mut last_autoplay_card: Option<(i64, bool)> = None;
@@ -2082,6 +2271,10 @@ fn main() {
             Action::Search
         } else if matches!(screen, Screen::Question { .. }) && down.contains(KeyPad::X) {
             Action::Edit
+        } else if matches!(&screen, Screen::Question { card, .. } if card.type_answer.is_some())
+            && down.contains(KeyPad::Y)
+        {
+            Action::TypeAnswer
         } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::Y) {
             Action::Rate(0)
         } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::X) {
@@ -2095,7 +2288,9 @@ fn main() {
         } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
             && down.contains(KeyPad::L)
         {
-            Action::PlayAudio(None)
+            // The L button opens the next closed hint; once all hints are
+            // open it replays audio as before.
+            next_closed_hint(&top_card, &review).map_or(Action::PlayAudio(None), Action::HintToggle)
         } else if down.contains(KeyPad::A) {
             Action::Primary
         } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
@@ -2197,6 +2392,13 @@ fn main() {
                     Action::Sync
                 }
                 Screen::Question { card, .. }
+                    if card.type_answer.is_some()
+                        && (96.0..124.0).contains(&y)
+                        && (8.0..216.0).contains(&x) =>
+                {
+                    Action::TypeAnswer
+                }
+                Screen::Question { card, .. }
                     if (AUDIO_Y..AUDIO_Y + AUDIO_H + 8.0).contains(&y) =>
                 {
                     audio_tap(&card_audio(card, false), audio_page, x)
@@ -2237,6 +2439,18 @@ fn main() {
                     } else {
                         Action::None
                     }
+                }
+                Screen::Question { .. } if (184.0..202.0).contains(&y) => {
+                    hint_chip_tap(&top_card, &review, x)
+                }
+                Screen::Question { .. } if (206.0..236.0).contains(&y) => {
+                    media_bar_tap(&top_card, x, false)
+                }
+                Screen::Answer { .. } if (126.0..144.0).contains(&y) => {
+                    hint_chip_tap(&top_card, &review, x)
+                }
+                Screen::Answer { .. } if (150.0..176.0).contains(&y) => {
+                    media_bar_tap(&top_card, x, true)
                 }
                 Screen::Editor { .. } if x >= 304.0 && (43.0..187.0).contains(&y) => {
                     if y < 115.0 {
@@ -3225,6 +3439,79 @@ fn main() {
                     let pages = audio_page_count(total);
                     audio_page = (audio_page as i32 + delta).clamp(0, pages as i32 - 1) as usize;
                 }
+                Action::TypeAnswer => {
+                    let (field, initial) = match &screen {
+                        Screen::Question { card, .. } => match &card.type_answer {
+                            Some(answer) => (
+                                answer.field.clone(),
+                                review.typed.clone().unwrap_or_default(),
+                            ),
+                            None => return Ok(()),
+                        },
+                        _ => return Ok(()),
+                    };
+                    if let Some(value) = Ui::keyboard(&field, &initial)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                    {
+                        review.typed = Some(value);
+                        event("TYPE_ANSWER typed");
+                    }
+                }
+                Action::HintToggle(id) => {
+                    review.toggle_hint(id);
+                    event(&format!(
+                        "HINT toggle={id} open={}",
+                        review.hints_open.contains(&id)
+                    ));
+                }
+                Action::MediaToggle => {
+                    if let Some(anim) = top_card.media_items().get(review.media_sel) {
+                        if anim.supported {
+                            review.media_playing = !review.media_playing;
+                            if review.media_playing && Ui::anim_finished(anim.id) {
+                                Ui::anim_restart(anim.id);
+                            }
+                            Ui::anim_set_playing(anim.id, review.media_playing);
+                            event(&format!("ANIM toggle playing={}", review.media_playing));
+                        }
+                    }
+                }
+                Action::MediaReplay => {
+                    let items = top_card.media_items();
+                    if let Some(anim) =
+                        items.get(review.media_sel.min(items.len().saturating_sub(1)))
+                    {
+                        if anim.supported {
+                            Ui::anim_restart(anim.id);
+                            Ui::anim_set_playing(anim.id, true);
+                            review.media_playing = true;
+                            event("ANIM replay");
+                        }
+                    }
+                }
+                Action::MediaSelect(delta) => {
+                    let len = top_card.media_items().len();
+                    if len > 0 {
+                        let previous = review.media_sel;
+                        review.media_sel =
+                            (review.media_sel as i32 + delta).rem_euclid(len as i32) as usize;
+                        if review.media_playing && previous != review.media_sel {
+                            if let Some(old) = top_card.media_items().get(previous) {
+                                if old.supported {
+                                    Ui::anim_set_playing(old.id, false);
+                                }
+                            }
+                            if let Some(new) = top_card.media_items().get(review.media_sel) {
+                                if new.supported {
+                                    if Ui::anim_finished(new.id) {
+                                        Ui::anim_restart(new.id);
+                                    }
+                                    Ui::anim_set_playing(new.id, true);
+                                }
+                            }
+                        }
+                    }
+                }
                 Action::FullSync => {
                     screen = Screen::SyncChoice {
                         upload_ok: true,
@@ -3300,6 +3587,36 @@ fn main() {
                         Screen::Question { .. } => {
                             let old = std::mem::replace(&mut screen, Screen::Decks);
                             if let Screen::Question { card, deck_name } = old {
+                                // Compare the typed answer once and cache the
+                                // reveal HTML for the answer screen.
+                                if let Some(answer) = card.type_answer.clone() {
+                                    if let Some(active) = backend.as_mut() {
+                                        let typed = review.typed.clone().unwrap_or_default();
+                                        let compared = if answer.ignore_case {
+                                            active.compare_answer_full(
+                                                &answer.expected,
+                                                &typed,
+                                                answer.combining,
+                                                true,
+                                            )
+                                        } else {
+                                            active.compare_answer(
+                                                &answer.expected,
+                                                &typed,
+                                                answer.combining,
+                                            )
+                                        };
+                                        let base = card
+                                            .cloze_answer_html
+                                            .as_deref()
+                                            .unwrap_or(&card.answer_html);
+                                        review.revealed = Some(RevealedHtml {
+                                            card_id: card.id,
+                                            answer: backend::fill_type_answer(base, &compared),
+                                        });
+                                        event("TYPE_ANSWER compared");
+                                    }
+                                }
                                 screen = Screen::Answer { card, deck_name };
                             }
                             card_scroll = 0;
@@ -3743,6 +4060,14 @@ fn main() {
                 }
             }
         }
+        if review_card.map(|entry| entry.0) != last_review_card.map(|entry| entry.0) {
+            // New card (or left review): drop the typed answer, open hints,
+            // media selection and cached reveal HTML, and release animation
+            // slots. The question/answer transition of the same card keeps
+            // them.
+            review = ReviewState::default();
+            Ui::anim_close_all();
+        }
         if card_changed {
             last_review_card = review_card;
         }
@@ -3988,12 +4313,26 @@ fn main() {
             }
             Screen::Question { card, .. } | Screen::Answer { card, .. } => {
                 let answer = matches!(screen, Screen::Answer { .. });
-                let html = if answer {
-                    card.cloze_answer_html
-                        .as_deref()
-                        .unwrap_or(&card.answer_html)
+                let owned_html = if !answer && card.type_answer.is_some() {
+                    // Show the input box where the `[[type:...]]`
+                    // placeholder was so it never leaks onto the card.
+                    Some(backend::fill_type_answer(
+                        &card.question_html,
+                        "<input id=typeans>",
+                    ))
                 } else {
-                    &card.question_html
+                    None
+                };
+                let html = if answer {
+                    match &review.revealed {
+                        Some(revealed) if revealed.card_id == card.id => revealed.answer.as_str(),
+                        _ => card
+                            .cloze_answer_html
+                            .as_deref()
+                            .unwrap_or(&card.answer_html),
+                    }
+                } else {
+                    owned_html.as_deref().unwrap_or(card.question_html.as_str())
                 };
                 let media = if answer {
                     &card.answer_media
@@ -4002,7 +4341,7 @@ fn main() {
                 };
                 let images: Vec<String> = media
                     .iter()
-                    .filter(|item| !item.audio)
+                    .filter(|item| item.kind == backend::MediaKind::Image)
                     .filter(|item| {
                         backend
                             .as_ref()
@@ -4015,7 +4354,35 @@ fn main() {
                             .unwrap_or_else(|| item.path())
                     })
                     .collect();
-                top_card.set_text(html, &images, CARD_WIDTH, i18n::font_scale_factor());
+                top_card.set_text(
+                    html,
+                    &images,
+                    CARD_WIDTH,
+                    i18n::font_scale_factor(),
+                    &review.hints_set(),
+                    review.typed.as_deref().unwrap_or(""),
+                );
+                if !review.media_ready {
+                    // Adopt the autoplay policy once per card: animated
+                    // images loop on their own, video starts only with an
+                    // autoplay attribute or the matching setting.
+                    review.media_ready = true;
+                    review.media_sel = 0;
+                    for (index, anim) in top_card.media_items().iter().enumerate() {
+                        if !anim.supported {
+                            continue;
+                        }
+                        let want = anim.autoplay || (anim.video && i18n::autoplay_video());
+                        Ui::anim_set_playing(anim.id, want);
+                        if index == review.media_sel {
+                            review.media_playing = want;
+                        }
+                    }
+                }
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_frame).as_millis().min(1000) as u32;
+                last_frame = now;
+                top_card.tick_anims(elapsed);
                 review_max_scroll = top_card.max_scroll();
                 review_scroll = review_scroll.min(review_max_scroll);
                 top_card.draw(review_scroll);
@@ -4311,6 +4678,21 @@ fn main() {
                             .as_ref()
                             .is_some_and(media_sync::MediaSync::is_running),
                 );
+                if card.type_answer.is_some() {
+                    let sub = review.typed.clone().filter(|typed| !typed.is_empty());
+                    Ui::draw_button(
+                        8.0,
+                        96.0,
+                        208.0,
+                        28.0,
+                        tr("Type answer"),
+                        sub.as_deref(),
+                        6,
+                        false,
+                    );
+                }
+                draw_hint_chips(&top_card, &review, 184.0);
+                draw_media_bar(&top_card, &review, false);
                 Ui::draw_button(8.0, 128.0, 208.0, 52.0, tr("Show answer"), None, 0, false);
                 draw_undo_button(224.0, 128.0, 88.0, 52.0, undo_available);
             }
@@ -4329,6 +4711,8 @@ fn main() {
                             .as_ref()
                             .is_some_and(media_sync::MediaSync::is_running),
                 );
+                draw_hint_chips(&top_card, &review, 126.0);
+                draw_media_bar(&top_card, &review, true);
                 draw_undo_button(236.0, 148.0, 72.0, 36.0, undo_available);
                 for (i, label) in [tr("Again"), tr("Hard"), tr("Good"), tr("Easy")]
                     .iter()

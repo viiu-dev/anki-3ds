@@ -50,6 +50,7 @@ static FONT_SCALE: AtomicU16 = AtomicU16::new(DEFAULT_FONT_SCALE);
 pub fn init() {
     load_font_scale();
     load_autoplay_audio();
+    load_autoplay_video();
     load_download_connections();
     load_battery_linear();
     load_console_leds();
@@ -205,6 +206,33 @@ fn load_autoplay_audio() {
         .and_then(|value| value.get("autoplay_audio").and_then(|v| v.as_bool()));
     if let Some(value) = value {
         AUTOPLAY_AUDIO.store(value, Ordering::Relaxed);
+    }
+}
+
+static AUTOPLAY_VIDEO: AtomicBool = AtomicBool::new(false);
+
+/// Whether card video autoplays. Unlike audio, video only starts on its own
+/// with this setting (or an explicit autoplay attribute).
+pub fn autoplay_video() -> bool {
+    AUTOPLAY_VIDEO.load(Ordering::Relaxed)
+}
+
+pub fn toggle_autoplay_video() -> io::Result<bool> {
+    let value = !autoplay_video();
+    write_setting("autoplay_video", serde_json::json!(value))?;
+    AUTOPLAY_VIDEO.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_autoplay_video() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("autoplay_video").and_then(|v| v.as_bool()));
+    if let Some(value) = value {
+        AUTOPLAY_VIDEO.store(value, Ordering::Relaxed);
     }
 }
 

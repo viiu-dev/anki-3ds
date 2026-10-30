@@ -53,6 +53,9 @@ pub struct Theme {
     pub easy_bg: u32,
     pub easy_fg: u32,
     pub shadow: u32,
+    pub diff_good: u32,
+    pub diff_bad: u32,
+    pub diff_missed: u32,
 }
 
 const LIGHT: Theme = Theme {
@@ -88,6 +91,9 @@ const LIGHT: Theme = Theme {
     easy_bg: c(232, 240, 254),
     easy_fg: c(26, 115, 232),
     shadow: ca(0, 0, 0, 26),
+    diff_good: c(46, 125, 50),
+    diff_bad: c(198, 40, 40),
+    diff_missed: c(120, 120, 120),
 };
 
 const CREAM: Theme = Theme {
@@ -123,6 +129,9 @@ const CREAM: Theme = Theme {
     easy_bg: c(228, 236, 246),
     easy_fg: c(38, 101, 166),
     shadow: ca(60, 40, 20, 26),
+    diff_good: c(56, 130, 60),
+    diff_bad: c(190, 60, 50),
+    diff_missed: c(130, 120, 105),
 };
 
 const DARK: Theme = Theme {
@@ -158,6 +167,9 @@ const DARK: Theme = Theme {
     easy_bg: c(32, 48, 63),
     easy_fg: c(138, 180, 248),
     shadow: ca(0, 0, 0, 70),
+    diff_good: c(76, 175, 80),
+    diff_bad: c(229, 115, 115),
+    diff_missed: c(160, 165, 173),
 };
 
 const BLACK: Theme = Theme {
@@ -193,12 +205,15 @@ const BLACK: Theme = Theme {
     easy_bg: c(21, 35, 47),
     easy_fg: c(138, 180, 248),
     shadow: ca(0, 0, 0, 130),
+    diff_good: c(76, 175, 80),
+    diff_bad: c(229, 115, 115),
+    diff_missed: c(154, 160, 166),
 };
 
 static THEMES: [Theme; 4] = [LIGHT, CREAM, DARK, BLACK];
 static INDEX: AtomicUsize = AtomicUsize::new(0);
 
-const _: () = assert!(std::mem::size_of::<Theme>() == 32 * 4);
+const _: () = assert!(std::mem::size_of::<Theme>() == 35 * 4);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {

@@ -221,5 +221,14 @@
     "Clock": "Clock",
     "Move up [Y]": "Up [Y]",
     "Move down [X]": "Down [X]",
-    "A toggles. LEFT/RIGHT reorders. B returns.": "A toggles. LEFT/RIGHT moves. B returns."
+    "A toggles. LEFT/RIGHT reorders. B returns.": "A toggles. LEFT/RIGHT moves. B returns.",
+    "Type answer": "Type answer",
+    "Show Hint {0}": "Show Hint {0}",
+    "Hide Hint {0}": "Hide Hint {0}",
+    "Replay": "Replay",
+    "Play": "Play",
+    "Pause": "Pause",
+    "Unsupported video": "Unsupported video",
+    "Auto-play video": "Auto-play video",
+    "Auto-play video: {0}": "Auto-play video: {0}"
 }

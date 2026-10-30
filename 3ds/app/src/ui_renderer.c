@@ -89,6 +89,8 @@ static UiTheme g_theme = {
     C2D_RGBA(176, 110, 0, 255), C2D_RGBA(230, 244, 234, 255),
     C2D_RGBA(30, 142, 62, 255), C2D_RGBA(232, 240, 254, 255),
     C2D_RGBA(26, 115, 232, 255), C2D_RGBA(0, 0, 0, 26),
+    C2D_RGBA(46, 125, 50, 255), C2D_RGBA(198, 40, 40, 255),
+    C2D_RGBA(120, 120, 120, 255),
 };
 
 void ui_set_theme(const UiTheme* theme) {
@@ -216,6 +218,7 @@ static void media_mark_missing(const char* path) {
 }
 
 void ui_media_prefetch_clear(void);
+void ui_anim_close_all(void);
 
 static bool s_capture_pixels_active = false;
 static uint8_t* s_captured_pixels = NULL;
@@ -231,6 +234,7 @@ void ui_media_reset(void) {
         s_media_images[i].path[0] = '\0';
     }
     ui_media_prefetch_clear();
+    ui_anim_close_all();
     free(s_captured_pixels);
     s_captured_pixels = NULL;
     for (int i = 0; i < MEDIA_MISSING_SLOTS; i++) s_media_missing[i][0] = '\0';
@@ -759,6 +763,676 @@ void ui_media_draw(int id, float x, float y, float w, float h) {
     };
     C2D_Image c2d = { .tex = &image->tex, .subtex = &subtexture };
     C2D_DrawImageAt(c2d, x, y, 0.55f, NULL, 1.0f, 1.0f);
+}
+
+// Animated card media.
+//
+// GIF frames are decoded up front with stb_image (`stbi_load_gif_from_memory`
+// returns every frame plus per-frame delays) and downscaled into a capped
+// buffer. Animated WebP frames are decoded on demand into a single RGBA
+// canvas through the already-linked demuxer (fragments that fail to decode
+// keep the previous canvas). MJPEG-in-AVI video is parsed as raw RIFF chunks
+// and decoded on demand with stb_image. Anything else (H.264 MP4, VP8/VP9
+// WebM, …) reports -1 so the caller can draw an "unsupported" poster:
+// software decoding is not practical on this hardware, and H.264 needs the
+// New 3DS MVD block plus an MP4 demuxer that is not implemented here.
+//
+// The decoded-frame budget is about 6MB per card; larger animations are
+// downscaled or truncated. Decoding is synchronous on the caller thread: only
+// the newly-selected frame is (re)decoded per tick, and textures upload once
+// per frame change.
+
+#define UI_ANIM_SLOTS 4
+#define UI_ANIM_MAX_DIM 256
+#define UI_ANIM_BUDGET (6u * 1024u * 1024u)
+#define UI_ANIM_AVI_MAX (8u * 1024u * 1024u)
+#define UI_ANIM_AVI_FRAMES_MAX 600
+
+typedef struct {
+    bool used;
+    UiAnimKind kind;
+    char path[MEDIA_PATH_MAX];
+    int width;
+    int height;
+    int frames;
+    int* delays_ms;
+    uint8_t* pixels;
+    int current;
+    uint32_t acc_ms;
+    bool playing;
+    bool loop;
+    bool finished;
+    uint8_t* file_data;
+    size_t file_size;
+    WebPDemuxer* demux;
+    int* frame_offsets;
+    int* frame_sizes;
+    C3D_Tex tex;
+    bool tex_ready;
+    int tex_w;
+    int tex_h;
+} UiAnim;
+
+static UiAnim s_anims[UI_ANIM_SLOTS];
+
+static void anim_close_slot(UiAnim* anim) {
+    if (!anim || !anim->used) return;
+    if (anim->tex_ready) {
+        C3D_TexDelete(&anim->tex);
+        anim->tex_ready = false;
+    }
+    free(anim->delays_ms);
+    free(anim->pixels);
+    free(anim->file_data);
+    free(anim->frame_offsets);
+    free(anim->frame_sizes);
+    if (anim->demux) WebPDemuxDelete(anim->demux);
+    memset(anim, 0, sizeof(*anim));
+}
+
+void ui_anim_close_all(void) {
+    for (int i = 0; i < UI_ANIM_SLOTS; i++) anim_close_slot(&s_anims[i]);
+}
+
+static int anim_free_slot(void) {
+    for (int i = 0; i < UI_ANIM_SLOTS; i++) {
+        if (!s_anims[i].used) return i;
+    }
+    return -1;
+}
+
+static bool anim_valid(int id) {
+    return id >= 0 && id < UI_ANIM_SLOTS && s_anims[id].used;
+}
+
+// Upload the current frame canvas to the slot texture.
+static bool anim_upload(UiAnim* anim) {
+    if (!anim || !anim->pixels || anim->width <= 0 || anim->height <= 0) return false;
+    if (anim->width > 1024 || anim->height > 1024) return false;
+    const uint8_t* frame = anim->pixels;
+    if (anim->kind == UI_ANIM_GIF && anim->frames > 1) {
+        frame = anim->pixels
+            + (size_t)anim->current * (size_t)anim->width * (size_t)anim->height * 4;
+    }
+    if (!anim->tex_ready || anim->tex_w <= 0 || anim->tex_h <= 0) {
+        int tex_w = next_pow2(anim->width);
+        int tex_h = next_pow2(anim->height);
+        if ((size_t)tex_w * (size_t)tex_h * 4 > sizeof(s_media_scratch)) return false;
+        if (anim->tex_ready) C3D_TexDelete(&anim->tex);
+        if (!C3D_TexInit(&anim->tex, (u16)tex_w, (u16)tex_h, GPU_RGBA8)) return false;
+        C3D_TexSetFilter(&anim->tex, GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(&anim->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        anim->tex_w = tex_w;
+        anim->tex_h = tex_h;
+        anim->tex_ready = true;
+    }
+    memset(s_media_scratch, 0, (size_t)anim->tex_w * anim->tex_h * 4);
+    for (int y = 0; y < anim->height; y++) {
+        for (int x = 0; x < anim->width; x++) {
+            const uint8_t* src = frame + ((size_t)y * anim->width + (size_t)x) * 4;
+            uint8_t* dst = s_media_scratch + swizzled_offset_w(x, y, anim->tex_w);
+            dst[0] = src[3];
+            dst[1] = src[2];
+            dst[2] = src[1];
+            dst[3] = src[0];
+        }
+    }
+    C3D_TexUpload(&anim->tex, s_media_scratch);
+    C3D_TexFlush(&anim->tex);
+    return true;
+}
+
+static const uint8_t* anim_current_pixels(UiAnim* anim) {
+    if (anim->kind == UI_ANIM_GIF && anim->frames > 1) {
+        return anim->pixels
+            + (size_t)anim->current * (size_t)anim->width * (size_t)anim->height * 4;
+    }
+    return anim->pixels;
+}
+
+// Shrink dimensions until frames*w*h*4 fits the budget.
+static void anim_fit_budget(int frames, int* w, int* h) {
+    while (frames > 0 && *w > 0 && *h > 0
+        && (uint64_t)frames * (uint64_t)*w * (uint64_t)*h * 4 > UI_ANIM_BUDGET) {
+        if (*w <= 32 || *h <= 32) break;
+        *w /= 2;
+        *h /= 2;
+    }
+    if (*w < 1) *w = 1;
+    if (*h < 1) *h = 1;
+}
+
+static bool bytes_are_gif(const uint8_t* data, size_t size) {
+    return size >= 6
+        && (memcmp(data, "GIF87a", 6) == 0 || memcmp(data, "GIF89a", 6) == 0);
+}
+
+static bool bytes_are_avi(const uint8_t* data, size_t size) {
+    return size >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "AVI ", 4) == 0;
+}
+
+static int anim_open_gif(UiAnim* anim, const uint8_t* data, size_t size) {
+    int src_w = 0, src_h = 0, frames = 0, comp = 0;
+    int* delays = NULL;
+    if (size > (size_t)INT32_MAX) return -1;
+    unsigned char* frames_rgba = stbi_load_gif_from_memory(
+        data, (int)size, &delays, &src_w, &src_h, &frames, &comp, 4);
+    if (!frames_rgba || src_w <= 0 || src_h <= 0 || frames <= 0) {
+        free(delays);
+        if (frames_rgba) stbi_image_free(frames_rgba);
+        return -1;
+    }
+    int dst_w, dst_h;
+    fit_dimensions(src_w, src_h, &dst_w, &dst_h);
+    if (dst_w > UI_ANIM_MAX_DIM || dst_h > UI_ANIM_MAX_DIM) {
+        if (dst_w >= dst_h) {
+            dst_h = (int)((int64_t)dst_h * UI_ANIM_MAX_DIM / dst_w);
+            dst_w = UI_ANIM_MAX_DIM;
+        } else {
+            dst_w = (int)((int64_t)dst_w * UI_ANIM_MAX_DIM / dst_h);
+            dst_h = UI_ANIM_MAX_DIM;
+        }
+        if (dst_w < 1) dst_w = 1;
+        if (dst_h < 1) dst_h = 1;
+    }
+    anim_fit_budget(frames, &dst_w, &dst_h);
+    int keep = frames;
+    while (keep > 1
+        && (uint64_t)keep * (uint64_t)dst_w * (uint64_t)dst_h * 4 > UI_ANIM_BUDGET) {
+        keep--;
+    }
+    size_t plane = (size_t)dst_w * (size_t)dst_h * 4;
+    uint8_t* pixels = (uint8_t*)malloc(plane * (size_t)keep);
+    int* owned_delays = (int*)malloc(sizeof(int) * (size_t)keep);
+    if (!pixels || !owned_delays) {
+        free(pixels);
+        free(owned_delays);
+        free(delays);
+        stbi_image_free(frames_rgba);
+        return -1;
+    }
+    for (int i = 0; i < keep; i++) {
+        resample_rgba(
+            frames_rgba + (size_t)i * (size_t)src_w * (size_t)src_h * 4,
+            src_w, src_h, (size_t)src_w * 4,
+            pixels + plane * (size_t)i, dst_w, dst_h);
+        int delay = delays ? delays[i] : 100;
+        if (delay < 20) delay = 100;
+        if (delay > 10000) delay = 10000;
+        owned_delays[i] = delay;
+    }
+    free(delays);
+    stbi_image_free(frames_rgba);
+    anim->pixels = pixels;
+    anim->delays_ms = owned_delays;
+    anim->width = dst_w;
+    anim->height = dst_h;
+    anim->frames = keep;
+    anim->kind = UI_ANIM_GIF;
+    return 0;
+}
+
+static bool anim_decode_webp_fragment(
+    UiAnim* anim, const uint8_t* fragment, size_t fragment_size) {
+    WebPDecoderConfig config;
+    if (!WebPInitDecoderConfig(&config)) return false;
+    config.options.use_scaling = 1;
+    config.options.scaled_width = anim->width;
+    config.options.scaled_height = anim->height;
+    config.options.no_fancy_upsampling = 1;
+    config.output.colorspace = MODE_RGBA;
+    bool ok = WebPDecode(fragment, fragment_size, &config) == VP8_STATUS_OK;
+    if (ok) {
+        resample_rgba(
+            config.output.u.RGBA.rgba,
+            config.output.width, config.output.height,
+            config.output.u.RGBA.stride,
+            anim->pixels, anim->width, anim->height);
+    }
+    WebPFreeDecBuffer(&config.output);
+    return ok;
+}
+
+static int anim_open_webp(UiAnim* anim, uint8_t* data, size_t size) {
+    // `WebPGetFeatures` does not report animation or dimensions for every
+    // muxed file, so the demuxer (frame count, first-frame dimensions) is
+    // the source of truth when it is available.
+    int src_w = 0, src_h = 0;
+    int count = 1;
+    WebPDemuxer* demux = NULL;
+    WebPData webp = { .bytes = data, .size = size };
+    demux = WebPDemux(&webp);
+    if (demux) {
+        count = WebPDemuxGetI(demux, WEBP_FF_FRAME_COUNT);
+        if (count <= 0) {
+            count = 1;
+        }
+        if (count > 256) {
+            count = 256;
+        }
+        WebPIterator first;
+        if (WebPDemuxGetFrame(demux, 1, &first)) {
+            src_w = first.width;
+            src_h = first.height;
+            WebPDemuxReleaseIterator(&first);
+        }
+    }
+    if (src_w <= 0 || src_h <= 0) {
+        WebPDecoderConfig probe;
+        if (WebPInitDecoderConfig(&probe)
+            && WebPGetFeatures(data, size, &probe.input) == VP8_STATUS_OK
+            && probe.input.width > 0 && probe.input.height > 0) {
+            src_w = probe.input.width;
+            src_h = probe.input.height;
+        } else {
+            if (demux) {
+                WebPDemuxDelete(demux);
+            }
+            return -1;
+        }
+    }
+    int dst_w, dst_h;
+    fit_dimensions(src_w, src_h, &dst_w, &dst_h);
+    if (dst_w > UI_ANIM_MAX_DIM || dst_h > UI_ANIM_MAX_DIM) {
+        if (dst_w >= dst_h) {
+            dst_h = (int)((int64_t)dst_h * UI_ANIM_MAX_DIM / dst_w);
+            dst_w = UI_ANIM_MAX_DIM;
+        } else {
+            dst_w = (int)((int64_t)dst_w * UI_ANIM_MAX_DIM / dst_h);
+            dst_h = UI_ANIM_MAX_DIM;
+        }
+        if (dst_w < 1) dst_w = 1;
+        if (dst_h < 1) dst_h = 1;
+    }
+    anim_fit_budget(1, &dst_w, &dst_h);
+    if (count <= 1) {
+        // Still WebP: single poster frame.
+        if (demux) {
+            WebPDemuxDelete(demux);
+            demux = NULL;
+        }
+        uint8_t* pixels = (uint8_t*)malloc((size_t)dst_w * (size_t)dst_h * 4);
+        int* owned = (int*)malloc(sizeof(int));
+        if (!pixels || !owned) {
+            free(pixels);
+            free(owned);
+            return -1;
+        }
+        anim->width = dst_w;
+        anim->height = dst_h;
+        anim->pixels = pixels;
+        anim->frames = 1;
+        anim->kind = UI_ANIM_WEBP;
+        if (!anim_decode_webp_fragment(anim, data, size)) {
+            free(pixels);
+            free(owned);
+            anim->pixels = NULL;
+            return -1;
+        }
+        owned[0] = 100;
+        anim->delays_ms = owned;
+        return 0;
+    }
+    if (!demux) {
+        return -1;
+    }
+    uint8_t* canvas = (uint8_t*)malloc((size_t)dst_w * (size_t)dst_h * 4);
+    int* owned = (int*)malloc(sizeof(int) * (size_t)count);
+    if (!canvas || !owned) {
+        free(canvas);
+        free(owned);
+        WebPDemuxDelete(demux);
+        return -1;
+    }
+    memset(canvas, 0, (size_t)dst_w * (size_t)dst_h * 4);
+    anim->width = dst_w;
+    anim->height = dst_h;
+    anim->pixels = canvas;
+    anim->frames = count;
+    anim->kind = UI_ANIM_WEBP;
+    for (int i = 1; i <= count; i++) {
+        WebPIterator it;
+        int duration = 100;
+        if (WebPDemuxGetFrame(demux, i, &it)) {
+            duration = it.duration > 0 ? it.duration : 100;
+            if (duration < 20) duration = 100;
+            if (duration > 10000) duration = 10000;
+            // Decode the first frame now so the poster is ready; the rest
+            // decode on demand when their tick arrives.
+            if (i == 1 && it.fragment.bytes && it.fragment.size > 0) {
+                anim_decode_webp_fragment(anim, it.fragment.bytes, it.fragment.size);
+            }
+            WebPDemuxReleaseIterator(&it);
+        }
+        owned[i - 1] = duration;
+    }
+    anim->delays_ms = owned;
+    // The demuxer borrows `data`; keep both alive for on-demand decodes.
+    anim->demux = demux;
+    anim->file_data = data;
+    anim->file_size = size;
+    return 0;
+}
+
+static uint32_t anim_le32(const uint8_t* data) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8)
+        | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+// Parse an MJPEG AVI file: collect `00dc`/`00db` frame offsets and the frame
+// delay from the main AVI header. Returns 0 on success.
+static int anim_parse_avi(
+    const uint8_t* data, size_t size, int** offsets, int** sizes, int* frames,
+    int* delay_ms) {
+    *offsets = NULL;
+    *sizes = NULL;
+    *frames = 0;
+    *delay_ms = 66;
+    if (size < 12 || !bytes_are_avi(data, size)) return -1;
+    // Main header delay.
+    size_t pos = 12;
+    while (pos + 8 <= size) {
+        const uint8_t* chunk = data + pos;
+        uint32_t length = anim_le32(chunk + 4);
+        if (length > size - pos - 8) length = (uint32_t)(size - pos - 8);
+        if (memcmp(chunk, "avih", 4) == 0 && length >= 20) {
+            uint32_t micro = anim_le32(chunk + 8);
+            if (micro >= 1000 && micro <= 1000000) *delay_ms = (int)(micro / 1000);
+            break;
+        }
+        // Only scan the header region for avih.
+        if (pos > 65536) break;
+        pos += 8 + length + (length & 1);
+    }
+    // Find the movi list.
+    size_t movi = 0;
+    size_t movi_end = 0;
+    pos = 12;
+    while (pos + 12 <= size) {
+        const uint8_t* chunk = data + pos;
+        uint32_t length = anim_le32(chunk + 4);
+        if (length > size - pos - 8) length = (uint32_t)(size - pos - 8);
+        if (memcmp(chunk, "LIST", 4) == 0 && memcmp(chunk + 8, "movi", 4) == 0) {
+            movi = pos + 12;
+            movi_end = movi + (length > 4 ? length - 4 : 0);
+            if (movi_end > size) movi_end = size;
+            break;
+        }
+        if (length > UI_ANIM_AVI_MAX + 16) break;
+        pos += 8 + length + (length & 1);
+    }
+    if (movi == 0) return -1;
+    int* offs = (int*)malloc(sizeof(int) * UI_ANIM_AVI_FRAMES_MAX);
+    int* lens = (int*)malloc(sizeof(int) * UI_ANIM_AVI_FRAMES_MAX);
+    if (!offs || !lens) {
+        free(offs);
+        free(lens);
+        return -1;
+    }
+    int count = 0;
+    pos = movi;
+    while (pos + 8 <= movi_end && count < UI_ANIM_AVI_FRAMES_MAX) {
+        const uint8_t* chunk = data + pos;
+        uint32_t length = anim_le32(chunk + 4);
+        if (length > movi_end - pos - 8) break;
+        if ((memcmp(chunk, "00dc", 4) == 0 || memcmp(chunk, "00db", 4) == 0)
+            && length > 64) {
+            offs[count] = (int)(pos + 8);
+            lens[count] = (int)length;
+            count++;
+        }
+        pos += 8 + length + (length & 1);
+    }
+    if (count == 0) {
+        free(offs);
+        free(lens);
+        return -1;
+    }
+    *offsets = offs;
+    *sizes = lens;
+    *frames = count;
+    return 0;
+}
+
+static bool anim_decode_avi_frame(UiAnim* anim, int index) {
+    if (!anim->file_data || !anim->frame_offsets || index < 0 || index >= anim->frames) {
+        return false;
+    }
+    size_t offset = (size_t)anim->frame_offsets[index];
+    size_t length = (size_t)anim->frame_sizes[index];
+    if (offset + length > anim->file_size) return false;
+    // MJPEG frames are JPEG bitstreams.
+    const uint8_t* jpg = anim->file_data + offset;
+    if (length < 4 || jpg[0] != 0xFF || jpg[1] != 0xD8) return false;
+    int src_w = 0, src_h = 0, comp = 0;
+    unsigned char* rgb = stbi_load_from_memory(
+        jpg, (int)length, &src_w, &src_h, &comp, 4);
+    if (!rgb || src_w <= 0 || src_h <= 0) {
+        if (rgb) stbi_image_free(rgb);
+        return false;
+    }
+    resample_rgba(
+        rgb, src_w, src_h, (size_t)src_w * 4,
+        anim->pixels, anim->width, anim->height);
+    stbi_image_free(rgb);
+    return true;
+}
+
+static int anim_open_avi(UiAnim* anim, uint8_t* data, size_t size) {
+    if (size > UI_ANIM_AVI_MAX) {
+        return -1;
+    }
+    int* offsets = NULL;
+    int* sizes = NULL;
+    int frames = 0;
+    int delay = 66;
+    if (anim_parse_avi(data, size, &offsets, &sizes, &frames, &delay) != 0) {
+        return -1;
+    }
+    // Validate by decoding the first frame (also rejects non-MJPEG AVIs).
+    int src_w = 0, src_h = 0, comp = 0;
+    size_t first_len = (size_t)sizes[0];
+    size_t first_off = (size_t)offsets[0];
+    bool probe_ok = false;
+    if (first_off + first_len <= size) {
+        unsigned char* probe = stbi_load_from_memory(
+            data + first_off, (int)first_len, &src_w, &src_h, &comp, 4);
+        if (probe && src_w > 0 && src_h > 0) {
+            probe_ok = true;
+            stbi_image_free(probe);
+        } else if (probe) {
+            stbi_image_free(probe);
+        }
+    }
+    if (!probe_ok) {
+        free(offsets);
+        free(sizes);
+        return -1;
+    }
+    int dst_w, dst_h;
+    fit_dimensions(src_w, src_h, &dst_w, &dst_h);
+    if (dst_w > UI_ANIM_MAX_DIM || dst_h > UI_ANIM_MAX_DIM) {
+        if (dst_w >= dst_h) {
+            dst_h = (int)((int64_t)dst_h * UI_ANIM_MAX_DIM / dst_w);
+            dst_w = UI_ANIM_MAX_DIM;
+        } else {
+            dst_w = (int)((int64_t)dst_w * UI_ANIM_MAX_DIM / dst_h);
+            dst_h = UI_ANIM_MAX_DIM;
+        }
+        if (dst_w < 1) dst_w = 1;
+        if (dst_h < 1) dst_h = 1;
+    }
+    uint8_t* canvas = (uint8_t*)malloc((size_t)dst_w * (size_t)dst_h * 4);
+    int* owned = (int*)malloc(sizeof(int) * (size_t)frames);
+    if (!canvas || !owned) {
+        free(canvas);
+        free(owned);
+        free(offsets);
+        free(sizes);
+        return -1;
+    }
+    memset(canvas, 0, (size_t)dst_w * (size_t)dst_h * 4);
+    for (int i = 0; i < frames; i++) owned[i] = delay;
+    anim->width = dst_w;
+    anim->height = dst_h;
+    anim->pixels = canvas;
+    anim->frames = frames;
+    anim->kind = UI_ANIM_VIDEO;
+    anim->delays_ms = owned;
+    anim->frame_offsets = offsets;
+    anim->frame_sizes = sizes;
+    anim->file_data = data;
+    anim->file_size = size;
+    anim_decode_avi_frame(anim, 0);
+    return 0;
+}
+
+int ui_anim_open(const char* path, int* w, int* h, int* frame_count) {
+    if (!path || !path[0]) return -1;
+    for (int i = 0; i < UI_ANIM_SLOTS; i++) {
+        if (s_anims[i].used && strcmp(s_anims[i].path, path) == 0) {
+            if (w) *w = s_anims[i].width;
+            if (h) *h = s_anims[i].height;
+            if (frame_count) *frame_count = s_anims[i].frames;
+            return i;
+        }
+    }
+    int slot = anim_free_slot();
+    if (slot < 0) return -1;
+    size_t size = 0;
+    uint8_t* data = read_media_file(path, &size);
+    if (!data) return -1;
+    UiAnim* anim = &s_anims[slot];
+    memset(anim, 0, sizeof(*anim));
+    int result = -1;
+    if (bytes_are_gif(data, size)) {
+        result = anim_open_gif(anim, data, size);
+        free(data);
+    } else if (bytes_are_webp(data, size)) {
+        // anim_open_webp takes ownership of `data` for animated images.
+        result = anim_open_webp(anim, data, size);
+        if (result != 0 || anim->file_data != data) free(data);
+    } else if (bytes_are_avi(data, size)) {
+        // anim_open_avi takes ownership of `data`.
+        result = anim_open_avi(anim, data, size);
+        if (result != 0 || anim->file_data != data) free(data);
+    } else {
+        free(data);
+        return -1;
+    }
+    if (result != 0 || anim->frames <= 0) {
+        anim_close_slot(anim);
+        return -1;
+    }
+    anim->used = true;
+    anim->playing = true;
+    anim->loop = true;
+    snprintf(anim->path, sizeof(anim->path), "%s", path);
+    if (!anim_upload(anim)) {
+        anim_close_slot(anim);
+        return -1;
+    }
+    if (w) *w = anim->width;
+    if (h) *h = anim->height;
+    if (frame_count) *frame_count = anim->frames;
+    return slot;
+}
+
+// Decode the newly-selected frame after a tick advanced the index.
+static void anim_refresh_frame(UiAnim* anim) {
+    if (anim->kind == UI_ANIM_WEBP && anim->frames > 1 && anim->demux) {
+        WebPIterator it;
+        if (WebPDemuxGetFrame(anim->demux, anim->current + 1, &it)) {
+            if (it.fragment.bytes && it.fragment.size > 0) {
+                anim_decode_webp_fragment(anim, it.fragment.bytes, it.fragment.size);
+            }
+            WebPDemuxReleaseIterator(&it);
+        }
+    } else if (anim->kind == UI_ANIM_VIDEO) {
+        anim_decode_avi_frame(anim, anim->current);
+    }
+    anim_upload(anim);
+}
+
+void ui_anim_tick(int id, uint32_t elapsed_ms) {
+    if (!anim_valid(id)) return;
+    UiAnim* anim = &s_anims[id];
+    if (!anim->playing || anim->finished || anim->frames <= 1) return;
+    if (elapsed_ms > 1000) elapsed_ms = 1000;
+    anim->acc_ms += elapsed_ms;
+    bool changed = false;
+    for (;;) {
+        int delay = anim->delays_ms ? anim->delays_ms[anim->current] : 100;
+        if (delay <= 0) delay = 100;
+        if (anim->acc_ms < (uint32_t)delay) break;
+        anim->acc_ms -= (uint32_t)delay;
+        anim->current++;
+        if (anim->current >= anim->frames) {
+            if (anim->loop) {
+                anim->current = 0;
+            } else {
+                anim->current = anim->frames - 1;
+                anim->finished = true;
+                anim->playing = false;
+                break;
+            }
+        }
+        changed = true;
+        // Avoid catching up more than a few frames after a stall.
+        if (anim->acc_ms > 500) anim->acc_ms = 0;
+    }
+    if (changed || anim->finished) anim_refresh_frame(anim);
+}
+
+void ui_anim_draw(int id, float x, float y, float w, float h) {
+    if (!anim_valid(id)) return;
+    UiAnim* anim = &s_anims[id];
+    if (!anim->tex_ready || anim->width <= 0 || anim->height <= 0) return;
+    if (w <= 0.0f || h <= 0.0f) return;
+    Tex3DS_SubTexture subtexture = {
+        .width = (u16)w,
+        .height = (u16)h,
+        .left = 0.0f,
+        .top = 1.0f,
+        .right = (float)anim->width / (float)anim->tex_w,
+        .bottom = 1.0f - (float)anim->height / (float)anim->tex_h,
+    };
+    C2D_Image c2d = { .tex = &anim->tex, .subtex = &subtexture };
+    C2D_DrawImageAt(c2d, x, y, 0.55f, NULL, 1.0f, 1.0f);
+}
+
+void ui_anim_set_playing(int id, bool playing) {
+    if (!anim_valid(id)) return;
+    UiAnim* anim = &s_anims[id];
+    if (playing && anim->finished && anim->loop) {
+        anim->finished = false;
+        anim->current = 0;
+        anim->acc_ms = 0;
+        anim_refresh_frame(anim);
+    }
+    anim->playing = playing && !anim->finished;
+}
+
+void ui_anim_set_loop(int id, bool loop_) {
+    if (!anim_valid(id)) return;
+    s_anims[id].loop = loop_;
+}
+
+void ui_anim_restart(int id) {
+    if (!anim_valid(id)) return;
+    UiAnim* anim = &s_anims[id];
+    anim->current = 0;
+    anim->acc_ms = 0;
+    anim->finished = false;
+    anim_refresh_frame(anim);
+}
+
+bool ui_anim_is_playing(int id) {
+    return anim_valid(id) && s_anims[id].playing;
+}
+
+bool ui_anim_finished(int id) {
+    return !anim_valid(id) || s_anims[id].finished;
 }
 
 static int16_t* s_audio_pcm = NULL;
@@ -1695,6 +2369,62 @@ float ui_get_card_text_width(float scale, const char* str) {
         previous_font = font;
     }
     return width;
+}
+
+// Fixed advance for monospace card text: the advance of 'M' in the main
+// font, so no extra font asset is needed.
+static float mono_advance_for_px(int px) {
+    if (s_font_loaded) {
+        int advance = 0;
+        int lsb = 0;
+        int glyph = stbtt_FindGlyphIndex(&s_font, (int)'M');
+        stbtt_GetGlyphHMetrics(&s_font, glyph, &advance, &lsb);
+        (void)lsb;
+        float em = stbtt_ScaleForMappingEmToPixels(&s_font, (float)px);
+        float result = (float)advance * em;
+        if (result > 0.5f) return result;
+    }
+    return (float)px * 0.62f;
+}
+
+float ui_get_card_text_width_mono(float scale, const char* str) {
+    if (!str || !str[0]) return 0.0f;
+    float advance = mono_advance_for_px(card_font_px(scale));
+    size_t count = 0;
+    const unsigned char* cursor = (const unsigned char*)str;
+    while (*cursor) {
+        (void)utf8_next(&cursor);
+        count++;
+    }
+    return advance * (float)count;
+}
+
+void ui_draw_card_text_mono(float x, float y, float scale, uint32_t color, const char* str) {
+    if (!str || !str[0]) return;
+    float advance = mono_advance_for_px(card_font_px(scale));
+    float pen_x = x;
+    const unsigned char* cursor = (const unsigned char*)str;
+    char single[8];
+    while (*cursor) {
+        const unsigned char* start = cursor;
+        uint32_t cp = utf8_next(&cursor);
+        if (cp == (uint32_t)'\t') {
+            pen_x += advance * 4.0f;
+            continue;
+        }
+        size_t len = (size_t)(cursor - start);
+        if (len == 0 || len >= sizeof(single)) {
+            pen_x += advance;
+            continue;
+        }
+        memcpy(single, start, len);
+        single[len] = '\0';
+        float glyph_w = ui_get_card_text_width(scale, single);
+        float dx = (advance - glyph_w) * 0.5f;
+        if (dx < 0.0f) dx = 0.0f;
+        ui_draw_card_text(pen_x + dx, y, scale, color, single, false, false);
+        pen_x += advance;
+    }
 }
 
 void ui_draw_text_centered(float x_center, float y, float scale, uint32_t color, const char* str) {

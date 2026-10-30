@@ -221,5 +221,14 @@
     "Clock": "Годинник",
     "Move up [Y]": "Вище [Y]",
     "Move down [X]": "Нижче [X]",
-    "A toggles. LEFT/RIGHT reorders. B returns.": "A: увімк/вимк. ВЛІВО/ВПРАВО: порядок. B: назад."
+    "A toggles. LEFT/RIGHT reorders. B returns.": "A: увімк/вимк. ВЛІВО/ВПРАВО: порядок. B: назад.",
+    "Type answer": "Type answer",
+    "Show Hint {0}": "Show Hint {0}",
+    "Hide Hint {0}": "Hide Hint {0}",
+    "Replay": "Replay",
+    "Play": "Play",
+    "Pause": "Pause",
+    "Unsupported video": "Unsupported video",
+    "Auto-play video": "Auto-play video",
+    "Auto-play video: {0}": "Auto-play video: {0}"
 }
