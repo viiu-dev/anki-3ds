@@ -73,6 +73,8 @@ pub struct PitchStyle {
     pub low: bool,
     pub downstep: bool,
     pub upstep: bool,
+    pub nasal: bool,
+    pub nasal_color: Option<[u8; 3]>,
     pub accent: Option<u8>,
 }
 
@@ -108,6 +110,10 @@ impl Style {
         self.pitch.low |= other.pitch.low;
         self.pitch.downstep |= other.pitch.downstep;
         self.pitch.upstep |= other.pitch.upstep;
+        self.pitch.nasal |= other.pitch.nasal;
+        if other.pitch.nasal_color.is_some() {
+            self.pitch.nasal_color = other.pitch.nasal_color;
+        }
         if other.pitch.accent.is_some() {
             self.pitch.accent = other.pitch.accent;
         }
@@ -451,6 +457,9 @@ impl Parser {
         if is_pitch_overlay(attributes) {
             self.apply_pitch_overlay(attributes);
         }
+        if is_nasal_overlay(attributes) {
+            self.apply_nasal_overlay(attributes);
+        }
         let start = self.current.len();
         self.span_groups.push(SpanGroup { wrapper, start });
         if wrapper {
@@ -504,6 +513,41 @@ impl Parser {
             if let Some(index) = last_text {
                 if let Some(style) = inline_style_mut(&mut self.current[index]) {
                     style.pitch.downstep = true;
+                }
+            }
+        }
+    }
+
+    fn apply_nasal_overlay(&mut self, attributes: &[(String, String)]) {
+        let mut effect = Style::default();
+        if let Some(css) = attribute(attributes, "style") {
+            apply_css(&mut effect, css);
+        }
+        if let Some(color) = attribute(attributes, "color").and_then(parse_color) {
+            effect.color = Some(color);
+        }
+        let Some(start) = self
+            .span_groups
+            .iter()
+            .rev()
+            .find(|group| group.wrapper)
+            .map(|group| group.start)
+        else {
+            return;
+        };
+        let mut last_text = None;
+        for (offset, inline) in self.current[start..].iter_mut().enumerate() {
+            if let Inline::Text { text, .. } = inline {
+                if !text.is_empty() {
+                    last_text = Some(start + offset);
+                }
+            }
+        }
+        if let Some(index) = last_text {
+            if let Some(style) = inline_style_mut(&mut self.current[index]) {
+                style.pitch.nasal = true;
+                if effect.color.is_some() {
+                    style.pitch.nasal_color = effect.color;
                 }
             }
         }
@@ -604,6 +648,7 @@ impl Parser {
         while matches!(self.current.last(), Some(Inline::Break)) {
             self.current.pop();
         }
+        normalize_nasal_markers(&mut self.current);
         self.current.retain(|inline| match inline {
             Inline::Text { text, .. } => !text.is_empty(),
             _ => true,
@@ -717,6 +762,16 @@ fn apply_pitch_word(style: &mut Style, value: &str) {
         style.pitch.high = true;
     } else if matches!(value, "low" | "bottom" | "accent-low") {
         style.pitch.low = true;
+    } else if matches!(
+        value,
+        "nasal"
+            | "bidakuon"
+            | "handakuten"
+            | "pronunciation-nasal"
+            | "nasal-diacritic"
+            | "pronunciation-nasal-diacritic"
+    ) {
+        style.pitch.nasal = true;
     } else if matches!(value, "downstep" | "down" | "drop" | "accent-drop" | "fall") {
         style.pitch.downstep = true;
     } else if matches!(
@@ -959,6 +1014,18 @@ fn is_pitch_overlay(attributes: &[(String, String)]) -> bool {
     effect.pitch.high || effect.pitch.downstep || effect.pitch.upstep
 }
 
+fn is_nasal_overlay(attributes: &[(String, String)]) -> bool {
+    attribute(attributes, "class")
+        .is_some_and(|value| {
+            value.split_whitespace().any(|class| {
+                matches!(
+                    class,
+                    "pronunciation-nasal-diacritic" | "nasal-diacritic" | "nasal-circle"
+                )
+            })
+        })
+}
+
 fn push_text_with_furigana(output: &mut Vec<Inline>, text: &str, style: Style) {
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -1049,6 +1116,184 @@ fn push_text_plain(output: &mut Vec<Inline>, text: &str, style: Style) {
     });
 }
 
+fn normalize_nasal_markers(current: &mut Vec<Inline>) {
+    let mut output = Vec::with_capacity(current.len());
+    for inline in current.drain(..) {
+        match inline {
+            Inline::Text { text, style } => append_text_with_nasal(&mut output, &text, style),
+            other => output.push(other),
+        }
+    }
+    *current = output;
+}
+
+fn append_text_with_nasal(output: &mut Vec<Inline>, text: &str, style: Style) {
+    let mut segment_start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if index < segment_start || !is_nasal_marker_char(ch) {
+            continue;
+        }
+        let previous_in_segment = text[segment_start..index].chars().next_back();
+        let previous_is_kana = match previous_in_segment {
+            Some(previous) => is_kana_char(previous),
+            None => last_text_ends_with_kana(output),
+        };
+        if !previous_is_kana {
+            continue;
+        }
+        if ch == '\u{25CB}' && !circle_is_nasal(text, index, &style) {
+            continue;
+        }
+        if previous_in_segment.is_some_and(is_kana_char) {
+            let mut start = mora_start(text, index);
+            if start < segment_start {
+                start = segment_start;
+            }
+            if start < index {
+                push_text_plain(output, &text[segment_start..start], style.clone());
+                let mut mora_style = style.clone();
+                apply_nasal_marker_style(&mut mora_style, &style);
+                push_text_plain(output, &text[start..index], mora_style);
+                segment_start = index + ch.len_utf8();
+            }
+        } else if attach_nasal_to_last(output, &style) {
+            segment_start = index + ch.len_utf8();
+        }
+    }
+    if segment_start < text.len() {
+        push_text_plain(output, &text[segment_start..], style);
+    }
+}
+
+fn attach_nasal_to_last(output: &mut Vec<Inline>, marker_style: &Style) -> bool {
+    let Some(index) = output.iter().rposition(
+        |inline| matches!(inline, Inline::Text { text, .. } if !text.is_empty()),
+    ) else {
+        return false;
+    };
+    if !output[index + 1..].iter().all(
+        |inline| matches!(inline, Inline::Text { text, .. } if text.is_empty()),
+    ) {
+        return false;
+    }
+    let mut tail = output.split_off(index);
+    let Inline::Text { text, style } = tail.remove(0) else {
+        return false;
+    };
+    if !text.chars().next_back().is_some_and(is_kana_char) {
+        output.push(Inline::Text { text, style });
+        output.extend(tail);
+        return false;
+    }
+    let start = mora_start(&text, text.len());
+    if start > 0 {
+        output.push(Inline::Text {
+            text: text[..start].to_owned(),
+            style: style.clone(),
+        });
+    }
+    let mut mora_style = style;
+    apply_nasal_marker_style(&mut mora_style, marker_style);
+    output.push(Inline::Text {
+        text: text[start..].to_owned(),
+        style: mora_style,
+    });
+    output.extend(tail);
+    true
+}
+
+fn apply_nasal_marker_style(mora_style: &mut Style, marker_style: &Style) {
+    mora_style.pitch.nasal = true;
+    if marker_style.color.is_some() {
+        mora_style.pitch.nasal_color = marker_style.color;
+    }
+    if marker_style.pitch.downstep {
+        mora_style.pitch.downstep = true;
+    }
+    if marker_style.pitch.upstep {
+        mora_style.pitch.upstep = true;
+    }
+}
+
+fn last_text_ends_with_kana(output: &[Inline]) -> bool {
+    output
+        .iter()
+        .rev()
+        .find_map(|inline| match inline {
+            Inline::Text { text, .. } if !text.is_empty() => {
+                Some(text.chars().next_back().is_some_and(is_kana_char))
+            }
+            Inline::Text { .. } => None,
+            _ => Some(false),
+        })
+        .unwrap_or(false)
+}
+
+fn is_nasal_marker_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{309A}' | '\u{309C}' | '\u{FF9F}' | '\u{00B0}' | '\u{02DA}' | '\u{25CB}'
+    )
+}
+
+fn circle_is_nasal(text: &str, index: usize, style: &Style) -> bool {
+    if style.pitch != PitchStyle::default() {
+        return true;
+    }
+    let after = &text[index + '\u{25CB}'.len_utf8()..];
+    after
+        .chars()
+        .next()
+        .is_some_and(|next| is_kana_char(next) || next == '[')
+}
+
+fn is_kana_char(ch: char) -> bool {
+    matches!(ch as u32, 0x3041..=0x3096 | 0x30a1..=0x30fa)
+}
+
+fn is_small_kana(ch: char) -> bool {
+    matches!(
+        ch,
+        'ぁ' | 'ぃ'
+            | 'ぅ'
+            | 'ぇ'
+            | 'ぉ'
+            | 'っ'
+            | 'ゃ'
+            | 'ゅ'
+            | 'ょ'
+            | 'ゎ'
+            | 'ァ'
+            | 'ィ'
+            | 'ゥ'
+            | 'ェ'
+            | 'ォ'
+            | 'ッ'
+            | 'ャ'
+            | 'ュ'
+            | 'ョ'
+            | 'ヮ'
+    )
+}
+
+fn mora_start(text: &str, end: usize) -> usize {
+    let mut start = match text[..end].char_indices().next_back() {
+        Some((index, _)) => index,
+        None => return end,
+    };
+    loop {
+        let ch = text[start..].chars().next().unwrap_or(' ');
+        if !is_small_kana(ch) {
+            break;
+        }
+        match text[..start].char_indices().next_back() {
+            Some((previous, previous_ch)) if is_kana_char(previous_ch) => start = previous,
+            _ => break,
+        }
+    }
+    start
+}
+
 fn pitch_symbol(ch: char) -> Option<PitchMarker> {
     Some(match ch {
         '↗' | '↑' | '⤴' | '／' => PitchMarker::Up,
@@ -1074,7 +1319,10 @@ fn furigana_base_start(text: &str) -> Option<usize> {
     let mut start = last_index;
     if is_kanji(last) {
         for (index, ch) in text[..last_index].char_indices().rev() {
-            if is_kanji(ch) || matches!(ch, '\u{3005}' | '\u{3006}' | '\u{3007}' | '\u{30fc}') {
+            if is_kanji(ch)
+                || matches!(ch, '\u{3005}' | '\u{3006}' | '\u{3007}' | '\u{30fc}')
+                || is_nasal_marker_char(ch)
+            {
                 start = index;
             } else {
                 break;
@@ -1082,7 +1330,10 @@ fn furigana_base_start(text: &str) -> Option<usize> {
         }
     } else if last.is_alphanumeric() {
         for (index, ch) in text[..last_index].char_indices().rev() {
-            if ch.is_alphanumeric() || matches!(ch, '\'' | '’' | '-' | '_') {
+            if ch.is_alphanumeric()
+                || matches!(ch, '\'' | '’' | '-' | '_')
+                || is_nasal_marker_char(ch)
+            {
                 start = index;
             } else {
                 break;
@@ -1471,7 +1722,9 @@ mod tests {
 
     #[test]
     fn ajt_pitch_overlays_apply_to_the_preceding_group() {
-        fn runs(html: &str) -> Vec<(String, bool, bool, Option<[u8; 3]>)> {
+        fn runs(
+            html: &str,
+        ) -> Vec<(String, bool, bool, bool, Option<[u8; 3]>, Option<[u8; 3]>)> {
             let blocks = parse_html(html);
             let Block::Paragraph(content) = &blocks[0] else {
                 panic!("expected paragraph");
@@ -1483,7 +1736,9 @@ mod tests {
                         text.clone(),
                         style.pitch.high,
                         style.pitch.downstep,
+                        style.pitch.nasal,
                         style.color,
+                        style.pitch.nasal_color,
                     )),
                     _ => None,
                 })
@@ -1495,8 +1750,8 @@ mod tests {
                 r#"ワ<span style="display:inline-block;position:relative;"><span style="display:inline;">タシ</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;"></span></span>"#
             ),
             vec![
-                ("ワ".into(), false, false, None),
-                ("タシ".into(), true, false, None),
+                ("ワ".into(), false, false, false, None, None),
+                ("タシ".into(), true, false, false, None, None),
             ]
         );
 
@@ -1505,9 +1760,9 @@ mod tests {
                 r#"ア<span style="display:inline-block;position:relative;padding-right:0.1em;margin-right:0.1em;"><span style="display:inline;">ナ</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;right:-0.1em;height:0.4em;border-right-width:0.1em;border-right-style:solid;"></span></span>タ"#
             ),
             vec![
-                ("ア".into(), false, false, None),
-                ("ナ".into(), true, true, None),
-                ("タ".into(), false, false, None),
+                ("ア".into(), false, false, false, None, None),
+                ("ナ".into(), true, true, false, None, None),
+                ("タ".into(), false, false, false, None, None),
             ]
         );
 
@@ -1516,8 +1771,15 @@ mod tests {
                 r#"<span style="color: royalblue;">ス</span><span style="display:inline-block;position:relative;padding-right:0.1em;margin-right:0.1em;"><span style="display:inline;">キ</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;right:-0.1em;height:0.4em;border-right-width:0.1em;border-right-style:solid;"></span></span>"#
             ),
             vec![
-                ("ス".into(), false, false, Some([65, 105, 225])),
-                ("キ".into(), true, true, None),
+                (
+                    "ス".into(),
+                    false,
+                    false,
+                    false,
+                    Some([65, 105, 225]),
+                    None
+                ),
+                ("キ".into(), true, true, false, None, None),
             ]
         );
 
@@ -1526,19 +1788,84 @@ mod tests {
                 r#"ニ<span style="display:inline-block;position:relative;"><span style="display:inline;">ホンコ<span style="color: red;">°</span></span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;"></span></span>"#
             ),
             vec![
-                ("ニ".into(), false, false, None),
-                ("ホンコ".into(), true, false, None),
-                ("°".into(), true, false, Some([220, 40, 30])),
+                ("ニ".into(), false, false, false, None, None),
+                ("ホン".into(), true, false, false, None, None),
+                (
+                    "コ".into(),
+                    true,
+                    false,
+                    true,
+                    None,
+                    Some([220, 40, 30])
+                ),
             ]
         );
 
         assert_eq!(
             runs(r#"ベ<span style="text-decoration:overline;">ンキョー</span>"#),
             vec![
-                ("ベ".into(), false, false, None),
-                ("ンキョー".into(), true, false, None),
+                ("ベ".into(), false, false, false, None, None),
+                ("ンキョー".into(), true, false, false, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn nasal_markers_attach_to_the_preceding_mora() {
+        fn runs(html: &str) -> Vec<(String, bool, bool, Option<[u8; 3]>)> {
+            let blocks = parse_html(html);
+            let Block::Paragraph(content) = &blocks[0] else {
+                panic!("expected paragraph");
+            };
+            content
+                .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Text { text, style } if !text.is_empty() => Some((
+                        text.clone(),
+                        style.pitch.high,
+                        style.pitch.nasal,
+                        style.pitch.nasal_color,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            runs("ハケ°シイ"),
+            vec![
+                ("ハ".into(), false, false, None),
+                ("ケ".into(), false, true, None),
+                ("シイ".into(), false, false, None),
+            ]
+        );
+        assert_eq!(
+            runs("カ\u{309A}"),
+            vec![("カ".into(), false, true, None)]
+        );
+        assert_eq!(runs("ケ゜"), vec![("ケ".into(), false, true, None)]);
+        assert_eq!(
+            runs(
+                r#"<span style="display:inline-block;position:relative;"><span style="display:inline;">ケ○</span><span style="border-color:currentColor;display:block;user-select:none;pointer-events:none;position:absolute;top:0.1em;left:0;right:0;height:0;border-top-width:0.1em;border-top-style:solid;"></span></span>"#
+            ),
+            vec![("ケ".into(), true, true, None)]
+        );
+        assert_eq!(
+            runs("<span class=\"nasal\">ガ</span>"),
+            vec![("ガ".into(), false, true, None)]
+        );
+    }
+
+    #[test]
+    fn nasal_marker_in_pitch_word_stays_in_the_base_for_layout() {
+        let blocks = parse_html("ハケ°シイ[2]");
+        let Block::Paragraph(content) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(content.iter().any(|inline| matches!(
+            inline,
+            Inline::PitchWord { base, accent, .. } if base == "ハケ°シイ" && *accent == 2
+        )));
     }
 
     #[test]

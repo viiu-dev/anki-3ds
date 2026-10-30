@@ -39,6 +39,7 @@ const CARD_HEADWORD_SCALE: f32 = 1.30;
 const CARD_HEADWORD_MAX_CHARS: usize = 28;
 const CARD_PITCH_HEIGHT: f32 = 6.0;
 const CARD_PITCH_GAP: f32 = 4.0;
+const CARD_RUBY_MIN_GAP: f32 = 3.0;
 
 // Bundled SIL OFL font, so users never need to copy cjk.bcfnt to their SD
 // card. The renderer rasterizes only visible glyphs into a small atlas.
@@ -114,8 +115,24 @@ extern "C" {
     fn ui_audio_prefetch_clear();
     fn ui_audio_stop();
     fn ui_audio_is_playing() -> bool;
-    fn ui_draw_status_compact(x_right: f32, y: f32, scale: f32, sync_state: c_int);
+    fn ui_draw_status_compact(
+        x_right: f32,
+        y: f32,
+        scale: f32,
+        sync_state: c_int,
+        items: *const u8,
+        count: c_int,
+    ) -> f32;
     fn ui_draw_sync_icon(x: f32, y: f32, size: f32, state: c_int);
+    fn ui_draw_icon_undo(x: f32, y: f32, size: f32, color: u32);
+    fn ui_draw_nasal_circle(cx: f32, cy: f32, radius: f32, thickness: f32, color: u32);
+    fn ui_ruby_collision_shift(
+        has_prev_ruby: bool,
+        prev_ruby_right: f32,
+        nominal_x: f32,
+        base_advance: f32,
+        ruby_width: f32,
+    ) -> f32;
     fn ui_set_battery_linear(linear: bool);
     fn ui_draw_scroll_indicator(x_right: f32, y: f32, w: f32, h: f32, scroll: f32, max_scroll: f32);
 
@@ -485,12 +502,53 @@ impl Ui {
         unsafe { ui_audio_is_playing() }
     }
 
-    pub fn draw_status_compact(x_right: f32, y: f32, scale: f32, sync_state: i32) {
-        unsafe { ui_draw_status_compact(x_right, y, scale, sync_state as c_int) }
+    pub fn draw_status_compact(
+        x_right: f32,
+        y: f32,
+        scale: f32,
+        sync_state: i32,
+        items: &[u8],
+    ) -> f32 {
+        unsafe {
+            ui_draw_status_compact(
+                x_right,
+                y,
+                scale,
+                sync_state as c_int,
+                items.as_ptr(),
+                items.len() as c_int,
+            )
+        }
     }
 
     pub fn draw_sync_icon(x: f32, y: f32, size: f32, state: i32) {
         unsafe { ui_draw_sync_icon(x, y, size, state as c_int) }
+    }
+
+    pub fn draw_icon_undo(x: f32, y: f32, size: f32, color: u32) {
+        unsafe { ui_draw_icon_undo(x, y, size, color) }
+    }
+
+    pub fn draw_nasal_circle(cx: f32, cy: f32, radius: f32, thickness: f32, color: u32) {
+        unsafe { ui_draw_nasal_circle(cx, cy, radius, thickness, color) }
+    }
+
+    pub fn ruby_collision_shift(
+        has_prev_ruby: bool,
+        prev_ruby_right: f32,
+        nominal_x: f32,
+        base_advance: f32,
+        ruby_width: f32,
+    ) -> f32 {
+        unsafe {
+            ui_ruby_collision_shift(
+                has_prev_ruby,
+                prev_ruby_right,
+                nominal_x,
+                base_advance,
+                ruby_width,
+            )
+        }
     }
 
     pub fn set_battery_linear(linear: bool) {
@@ -598,6 +656,7 @@ struct CardPiece {
     x: f32,
     width: f32,
     base_width: f32,
+    ruby_width: f32,
     ruby: Option<String>,
     rise: f32,
     scale: f32,
@@ -625,6 +684,9 @@ struct LineDraft {
     max_scale: f32,
     pitch_height: f32,
     marker: Option<String>,
+    last_ruby_right: Option<f32>,
+    last_ruby_piece: Option<usize>,
+    had_space_since_ruby: bool,
 }
 
 impl LineDraft {
@@ -638,6 +700,9 @@ impl LineDraft {
             max_scale: 1.0,
             pitch_height: 0.0,
             marker,
+            last_ruby_right: None,
+            last_ruby_piece: None,
+            had_space_since_ruby: false,
         }
     }
 
@@ -931,10 +996,15 @@ impl RichTextLayout {
                     false,
                 );
             }
+            let mut previous_piece: Option<&CardPiece> = None;
+            let mut previous_base_right = 0.0;
+            let mut previous_piece_end = 0.0;
+            let mut previous_ruby_right: Option<f32> = None;
             for piece in &line.pieces {
                 let x = line_left + piece.x;
                 if let Some(marker) = &piece.pitch_marker {
                     self.draw_pitch_marker(marker, x, text_top, pitch_top, piece.width, scale);
+                    previous_piece = None;
                     continue;
                 }
                 let text_scale = scale
@@ -946,6 +1016,8 @@ impl RichTextLayout {
                     };
                 let y = text_top + piece.rise;
                 let base_x = x + (piece.width - piece.base_width) / 2.0;
+                let bar_y =
+                    pitch_top - CARD_PITCH_GAP * self.font_scale * piece.scale.max(1.0);
                 let color = if let Some(rgb) = piece.style.color {
                     rgba(rgb[0], rgb[1], rgb[2], 255)
                 } else if piece.style.cloze {
@@ -1000,10 +1072,19 @@ impl RichTextLayout {
                 }
                 if piece.style.pitch.high || piece.style.pitch.downstep || piece.style.pitch.upstep
                 {
-                    let bar_y = pitch_top - CARD_PITCH_GAP * self.font_scale;
                     if piece.style.pitch.high {
+                        let bar_start = match previous_piece {
+                            Some(previous)
+                                if previous.style.pitch.high
+                                    && !previous.style.pitch.downstep
+                                    && previous_piece_end < base_x =>
+                            {
+                                previous_base_right
+                            }
+                            _ => base_x,
+                        };
                         Ui::draw_line(
-                            base_x,
+                            bar_start,
                             bar_y,
                             base_x + piece.base_width,
                             bar_y,
@@ -1032,11 +1113,37 @@ impl RichTextLayout {
                         );
                     }
                 }
+                if piece.style.pitch.nasal {
+                    let nasal_color = piece
+                        .style
+                        .pitch
+                        .nasal_color
+                        .map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255))
+                        .or_else(|| piece.style.color.map(|rgb| rgba(rgb[0], rgb[1], rgb[2], 255)))
+                        .unwrap_or(theme().again_fg);
+                    let radius = (2.1 * self.font_scale * piece.scale).clamp(1.7, 4.5);
+                    let stroke = (1.1 * self.font_scale).clamp(1.0, 1.8);
+                    let pad = nasal_pad(&piece.text, self.font_scale, piece.scale);
+                    let glyph_right = base_x + piece.base_width - pad;
+                    let cx = glyph_right + pad * 0.5;
+                    let mut cy = y + 2.6 * self.font_scale * piece.scale;
+                    if piece.style.pitch.high
+                        || piece.style.pitch.downstep
+                        || piece.style.pitch.upstep
+                    {
+                        cy = cy.max(bar_y + radius + 1.0);
+                    }
+                    Ui::draw_nasal_circle(cx, cy, radius, stroke, nasal_color);
+                }
                 if let Some(reading) = &piece.ruby {
                     let reading_scale = ruby_scale * piece.scale;
-                    let reading_width = Ui::get_card_text_width(reading_scale, reading);
+                    let mut ruby_x = x + (piece.width - piece.ruby_width) * 0.5;
+                    ruby_x = ruby_x.clamp(1.0, (TOP_WIDTH - piece.ruby_width - 1.0).max(1.0));
+                    if let Some(previous_right) = previous_ruby_right {
+                        ruby_x = ruby_x.max(previous_right + CARD_RUBY_MIN_GAP);
+                    }
                     Ui::draw_card_text(
-                        x + (piece.width - reading_width) / 2.0,
+                        ruby_x,
                         top + line.pitch_height + line.upper,
                         reading_scale,
                         color,
@@ -1044,7 +1151,11 @@ impl RichTextLayout {
                         false,
                         false,
                     );
+                    previous_ruby_right = Some(ruby_x + piece.ruby_width);
                 }
+                previous_piece = Some(piece);
+                previous_base_right = base_x + piece.base_width;
+                previous_piece_end = x + piece.width;
             }
         }
         for image in &self.images {
@@ -1378,28 +1489,50 @@ impl RichTextLayout {
         cursor: &mut f32,
     ) {
         let mut mora = -1i32;
-        for ch in base.chars() {
+        let mut chars = base.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if is_nasal_marker(ch) {
+                continue;
+            }
             if !is_small_kana(ch) {
                 mora += 1;
             }
-            let mora = mora.max(0) as u8;
+            let current_mora = mora.max(0) as u8;
+            let mut text = String::new();
+            text.push(ch);
+            while let Some(&next) = chars.peek() {
+                if is_small_kana(next) {
+                    text.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let mut nasal = false;
+            while let Some(&next) = chars.peek() {
+                if is_nasal_marker(next) {
+                    nasal = true;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
             let high = if accent == 0 {
-                mora >= 1
+                current_mora >= 1
             } else if accent == 1 {
-                mora == 0
+                current_mora == 0
             } else {
-                mora >= 1 && mora < accent
+                current_mora >= 1 && current_mora < accent
             };
-            let downstep = accent > 0 && mora + 1 == accent;
+            let downstep = accent > 0 && current_mora + 1 == accent;
             let mut piece_style = style.clone();
             piece_style.pitch.high = high;
             piece_style.pitch.low = !high;
             piece_style.pitch.downstep = downstep;
-            let multiplier = block_scale * if is_cjk_char(ch) { CARD_CJK_SCALE } else { 1.0 };
-            let mut buffer = [0u8; 4];
-            let piece = ch.encode_utf8(&mut buffer);
+            piece_style.pitch.nasal |= nasal;
+            let multiplier = block_scale * script_multiplier(&text);
             self.place_run(
-                piece,
+                &text,
                 &piece_style,
                 None,
                 multiplier,
@@ -1438,6 +1571,7 @@ impl RichTextLayout {
             x,
             width,
             base_width: width,
+            ruby_width: 0.0,
             ruby: None,
             rise: 0.0,
             scale: 1.0,
@@ -1466,29 +1600,41 @@ impl RichTextLayout {
         lines: &mut Vec<CardLine>,
         cursor: &mut f32,
     ) {
-        let (width, base_width, ruby_height, rise) = self.measure_piece(
+        let (width, base_width, ruby_width, ruby_height, rise) = self.measure_piece(
             text,
             style,
             ruby.as_deref(),
             metrics.font_scale,
             scale_multiplier,
         );
-        if draft.has_content() {
-            let gap = if *pending_space {
-                self.space_width(metrics)
-            } else {
-                0.0
-            };
-            if draft.x + gap + width > metrics.width {
-                finish_line(draft, lines, cursor, metrics, true);
+        let space_gap = if draft.has_content() && *pending_space {
+            self.space_width(metrics)
+        } else {
+            0.0
+        };
+        let mut nominal_x = draft.x + space_gap;
+        let mut ruby_shift = match (ruby.is_some(), draft.last_ruby_right) {
+            (true, Some(previous_right)) if !draft.had_space_since_ruby => {
+                Ui::ruby_collision_shift(true, previous_right, nominal_x, width, ruby_width)
             }
+            _ => 0.0,
+        };
+        let mut placed_x = nominal_x + ruby_shift;
+        if draft.has_content() && placed_x + width > metrics.width {
+            finish_line(draft, lines, cursor, metrics, true);
+            nominal_x = draft.x;
+            ruby_shift = 0.0;
+            placed_x = draft.x;
         }
-        let available = metrics.width - draft.x;
+        let available = metrics.width - placed_x;
         if ruby.is_none() && width > available {
             if draft.has_content() {
                 finish_line(draft, lines, cursor, metrics, true);
+                nominal_x = draft.x;
+                ruby_shift = 0.0;
+                placed_x = draft.x;
             }
-            if width > metrics.width - draft.x {
+            if width > metrics.width - placed_x {
                 self.place_split_text(
                     text,
                     style,
@@ -1503,18 +1649,35 @@ impl RichTextLayout {
                 return;
             }
         }
-        let gap = if draft.has_content() && *pending_space {
-            self.space_width(metrics)
+        if ruby_shift > 0.0 {
+            let directly_adjacent =
+                draft.last_ruby_piece == Some(draft.pieces.len().saturating_sub(1));
+            if !directly_adjacent {
+                if let Some(previous_index) = draft.last_ruby_piece {
+                    let start = previous_index + 1;
+                    let end = draft.pieces.len();
+                    let count = end.saturating_sub(start);
+                    if count > 0 {
+                        for index in start..end {
+                            let shift = ruby_shift * (index - previous_index) as f32
+                                / (count + 1) as f32;
+                            draft.pieces[index].x += shift;
+                        }
+                    }
+                }
+            }
+            draft.x = nominal_x + ruby_shift;
         } else {
-            0.0
-        };
-        draft.x += gap;
+            draft.x = nominal_x;
+        }
+        let piece_x = draft.x;
         draft.pieces.push(CardPiece {
             text: text.to_owned(),
             style: style.clone(),
-            x: draft.x,
+            x: piece_x,
             width,
             base_width,
+            ruby_width,
             ruby,
             rise,
             scale: scale_multiplier,
@@ -1528,10 +1691,19 @@ impl RichTextLayout {
             draft.lower = draft.lower.max(rise);
         }
         draft.max_scale = draft.max_scale.max(scale_multiplier);
-        if style.pitch.high || style.pitch.downstep || style.pitch.upstep {
-            draft.pitch_height = draft
-                .pitch_height
-                .max(CARD_PITCH_HEIGHT * metrics.font_scale);
+        if style.pitch.high || style.pitch.downstep || style.pitch.upstep || style.pitch.nasal {
+            draft.pitch_height = draft.pitch_height.max(
+                CARD_PITCH_HEIGHT * metrics.font_scale * scale_multiplier.max(1.0),
+            );
+        }
+        if draft.pieces.last().is_some_and(|piece| piece.ruby.is_some()) {
+            let ruby_right = piece_x + (width + ruby_width) * 0.5;
+            draft.last_ruby_right =
+                Some(draft.last_ruby_right.map_or(ruby_right, |previous| previous.max(ruby_right)));
+            draft.last_ruby_piece = Some(draft.pieces.len() - 1);
+            draft.had_space_since_ruby = false;
+        } else if *pending_space {
+            draft.had_space_since_ruby = true;
         }
         *pending_space = false;
     }
@@ -1549,34 +1721,47 @@ impl RichTextLayout {
         cursor: &mut f32,
         ruby_height: f32,
     ) {
-        let scale = CARD_TEXT_SCALE * metrics.font_scale;
+        let mut gap = if draft.has_content() && *pending_space {
+            self.space_width(metrics)
+        } else {
+            0.0
+        };
         for ch in text.chars() {
             let piece_scale = scale_multiplier;
-            let text_scale = scale * piece_scale * if style.sub || style.sup { 0.75 } else { 1.0 };
             let mut buffer = [0u8; 4];
             let piece = ch.encode_utf8(&mut buffer);
-            let width = Ui::get_card_text_width(text_scale, piece);
-            if draft.has_content() && draft.x + width > metrics.width {
+            let (width, base_width, _, _, rise) =
+                self.measure_piece(piece, style, None, metrics.font_scale, piece_scale);
+            if draft.has_content() && draft.x + gap + width > metrics.width {
                 finish_line(draft, lines, cursor, metrics, true);
+                gap = 0.0;
             }
+            let x = draft.x + gap;
+            gap = 0.0;
             draft.pieces.push(CardPiece {
                 text: piece.to_owned(),
                 style: style.clone(),
-                x: draft.x,
+                x,
                 width,
-                base_width: width,
+                base_width,
+                ruby_width: 0.0,
                 ruby: None,
-                rise: 0.0,
+                rise,
                 scale: piece_scale,
                 pitch_marker: None,
             });
-            draft.x += width;
+            draft.x = x + width;
             draft.ruby_height = draft.ruby_height.max(ruby_height);
+            if rise < 0.0 {
+                draft.upper = draft.upper.max(-rise);
+            } else if rise > 0.0 {
+                draft.lower = draft.lower.max(rise);
+            }
             draft.max_scale = draft.max_scale.max(piece_scale);
-            if style.pitch.high || style.pitch.downstep || style.pitch.upstep {
-                draft.pitch_height = draft
-                    .pitch_height
-                    .max(CARD_PITCH_HEIGHT * metrics.font_scale);
+            if style.pitch.high || style.pitch.downstep || style.pitch.upstep || style.pitch.nasal {
+                draft.pitch_height = draft.pitch_height.max(
+                    CARD_PITCH_HEIGHT * metrics.font_scale * piece_scale.max(1.0),
+                );
             }
         }
         *pending_space = false;
@@ -1589,14 +1774,21 @@ impl RichTextLayout {
         ruby: Option<&str>,
         font_scale: f32,
         scale_multiplier: f32,
-    ) -> (f32, f32, f32, f32) {
+    ) -> (f32, f32, f32, f32, f32) {
         let scale = CARD_TEXT_SCALE * font_scale * scale_multiplier;
         let text_scale = scale * if style.sub || style.sup { 0.75 } else { 1.0 };
-        let base_width = Ui::get_card_text_width(text_scale, text);
+        let mut base_width = Ui::get_card_text_width(text_scale, text);
+        if style.pitch.nasal {
+            base_width += nasal_pad(text, font_scale, scale_multiplier);
+        }
         let mut width = base_width;
         if style.bold {
             width += 0.7 * font_scale * scale_multiplier;
         }
+        let ruby_scale = CARD_TEXT_SCALE * font_scale * CARD_RUBY_SCALE * scale_multiplier;
+        let ruby_width = ruby
+            .map(|reading| Ui::get_card_text_width(ruby_scale, reading))
+            .unwrap_or(0.0);
         let ruby_height = if ruby.is_some() {
             CARD_RUBY_HEIGHT * font_scale * scale_multiplier + 1.0
         } else {
@@ -1609,7 +1801,7 @@ impl RichTextLayout {
         } else {
             0.0
         };
-        (width, base_width, ruby_height, rise)
+        (width, base_width, ruby_width, ruby_height, rise)
     }
 
     fn space_width(&self, metrics: CardMetrics) -> f32 {
@@ -1657,6 +1849,9 @@ fn finish_line(
     draft.lower = 0.0;
     draft.max_scale = 1.0;
     draft.pitch_height = 0.0;
+    draft.last_ruby_right = None;
+    draft.last_ruby_piece = None;
+    draft.had_space_since_ruby = false;
 }
 
 fn script_runs(text: &str) -> Vec<(usize, usize)> {
@@ -1708,6 +1903,23 @@ fn is_cjk_char(ch: char) -> bool {
             | 0xff66..=0xff9f
             | 0x20000..=0x2fa1f
     )
+}
+
+fn is_nasal_marker(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{309A}' | '\u{309C}' | '\u{FF9F}' | '\u{00B0}' | '\u{02DA}' | '\u{25CB}'
+    )
+}
+
+fn has_dakuten(text: &str) -> bool {
+    text.chars()
+        .any(|ch| matches!(ch, 'ガ' | 'ギ' | 'グ' | 'ゲ' | 'ゴ' | 'が' | 'ぎ' | 'ぐ' | 'げ' | 'ご'))
+}
+
+fn nasal_pad(text: &str, font_scale: f32, scale_multiplier: f32) -> f32 {
+    let factor = if has_dakuten(text) { 6.0 } else { 5.0 };
+    factor * font_scale * scale_multiplier
 }
 
 fn is_small_kana(ch: char) -> bool {

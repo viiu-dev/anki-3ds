@@ -472,6 +472,9 @@ fn draw_rating_icon(rating: i32, cx: f32, cy: f32, scale: f32, color: u32) {
 }
 
 fn draw_rating_badge(feedback: Option<(i32, Instant)>) {
+    if !i18n::rating_icon() {
+        return;
+    }
     let Some((rating, at)) = feedback else {
         return;
     };
@@ -480,19 +483,8 @@ fn draw_rating_badge(feedback: Option<(i32, Instant)>) {
         return;
     }
     let alpha = feedback_alpha(elapsed);
-    let (background, foreground) = rating_colors(rating);
-    let radius = 15.0;
-    let cx = TOP_WIDTH - 28.0;
-    let cy = 27.0;
-    Ui::draw_rounded_rect(
-        cx - radius,
-        cy - radius,
-        radius * 2.0,
-        radius * 2.0,
-        radius,
-        with_alpha(background, alpha * 0.95),
-    );
-    draw_rating_icon(rating, cx, cy, 1.0, with_alpha(foreground, alpha));
+    let (_, foreground) = rating_colors(rating);
+    draw_rating_icon(rating, TOP_WIDTH - 20.0, 18.0, 1.0, with_alpha(foreground, alpha));
 }
 
 fn draw_sync_button(x: f32, y: f32, w: f32, h: f32, state: i32) {
@@ -516,26 +508,14 @@ fn draw_sync_button(x: f32, y: f32, w: f32, h: f32, state: i32) {
 
 fn draw_undo_button(x: f32, y: f32, w: f32, h: f32, enabled: bool) {
     let style = if enabled { 6 } else { 8 };
-    Ui::draw_button(x, y, w, h, tr("Undo"), None, style, false);
-}
-
-fn draw_rating_edge(feedback: Option<(i32, Instant)>) {
-    let Some((rating, at)) = feedback else {
-        return;
+    let color = if enabled {
+        current_theme().text
+    } else {
+        current_theme().text_faint
     };
-    let elapsed = at.elapsed().as_secs_f32();
-    if elapsed >= 0.95 {
-        return;
-    }
-    let alpha = feedback_alpha(elapsed);
-    let (background, foreground) = rating_colors(rating);
-    if elapsed < 0.55 {
-        let fade = 1.0 - elapsed / 0.55;
-        let x = 8.0 + rating as f32 * 76.0;
-        Ui::draw_rounded_rect(x, 190.0, 72.0, 36.0, 16.0, with_alpha(background, fade * 0.95));
-        draw_rating_icon(rating, x + 36.0, 208.0, 0.9, with_alpha(foreground, fade));
-    }
-    Ui::draw_rounded_rect(313.0, 84.0, 5.0, 76.0, 2.5, with_alpha(foreground, alpha * 0.9));
+    let size = if h >= 48.0 { 20.0 } else { 18.0 };
+    Ui::draw_button(x, y, w, h, "", None, style, false);
+    Ui::draw_icon_undo(x + (w - size) * 0.5, y + (h - size) * 0.5, size, color);
 }
 
 fn draw_leech_notice(notice: Option<&(String, Instant)>) {
@@ -1067,6 +1047,10 @@ enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    SettingsToolbar {
+        selected: usize,
+        previous: Box<Screen>,
+    },
     CardChoice {
         card_id: i64,
         selected: usize,
@@ -1271,6 +1255,25 @@ fn counts_compact(new: u32, learn: u32, review: u32, y: f32) {
         Ui::draw_text_centered(x, y + 17.0, 0.37, current_theme().text_muted, label);
     }
 }
+fn draw_review_header(deck_name: &str, sync_state: i32) {
+    let (items, count) = i18n::active_toolbar_items();
+    let status_width = Ui::draw_status_compact(314.0, 3.0, 0.42, sync_state, &items[..count]);
+    let max_deck_width = if status_width > 0.0 {
+        (314.0 - status_width - 16.0).max(80.0)
+    } else {
+        304.0
+    };
+    if i18n::deck_title_visible() {
+        Ui::draw_text(
+            8.0,
+            3.0,
+            0.44,
+            current_theme().text_muted,
+            &Ui::ellipsize(deck_name, 0.44, max_deck_width),
+        );
+    }
+}
+
 fn button(x: f32, y: f32, w: f32, label: &str, hint: Option<&str>, style: i32) {
     Ui::draw_button(
         x,
@@ -1368,6 +1371,8 @@ enum ChoiceKind {
 enum ToggleKind {
     Autoplay,
     ConsoleLeds,
+    RatingIcon,
+    CardCounts,
 }
 
 #[derive(Clone, Copy)]
@@ -1375,14 +1380,20 @@ enum SettingsItem {
     Choice(ChoiceKind),
     Toggle(ToggleKind),
     Action(Action, &'static str),
+    Toolbar,
 }
 
-const APPEARANCE_ITEMS: [SettingsItem; 3] = [
+const APPEARANCE_ITEMS: [SettingsItem; 4] = [
     SettingsItem::Choice(ChoiceKind::Theme),
     SettingsItem::Choice(ChoiceKind::FontScale),
     SettingsItem::Choice(ChoiceKind::Battery),
+    SettingsItem::Toolbar,
 ];
-const AUDIO_ITEMS: [SettingsItem; 1] = [SettingsItem::Toggle(ToggleKind::Autoplay)];
+const AUDIO_ITEMS: [SettingsItem; 3] = [
+    SettingsItem::Toggle(ToggleKind::Autoplay),
+    SettingsItem::Toggle(ToggleKind::RatingIcon),
+    SettingsItem::Toggle(ToggleKind::CardCounts),
+];
 const NETWORK_ITEMS: [SettingsItem; 6] = [
     SettingsItem::Action(Action::Login, "Log in"),
     SettingsItem::Action(Action::Logout, "Log out"),
@@ -1513,6 +1524,14 @@ fn apply_toggle(kind: ToggleKind) -> std::io::Result<()> {
                 if value { "on" } else { "off" }
             ));
         }
+        ToggleKind::RatingIcon => {
+            let value = i18n::toggle_rating_icon()?;
+            event(&format!("RATING_ICON {}", if value { "on" } else { "off" }));
+        }
+        ToggleKind::CardCounts => {
+            let value = i18n::toggle_card_counts()?;
+            event(&format!("CARD_COUNTS {}", if value { "on" } else { "off" }));
+        }
     }
     Ok(())
 }
@@ -1536,6 +1555,22 @@ fn settings_item_label(
         SettingsItem::Toggle(ToggleKind::ConsoleLeds) => i18n::format(
             "Console LEDs: {0}",
             &[tr(if i18n::console_leds() { "On" } else { "Off" })],
+        ),
+        SettingsItem::Toggle(ToggleKind::RatingIcon) => i18n::format(
+            "Rating icon: {0}",
+            &[tr(if i18n::rating_icon() { "On" } else { "Off" })],
+        ),
+        SettingsItem::Toggle(ToggleKind::CardCounts) => i18n::format(
+            "Card counts: {0}",
+            &[tr(if i18n::card_counts() { "On" } else { "Off" })],
+        ),
+        SettingsItem::Toolbar => i18n::format(
+            "Toolbar: {0}",
+            &[tr(if i18n::toolbar_visible() {
+                "On"
+            } else {
+                "Off"
+            })],
         ),
         SettingsItem::Action(Action::MediaSync, _) => {
             media_sync_label(media_running, media_files, media_status)
@@ -1597,6 +1632,7 @@ const SETTINGS_TILE_H: f32 = 20.0;
 const SETTINGS_TILE_GAP: f32 = 2.0;
 const CHOICE_TILE_H: f32 = 18.0;
 const CHOICE_TILE_GAP: f32 = 2.0;
+const TOOLBAR_ROWS: usize = 6;
 
 fn settings_tile(row: usize) -> (f32, f32) {
     (
@@ -2052,6 +2088,10 @@ fn main() {
             Action::Rate(1)
         } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::R) {
             Action::Rate(3)
+        } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::Y) {
+            Action::Left
+        } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::X) {
+            Action::Right
         } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
             && down.contains(KeyPad::L)
         {
@@ -2298,6 +2338,25 @@ fn main() {
                         Action::None
                     }
                 }
+                Screen::SettingsToolbar { selected, .. } => {
+                    if let Some(index) = list_hit(x, y, 5) {
+                        *selected = index;
+                        Action::Primary
+                    } else if (150.0..170.0).contains(&y) && (10.0..150.0).contains(&x) {
+                        *selected = 5;
+                        Action::Primary
+                    } else if (194.0..222.0).contains(&y) {
+                        if (12.0..152.0).contains(&x) {
+                            Action::Left
+                        } else if (168.0..308.0).contains(&x) {
+                            Action::Right
+                        } else {
+                            Action::None
+                        }
+                    } else {
+                        Action::None
+                    }
+                }
                 Screen::CardChoice { selected, .. } if (70.0..118.0).contains(&y) => {
                     *selected = if x < 160.0 { 0 } else { 1 };
                     Action::Primary
@@ -2492,6 +2551,24 @@ fn main() {
                                 }
                             }
                             SettingsItem::Toggle(kind) => apply_toggle(kind)?,
+                            SettingsItem::Toolbar => {
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsCategory {
+                                    category,
+                                    selected,
+                                    previous,
+                                } = old
+                                {
+                                    screen = Screen::SettingsToolbar {
+                                        selected: 0,
+                                        previous: Box::new(Screen::SettingsCategory {
+                                            category,
+                                            selected,
+                                            previous,
+                                        }),
+                                    };
+                                }
+                            }
                             SettingsItem::Action(Action::MediaSync, _) => {
                                 if let Some(active) = &media_job {
                                     active.cancel();
@@ -2580,7 +2657,53 @@ fn main() {
                             }
                             SettingsItem::Toggle(kind) => apply_toggle(kind)?,
                             SettingsItem::Action(_, _) => {}
+                            SettingsItem::Toolbar => {}
                         }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            if let Screen::SettingsToolbar { selected, .. } = &screen {
+                let index = *selected;
+                match action {
+                    Action::Primary => {
+                        match index {
+                            0 => {
+                                let value = i18n::toggle_toolbar_visible()?;
+                                event(&format!(
+                                    "TOOLBAR {}",
+                                    if value { "on" } else { "off" }
+                                ));
+                            }
+                            1..=4 => {
+                                let item = i18n::toolbar_order()[index - 1];
+                                let value = i18n::toggle_toolbar_item(item)?;
+                                event(&format!(
+                                    "TOOLBAR_ITEM {} {}",
+                                    item.key(),
+                                    if value { "on" } else { "off" }
+                                ));
+                            }
+                            _ => {
+                                let value = i18n::toggle_deck_title()?;
+                                event(&format!(
+                                    "DECK_TITLE {}",
+                                    if value { "on" } else { "off" }
+                                ));
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Action::Left | Action::Right if (1..=4).contains(&index) => {
+                        let delta = if matches!(action, Action::Right) { 1 } else { -1 };
+                        let target = i18n::move_toolbar_item(index - 1, delta)?;
+                        if let Screen::SettingsToolbar { selected, .. } = &mut screen {
+                            *selected = target + 1;
+                        }
+                        let order = i18n::toolbar_order();
+                        let keys: Vec<&str> = order.iter().map(|item| item.key()).collect();
+                        event(&format!("TOOLBAR_ORDER {}", keys.join(",")));
                         return Ok(());
                     }
                     _ => {}
@@ -3119,6 +3242,7 @@ fn main() {
                         | Screen::Settings { previous, .. }
                         | Screen::SettingsCategory { previous, .. }
                         | Screen::SettingsChoice { previous, .. }
+                        | Screen::SettingsToolbar { previous, .. }
                         | Screen::CardChoice { previous, .. } => *previous,
                         Screen::Editor {
                             return_query: Some(query),
@@ -3437,6 +3561,10 @@ fn main() {
                                     matches!(action, Action::Down),
                                 );
                             }
+                            Screen::SettingsToolbar { selected, .. } => {
+                                *selected =
+                                    list_step(*selected, TOOLBAR_ROWS, matches!(action, Action::Down));
+                            }
                             _ => {
                                 card_scroll = next(card_scroll, top_max + 1);
                             }
@@ -3676,6 +3804,7 @@ fn main() {
             Screen::Settings { .. } => "SETTINGS",
             Screen::SettingsCategory { .. } => "SETTINGS_CATEGORY",
             Screen::SettingsChoice { .. } => "SETTINGS_CHOICE",
+            Screen::SettingsToolbar { .. } => "SETTINGS_TOOLBAR",
             Screen::CardChoice { .. } => "CARD_CHOICE",
             Screen::Info { .. } => "INFO",
             Screen::Error(_) => "ERROR",
@@ -4001,6 +4130,38 @@ fn main() {
                     tr("Choose an option. A applies. B returns."),
                 );
             }
+            Screen::SettingsToolbar { .. } => {
+                Ui::fit_text(
+                    200.0,
+                    34.0,
+                    0.62,
+                    360.0,
+                    current_theme().text,
+                    tr("Toolbar"),
+                );
+                Ui::fit_text(
+                    200.0,
+                    76.0,
+                    0.50,
+                    360.0,
+                    current_theme().text_muted,
+                    tr("A toggles. LEFT/RIGHT reorders. B returns."),
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    118.0,
+                    0.46,
+                    current_theme().text_muted,
+                    tr("Move up [Y]"),
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    136.0,
+                    0.46,
+                    current_theme().text_muted,
+                    tr("Move down [X]"),
+                );
+            }
             Screen::CardChoice { .. } => {
                 Ui::draw_text_centered(
                     200.0,
@@ -4136,15 +4297,10 @@ fn main() {
                 draw_sync_button(168.0, 194.0, 140.0, 28.0, sync_state);
             }
             Screen::Question { card, deck_name } => {
-                Ui::draw_text(
-                    8.0,
-                    3.0,
-                    0.44,
-                    current_theme().text_muted,
-                    &Ui::ellipsize(deck_name, 0.44, 205.0),
-                );
-                Ui::draw_status_compact(314.0, 3.0, 0.42, sync_state);
-                counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                draw_review_header(deck_name, sync_state);
+                if i18n::card_counts() {
+                    counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                }
                 let audio = card_audio(card, false);
                 let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
                 draw_audio_buttons(&audio, &states, frame, audio_page);
@@ -4159,15 +4315,10 @@ fn main() {
                 draw_undo_button(224.0, 128.0, 88.0, 52.0, undo_available);
             }
             Screen::Answer { card, deck_name } => {
-                Ui::draw_text(
-                    8.0,
-                    3.0,
-                    0.44,
-                    current_theme().text_muted,
-                    &Ui::ellipsize(deck_name, 0.44, 205.0),
-                );
-                Ui::draw_status_compact(314.0, 3.0, 0.42, sync_state);
-                counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                draw_review_header(deck_name, sync_state);
+                if i18n::card_counts() {
+                    counts_compact(card.new_count, card.learn_count, card.review_count, 48.0);
+                }
                 let audio = card_audio(card, true);
                 let states = audio_states(&audio, backend.as_ref(), playing_audio.as_deref());
                 draw_audio_buttons(&audio, &states, frame, audio_page);
@@ -4186,9 +4337,6 @@ fn main() {
                     let interval = card.intervals.get(i).map(String::as_str).unwrap_or("?");
                     let hint = format!("{interval} [{}]", ["Y", "X", "A", "R"][i]);
                     let hint = Ui::ellipsize(&hint, 0.42, 68.0);
-                    let pressed = rating_feedback.is_some_and(|(rating, at)| {
-                        rating == i as i32 && at.elapsed().as_secs_f32() < 0.40
-                    });
                     let x = 8.0 + i as f32 * 76.0;
                     Ui::draw_button(
                         x,
@@ -4198,12 +4346,8 @@ fn main() {
                         label,
                         Some(&hint),
                         i as i32 + 2,
-                        pressed,
+                        false,
                     );
-                    if pressed {
-                        let (_, foreground) = rating_colors(i as i32);
-                        Ui::draw_line(x + 8.0, 229.0, x + 64.0, 229.0, 3.0, foreground);
-                    }
                 }
             }
             Screen::Browser(b) => {
@@ -4376,6 +4520,65 @@ fn main() {
                     }
                 }
             }
+            Screen::SettingsToolbar { selected, .. } => {
+                header(320.0, tr("Toolbar"));
+                let order = i18n::toolbar_order();
+                for index in 0..5 {
+                    let (x, y) = settings_tile(index);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let label = if index == 0 {
+                        i18n::format(
+                            "Toolbar: {0}",
+                            &[tr(if i18n::toolbar_visible() { "On" } else { "Off" })],
+                        )
+                    } else {
+                        let item = order[index - 1];
+                        i18n::format(
+                            "{0}: {1}",
+                            &[
+                                tr(item.label()),
+                                tr(if i18n::toolbar_item_visible(item) {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }),
+                            ],
+                        )
+                    };
+                    let label = Ui::ellipsize(&label, 0.50, SETTINGS_TILE_W - 12.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        SETTINGS_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
+                }
+                let style = if *selected == 5 { 0 } else { 6 };
+                let deck_label = i18n::format(
+                    "{0}: {1}",
+                    &[
+                        tr("Current deck"),
+                        tr(if i18n::deck_title_visible() {
+                            "On"
+                        } else {
+                            "Off"
+                        }),
+                    ],
+                );
+                let deck_label = Ui::ellipsize(&deck_label, 0.46, 128.0);
+                Ui::draw_button(10.0, 150.0, 140.0, 20.0, &deck_label, None, style, false);
+                let (items, count) = i18n::active_toolbar_items();
+                Ui::draw_status_compact(255.0, 150.0, 0.48, sync_state, &items[..count]);
+                let can_move = (1..=4).contains(selected);
+                let up_style = if can_move && *selected > 1 { 0 } else { 6 };
+                let down_style = if can_move && *selected < 4 { 0 } else { 6 };
+                button(12.0, 194.0, 140.0, tr("Move up [Y]"), None, up_style);
+                button(168.0, 194.0, 140.0, tr("Move down [X]"), None, down_style);
+            }
             Screen::CardChoice { selected, .. } => {
                 header(320.0, tr("Bury / Suspend"));
                 Ui::draw_button(
@@ -4423,12 +4626,6 @@ fn main() {
                 Ui::draw_text_centered(160.0, 120.0, 0.50, current_theme().text, tr("START: Exit"));
             }
         }
-        if matches!(
-            screen,
-            Screen::Question { .. } | Screen::Answer { .. } | Screen::Empty { .. }
-        ) {
-            draw_rating_edge(rating_feedback);
-        }
         let hide_footer = matches!(
             screen,
             Screen::Question { .. }
@@ -4438,6 +4635,7 @@ fn main() {
                 | Screen::Settings { .. }
                 | Screen::SettingsCategory { .. }
                 | Screen::SettingsChoice { .. }
+                | Screen::SettingsToolbar { .. }
         );
         if !hide_footer {
             footer(&cached_footer);

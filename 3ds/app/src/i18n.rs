@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
@@ -52,6 +53,10 @@ pub fn init() {
     load_download_connections();
     load_battery_linear();
     load_console_leds();
+    load_rating_icon();
+    load_card_counts();
+    load_deck_title();
+    load_toolbar();
     let saved = fs::read_to_string(PATH)
         .ok()
         .and_then(|text| index_of(text.trim()));
@@ -256,6 +261,286 @@ fn load_console_leds() {
     if let Some(value) = value {
         CONSOLE_LEDS.store(value, Ordering::Relaxed);
     }
+}
+
+fn load_bool_setting(key: &str, target: &AtomicBool) {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get(key).and_then(|v| v.as_bool()));
+    if let Some(value) = value {
+        target.store(value, Ordering::Relaxed);
+    }
+}
+
+static RATING_ICON: AtomicBool = AtomicBool::new(true);
+
+pub fn rating_icon() -> bool {
+    RATING_ICON.load(Ordering::Relaxed)
+}
+
+pub fn toggle_rating_icon() -> io::Result<bool> {
+    let value = !rating_icon();
+    write_setting("rating_icon", serde_json::json!(value))?;
+    RATING_ICON.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_rating_icon() {
+    load_bool_setting("rating_icon", &RATING_ICON);
+}
+
+static CARD_COUNTS: AtomicBool = AtomicBool::new(true);
+
+pub fn card_counts() -> bool {
+    CARD_COUNTS.load(Ordering::Relaxed)
+}
+
+pub fn toggle_card_counts() -> io::Result<bool> {
+    let value = !card_counts();
+    write_setting("card_counts", serde_json::json!(value))?;
+    CARD_COUNTS.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_card_counts() {
+    load_bool_setting("card_counts", &CARD_COUNTS);
+}
+
+static DECK_TITLE: AtomicBool = AtomicBool::new(true);
+
+pub fn deck_title_visible() -> bool {
+    DECK_TITLE.load(Ordering::Relaxed)
+}
+
+pub fn toggle_deck_title() -> io::Result<bool> {
+    let value = !deck_title_visible();
+    write_setting("deck_title_visible", serde_json::json!(value))?;
+    DECK_TITLE.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_deck_title() {
+    load_bool_setting("deck_title_visible", &DECK_TITLE);
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolbarItem {
+    Sync = 0,
+    Wifi = 1,
+    Battery = 2,
+    Time = 3,
+}
+
+impl ToolbarItem {
+    const ALL: [ToolbarItem; 4] = [
+        ToolbarItem::Sync,
+        ToolbarItem::Wifi,
+        ToolbarItem::Battery,
+        ToolbarItem::Time,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ToolbarItem::Sync => "sync",
+            ToolbarItem::Wifi => "wifi",
+            ToolbarItem::Battery => "battery",
+            ToolbarItem::Time => "time",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolbarItem::Sync => "Sync icon",
+            ToolbarItem::Wifi => "Wi-Fi",
+            ToolbarItem::Battery => "Battery",
+            ToolbarItem::Time => "Clock",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "sync" => Some(ToolbarItem::Sync),
+            "wifi" => Some(ToolbarItem::Wifi),
+            "battery" => Some(ToolbarItem::Battery),
+            "time" => Some(ToolbarItem::Time),
+            _ => None,
+        }
+    }
+
+    fn from_index(index: u8) -> Self {
+        match index {
+            1 => ToolbarItem::Wifi,
+            2 => ToolbarItem::Battery,
+            3 => ToolbarItem::Time,
+            _ => ToolbarItem::Sync,
+        }
+    }
+}
+
+const TOOLBAR_VISIBLE_BIT: u32 = 1;
+const DEFAULT_TOOLBAR_STATE: u32 = 0x0000_E41F;
+static TOOLBAR_STATE: AtomicU32 = AtomicU32::new(DEFAULT_TOOLBAR_STATE);
+
+fn toolbar_item_bit(item: ToolbarItem) -> u32 {
+    1 << (item as u32 + 1)
+}
+
+fn toolbar_order_shift(slot: usize) -> u32 {
+    8 + slot as u32 * 2
+}
+
+fn toolbar_order_item(state: u32, slot: usize) -> ToolbarItem {
+    ToolbarItem::from_index(((state >> toolbar_order_shift(slot)) & 0x3) as u8)
+}
+
+fn set_toolbar_order_item(state: u32, slot: usize, item: ToolbarItem) -> u32 {
+    let shift = toolbar_order_shift(slot);
+    (state & !(0x3 << shift)) | ((item as u32 & 0x3) << shift)
+}
+
+pub fn toolbar_visible() -> bool {
+    TOOLBAR_STATE.load(Ordering::Relaxed) & TOOLBAR_VISIBLE_BIT != 0
+}
+
+pub fn toggle_toolbar_visible() -> io::Result<bool> {
+    let value = !toolbar_visible();
+    write_setting("toolbar_visible", serde_json::json!(value))?;
+    let mut state = TOOLBAR_STATE.load(Ordering::Relaxed);
+    if value {
+        state |= TOOLBAR_VISIBLE_BIT;
+    } else {
+        state &= !TOOLBAR_VISIBLE_BIT;
+    }
+    TOOLBAR_STATE.store(state, Ordering::Relaxed);
+    Ok(value)
+}
+
+pub fn toolbar_order() -> [ToolbarItem; 4] {
+    let state = TOOLBAR_STATE.load(Ordering::Relaxed);
+    [
+        toolbar_order_item(state, 0),
+        toolbar_order_item(state, 1),
+        toolbar_order_item(state, 2),
+        toolbar_order_item(state, 3),
+    ]
+}
+
+pub fn toolbar_item_visible(item: ToolbarItem) -> bool {
+    TOOLBAR_STATE.load(Ordering::Relaxed) & toolbar_item_bit(item) != 0
+}
+
+pub fn toggle_toolbar_item(item: ToolbarItem) -> io::Result<bool> {
+    let value = !toolbar_item_visible(item);
+    let mut state = TOOLBAR_STATE.load(Ordering::Relaxed);
+    if value {
+        state |= toolbar_item_bit(item);
+    } else {
+        state &= !toolbar_item_bit(item);
+    }
+    TOOLBAR_STATE.store(state, Ordering::Relaxed);
+    save_toolbar_hidden()?;
+    Ok(value)
+}
+
+pub fn move_toolbar_item(slot: usize, delta: i32) -> io::Result<usize> {
+    let slot = slot.min(3);
+    let target = (slot as i32 + delta).clamp(0, 3) as usize;
+    if target == slot {
+        return Ok(slot);
+    }
+    let mut order = toolbar_order();
+    order.swap(slot, target);
+    let keys: Vec<&str> = order.iter().map(|item| item.key()).collect();
+    write_setting("toolbar_order", serde_json::json!(keys))?;
+    let mut state = TOOLBAR_STATE.load(Ordering::Relaxed);
+    for (index, item) in order.iter().enumerate() {
+        state = set_toolbar_order_item(state, index, *item);
+    }
+    TOOLBAR_STATE.store(state, Ordering::Relaxed);
+    Ok(target)
+}
+
+pub fn active_toolbar_items() -> ([u8; 4], usize) {
+    if !toolbar_visible() {
+        return ([0; 4], 0);
+    }
+    let mut items = [0u8; 4];
+    let mut count = 0;
+    for item in toolbar_order() {
+        if toolbar_item_visible(item) {
+            items[count] = item as u8;
+            count += 1;
+        }
+    }
+    (items, count)
+}
+
+fn save_toolbar_hidden() -> io::Result<()> {
+    let hidden: Vec<&str> = ToolbarItem::ALL
+        .iter()
+        .filter(|item| !toolbar_item_visible(**item))
+        .map(|item| item.key())
+        .collect();
+    write_setting("toolbar_hidden", serde_json::json!(hidden))
+}
+
+fn load_toolbar() {
+    let mut state = DEFAULT_TOOLBAR_STATE;
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        TOOLBAR_STATE.store(state, Ordering::Relaxed);
+        return;
+    };
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+        TOOLBAR_STATE.store(state, Ordering::Relaxed);
+        return;
+    };
+    if let Some(value) = document
+        .get("toolbar_visible")
+        .and_then(|value| value.as_bool())
+    {
+        if value {
+            state |= TOOLBAR_VISIBLE_BIT;
+        } else {
+            state &= !TOOLBAR_VISIBLE_BIT;
+        }
+    }
+    if let Some(hidden) = document.get("toolbar_hidden").and_then(|value| value.as_array()) {
+        for item in ToolbarItem::ALL {
+            let is_hidden = hidden
+                .iter()
+                .any(|value| value.as_str() == Some(item.key()));
+            if is_hidden {
+                state &= !toolbar_item_bit(item);
+            } else {
+                state |= toolbar_item_bit(item);
+            }
+        }
+    }
+    if let Some(order) = document.get("toolbar_order").and_then(|value| value.as_array()) {
+        let mut seen = [false; 4];
+        let mut items = Vec::with_capacity(4);
+        for value in order {
+            if let Some(item) = value.as_str().and_then(ToolbarItem::from_key) {
+                if !seen[item as usize] {
+                    seen[item as usize] = true;
+                    items.push(item);
+                }
+            }
+        }
+        for item in ToolbarItem::ALL {
+            if !seen[item as usize] {
+                items.push(item);
+            }
+        }
+        for (slot, item) in items.into_iter().take(4).enumerate() {
+            state = set_toolbar_order_item(state, slot, item);
+        }
+    }
+    TOOLBAR_STATE.store(state, Ordering::Relaxed);
 }
 
 pub fn sync_stamp() -> i64 {

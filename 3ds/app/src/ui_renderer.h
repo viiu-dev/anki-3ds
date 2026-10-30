@@ -70,6 +70,7 @@ void ui_draw_rect(float x, float y, float w, float h, uint32_t color);
 void ui_draw_rect_gradient(float x, float y, float w, float h, uint32_t c_top, uint32_t c_bot);
 void ui_draw_line(float x0, float y0, float x1, float y1, float thickness, uint32_t color);
 void ui_draw_circle(float x, float y, float radius, uint32_t color);
+void ui_draw_nasal_circle(float cx, float cy, float radius, float thickness, uint32_t color);
 void ui_draw_rounded_rect(float x, float y, float w, float h, float radius, uint32_t color);
 void ui_draw_triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color);
 
@@ -89,7 +90,8 @@ void ui_draw_card_text(float x, float y, float scale, uint32_t color, const char
 float ui_get_card_text_width(float scale, const char* str);
 
 // Compact clock + battery cluster without the old status-bar banner.
-void ui_draw_status_compact(float x_right, float y, float scale, int sync_state);
+float ui_draw_status_compact(float x_right, float y, float scale, int sync_state,
+                             const uint8_t* items, int count);
 void ui_draw_sync_icon(float x, float y, float size, int state);
 void ui_draw_wifi_icon(float x, float y, float size, bool connected);
 void ui_set_battery_linear(bool linear);
@@ -123,6 +125,11 @@ void ui_audio_fini(void);
 void ui_draw_icon_help(float x, float y, float size);
 void ui_draw_icon_stats(float x, float y, float size);
 void ui_draw_icon_gear(float x, float y, float size);
+void ui_draw_icon_undo(float x, float y, float size, uint32_t color);
+
+#define CARD_RUBY_MIN_GAP_PX 3.0f
+float ui_ruby_collision_shift(bool has_prev_ruby, float prev_ruby_right,
+                              float nominal_x, float base_advance, float ruby_width);
 
 #ifdef __cplusplus
 }

@@ -1500,6 +1500,33 @@ void ui_draw_circle(float x, float y, float radius, uint32_t color) {
     C2D_DrawCircleSolid(x, y, 0.5f, radius, color);
 }
 
+void ui_draw_nasal_circle(float cx, float cy, float radius, float thickness, uint32_t color) {
+    if (radius < 1.5f) radius = 1.5f;
+    if (thickness < 1.0f) thickness = 1.0f;
+    const int steps = 10;
+    float prev_x = cx + radius;
+    float prev_y = cy;
+    for (int i = 1; i <= steps; i++) {
+        float angle = (2.0f * (float)M_PI * (float)i) / (float)steps;
+        float nx = cx + cosf(angle) * radius;
+        float ny = cy + sinf(angle) * radius;
+        C2D_DrawLine(prev_x, prev_y, color, nx, ny, color, thickness, 0.62f);
+        prev_x = nx;
+        prev_y = ny;
+    }
+}
+
+float ui_ruby_collision_shift(bool has_prev_ruby, float prev_ruby_right,
+                              float nominal_x, float base_advance, float ruby_width) {
+    if (!has_prev_ruby || ruby_width <= 0.0f) {
+        return 0.0f;
+    }
+    float nominal_ruby_left = nominal_x + (base_advance - ruby_width) * 0.5f;
+    float required_left = prev_ruby_right + CARD_RUBY_MIN_GAP_PX;
+    float shift = required_left - nominal_ruby_left;
+    return shift > 0.0f ? shift : 0.0f;
+}
+
 void ui_draw_triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color) {
     C2D_DrawTriangle(x0, y0, color, x1, y1, color, x2, y2, color, 0.5f);
 }
@@ -1787,25 +1814,13 @@ void ui_draw_sync_icon(float x, float y, float size, int state) {
     }
 }
 
-static void draw_status(float x_right, float y, float scale, int sync_state) {
-    static const int64_t epoch_1900_to_1970 = 2208988800LL;
-    time_t raw_time = (time_t)((int64_t)(osGetTime() / 1000) - epoch_1900_to_1970);
-    struct tm ti;
-    char time_str[16];
-    if (gmtime_r(&raw_time, &ti)) {
-        snprintf(time_str, sizeof(time_str), "%02d:%02d", ti.tm_hour, ti.tm_min);
-    } else {
-        snprintf(time_str, sizeof(time_str), "--:--");
-    }
-
+static void draw_battery_status(float x, float midline) {
     float batt_w = 16.0f;
     float batt_h = 8.0f;
-    float batt_x = x_right - batt_w;
-    float midline = y + 7.0f;
     float batt_y = midline - batt_h * 0.5f;
-    ui_draw_rounded_rect(batt_x, batt_y, batt_w, batt_h, 2.0f, g_theme.text_muted);
-    ui_draw_rounded_rect(batt_x + 1, batt_y + 1, batt_w - 2, batt_h - 2, 1.5f, g_theme.bg_bottom);
-    ui_draw_rect(batt_x + batt_w, batt_y + 2, 2, 4, g_theme.text_muted);
+    ui_draw_rounded_rect(x, batt_y, batt_w, batt_h, 2.0f, g_theme.text_muted);
+    ui_draw_rounded_rect(x + 1, batt_y + 1, batt_w - 2, batt_h - 2, 1.5f, g_theme.bg_bottom);
+    ui_draw_rect(x + batt_w, batt_y + 2, 2, 4, g_theme.text_muted);
 
     int bars;
     if (g_battery_linear) {
@@ -1828,22 +1843,68 @@ static void draw_status(float x_right, float y, float scale, int sync_state) {
     }
     uint32_t fill_clr = (bars <= 1) ? g_theme.learn : g_theme.review;
     for (int b = 0; b < bars; b++) {
-        ui_draw_rect(batt_x + 2 + b * 3.0f, batt_y + 2, 2.2f, batt_h - 4, fill_clr);
+        ui_draw_rect(x + 2 + b * 3.0f, batt_y + 2, 2.2f, batt_h - 4, fill_clr);
     }
-
-    float icon = 10.0f;
-    float gap = 6.0f;
-    float wifi_x = batt_x - gap - icon;
-    float sync_x = wifi_x - gap - icon;
-    float time_right = sync_x - gap;
-    float text_y = midline - 0.48f * (float)card_font_px(scale);
-    ui_draw_text_right(time_right, text_y, scale, g_theme.text_muted, time_str);
-    ui_draw_sync_icon(sync_x, midline - icon * 0.5f, icon, sync_state);
-    ui_draw_wifi_icon(wifi_x, midline - icon * 0.5f, icon, ui_wifi_connected());
 }
 
-void ui_draw_status_compact(float x_right, float y, float scale, int sync_state) {
-    draw_status(x_right, y, scale, sync_state);
+float ui_draw_status_compact(float x_right, float y, float scale, int sync_state,
+                             const uint8_t* items, int count) {
+    if (!items || count <= 0) return 0.0f;
+
+    static const int64_t epoch_1900_to_1970 = 2208988800LL;
+    time_t raw_time = (time_t)((int64_t)(osGetTime() / 1000) - epoch_1900_to_1970);
+    struct tm ti;
+    char time_str[16];
+    if (gmtime_r(&raw_time, &ti)) {
+        snprintf(time_str, sizeof(time_str), "%02d:%02d", ti.tm_hour, ti.tm_min);
+    } else {
+        snprintf(time_str, sizeof(time_str), "--:--");
+    }
+
+    float midline = y + 7.0f;
+    float gap = 6.0f;
+    float cursor_right = x_right;
+    for (int i = count - 1; i >= 0; i--) {
+        float w;
+        switch (items[i]) {
+            case 0:
+                w = 10.0f;
+                break;
+            case 1:
+                w = 10.0f;
+                break;
+            case 2:
+                w = 18.0f;
+                break;
+            case 3:
+                w = ui_get_text_width(scale, time_str);
+                break;
+            default:
+                w = 0.0f;
+                break;
+        }
+        float item_x = cursor_right - w;
+        switch (items[i]) {
+            case 0:
+                ui_draw_sync_icon(item_x, midline - 5.0f, 10.0f, sync_state);
+                break;
+            case 1:
+                ui_draw_wifi_icon(item_x, midline - 5.0f, 10.0f, ui_wifi_connected());
+                break;
+            case 2:
+                draw_battery_status(item_x, midline);
+                break;
+            case 3: {
+                float text_y = midline - 0.48f * (float)card_font_px(scale);
+                ui_draw_text_right(cursor_right, text_y, scale, g_theme.text_muted, time_str);
+                break;
+            }
+            default:
+                break;
+        }
+        cursor_right = item_x - (i > 0 ? gap : 0.0f);
+    }
+    return x_right - cursor_right;
 }
 
 void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, float max_scroll) {
@@ -1967,6 +2028,15 @@ void ui_draw_icon_gear(float x, float y, float size) {
         icon_line(x, y, scale, 12 + cosf(angle) * 6, 12 + sinf(angle) * 6,
                   12 + cosf(angle) * 9, 12 + sinf(angle) * 9, color);
     }
+}
+
+void ui_draw_icon_undo(float x, float y, float size, uint32_t color) {
+    float scale = size / 24.0f;
+    icon_line(x, y, scale, 5.75f, 9.5f, 14.25f, 9.5f, color);
+    icon_arc(x, y, scale, 14.25f, 14.0f, 4.5f, 270.0f, 180.0f, color);
+    icon_line(x, y, scale, 8.25f, 18.5f, 14.25f, 18.5f, color);
+    icon_line(x, y, scale, 5.25f, 9.5f, 9.25f, 5.5f, color);
+    icon_line(x, y, scale, 5.25f, 9.5f, 9.25f, 13.5f, color);
 }
 
 void ui_draw_nav_tab(float x, float y, float w, float h, const char* label, int icon_type, bool active) {
