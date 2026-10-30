@@ -289,13 +289,11 @@ fn sync_with_recovery(
     if cancel.load(Ordering::Acquire) {
         return Err(State::Cancelled);
     }
-    let handler = ThrottlingProgressHandler::<MediaSyncProgress>::new(progress.clone());
-    let error =
-        match block_on(manager.sync_media_with_config(handler, client.clone(), None, config())) {
-            Ok(()) => return Ok(()),
-            Err(error) if is_interrupted(&error) => return Err(State::Cancelled),
-            Err(error) => error,
-        };
+    let error = match run_with_resume(&manager, progress, client, config, cancel) {
+        Ok(()) => return Ok(()),
+        Err(error) if is_interrupted(&error) => return Err(State::Cancelled),
+        Err(error) => error,
+    };
     if !super::backend::media_db_recoverable(&error) || cancel.load(Ordering::Acquire) {
         return Err(State::Failed(super::error_text(&error)));
     }
@@ -310,12 +308,47 @@ fn sync_with_recovery(
             changed.fetch_add(1, Ordering::Release);
         }
     }
-    let handler = ThrottlingProgressHandler::<MediaSyncProgress>::new(progress.clone());
-    match block_on(manager.sync_media_with_config(handler, client.clone(), None, config())) {
+    match run_with_resume(&manager, progress, client, config, cancel) {
         Ok(()) => Ok(()),
         Err(error) if is_interrupted(&error) => Err(State::Cancelled),
         Err(error) => Err(State::Failed(super::error_text(&error))),
     }
+}
+
+fn run_with_resume(
+    manager: &anki::media::MediaManager,
+    progress: &Arc<Mutex<ProgressState>>,
+    client: &NativeSyncClient,
+    config: &impl Fn() -> MediaSyncConfig,
+    cancel: &AtomicBool,
+) -> Result<(), anki::error::AnkiError> {
+    let mut attempts = 0u32;
+    loop {
+        let handler = ThrottlingProgressHandler::<MediaSyncProgress>::new(progress.clone());
+        match block_on(manager.sync_media_with_config(handler, client.clone(), None, config())) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_interrupted(&e) => return Err(e),
+            Err(e)
+                if is_network(&e) && attempts < 5 && !cancel.load(Ordering::Acquire) =>
+            {
+                attempts += 1;
+                super::event(&format!("MEDIA_SYNC_RETRY attempt={attempts} {}", super::error_text(&e)));
+                anki_3ds_sync_transport::cleanup_https_session();
+                anki_3ds_sync_transport::init_https_session();
+                for _ in 0..(20 * attempts) {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(anki::error::AnkiError::Interrupted);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_network(e: &anki::error::AnkiError) -> bool {
+    matches!(e, anki::error::AnkiError::NetworkError { .. })
 }
 
 fn is_interrupted(error: &anki::error::AnkiError) -> bool {

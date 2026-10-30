@@ -145,6 +145,27 @@ static void dns_cache_clear(void) {
     memset(g_dns_cache_next, 0, sizeof(g_dns_cache_next));
 }
 
+static void slot_teardown(int slot) {
+    if (g_multi[slot]) { curl_multi_cleanup(g_multi[slot]); g_multi[slot] = NULL; }
+    if (g_easy[slot])  { curl_easy_cleanup(g_easy[slot]);  g_easy[slot]  = NULL; }
+}
+
+static bool is_transient(int code) {
+    return code == CURLE_COULDNT_CONNECT || code == CURLE_OPERATION_TIMEDOUT ||
+           code == CURLE_SSL_CONNECT_ERROR || code == CURLE_GOT_NOTHING ||
+           code == CURLE_SEND_ERROR || code == CURLE_RECV_ERROR;
+}
+
+static void dns_cache_forget(int slot, const char *host) {
+    for (int i = 0; i < 2; i++) {
+        if (g_dns_cache[slot][i].host[0] && strcmp(g_dns_cache[slot][i].host, host) == 0) {
+            g_dns_cache[slot][i].host[0] = '\0';
+            g_dns_cache[slot][i].ip[0] = '\0';
+            g_dns_cache[slot][i].expires = 0;
+        }
+    }
+}
+
 static const char *dns_cache_lookup(int slot, const char *host) {
     uint64_t now = osGetTime();
     for (int i = 0; i < 2; i++) {
@@ -170,14 +191,7 @@ int anki_3ds_https_global_init(void) {
 
 void anki_3ds_https_cleanup(void) {
     for (int slot = 0; slot < HTTPS_SLOT_COUNT; slot++) {
-        if (g_easy[slot]) {
-            curl_easy_cleanup(g_easy[slot]);
-            g_easy[slot] = NULL;
-        }
-        if (g_multi[slot]) {
-            curl_multi_cleanup(g_multi[slot]);
-            g_multi[slot] = NULL;
-        }
+        slot_teardown(slot);
     }
     dns_cache_clear();
 }
@@ -286,7 +300,8 @@ static int request_with_ip(
     curl_easy_setopt(easy, CURLOPT_TCP_KEEPINTVL, 15L);
     curl_easy_setopt(easy, CURLOPT_FRESH_CONNECT, 0L);
     curl_easy_setopt(easy, CURLOPT_FORBID_REUSE, 0L);
-    curl_easy_setopt(easy, CURLOPT_MAXCONNECTS, 8L);
+    curl_easy_setopt(easy, CURLOPT_MAXCONNECTS, 1L);
+    curl_easy_setopt(easy, CURLOPT_MAXAGE_CONN, 20L);
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, &rx_buf);
     curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0L);
@@ -400,8 +415,7 @@ static int request_with_ip(
     curl_slist_free_all(headers);
     curl_slist_free_all(resolve);
     if (code != CURLE_OK) {
-        curl_easy_cleanup(g_easy[slot]);
-        g_easy[slot] = NULL;
+        slot_teardown(slot);
     }
     return (code == CURLE_OK) ? 0 : (int)code;
 }
@@ -437,7 +451,6 @@ int anki_3ds_https_post(
     uint64_t started = osGetTime();
     char ip[16] = {0};
     const char *cached = dns_cache_lookup(slot, host);
-    bool used_cache = cached != NULL;
     int dns_rc = 0;
     if (cached) {
         snprintf(ip, sizeof(ip), "%s", cached);
@@ -453,24 +466,34 @@ int anki_3ds_https_post(
         return -2;
     }
 
-    int result = request_with_ip(
-        slot, host, ip, path, header_anki_sync, body, body_len,
-        timeout_ms, connect_timeout_ms, options, out_resp);
-
-    if (result != 0 && used_cache
-        && (result == CURLE_COULDNT_CONNECT || result == CURLE_COULDNT_RESOLVE_HOST
-            || result == CURLE_SSL_CONNECT_ERROR || result == CURLE_OPERATION_TIMEDOUT)) {
-        anki_3ds_http_response_free(out_resp);
-        char fresh_ip[16] = {0};
-        char dns_error[160] = {0};
-        if (probe_dns_with_context(host, fresh_ip, dns_error, dns_cancel, (void *)options, allow_override) == 0) {
-            dns_cache_store(slot, host, fresh_ip);
+    int result = 0;
+    const uint32_t backoff_ms[] = {0, 250, 750, 1500};
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (attempt > 0) {
+            if (options->upload_file == NULL && options->download_file != NULL) {
+                /* truncate partial download file */
+                FILE *f = fopen(options->download_file, "wb"); if (f) fclose(f);
+            }
+            anki_3ds_http_response_free(out_resp);
             memset(out_resp, 0, sizeof(*out_resp));
-            out_resp->dns_ms = osGetTime() - started;
-            result = request_with_ip(
-                slot, host, fresh_ip, path, header_anki_sync, body, body_len,
-                timeout_ms, connect_timeout_ms, options, out_resp);
+            slot_teardown(slot);
+            dns_cache_forget(slot, host);
+            for (uint32_t waited = 0; waited < backoff_ms[attempt]; waited += 50) {
+                if (options->cancelled && options->cancelled(options->context)) {
+                    snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "sync cancelled");
+                    out_resp->total_ms = osGetTime() - started;
+                    return CURLE_ABORTED_BY_CALLBACK;
+                }
+                svcSleepThread(50LL * 1000000LL);
+            }
+            char dns_error[160] = {0};
+            if (probe_dns_with_context(host, ip, dns_error, dns_cancel, (void *)options, allow_override) != 0)
+                continue;   /* keep last result, try again */
+            dns_cache_store(slot, host, ip);
         }
+        result = request_with_ip(slot, host, ip, path, header_anki_sync, body, body_len,
+                                 timeout_ms, connect_timeout_ms, options, out_resp);
+        if (result == 0 || !is_transient(result) || out_resp->http_status != 0) break;
     }
     out_resp->total_ms = osGetTime() - started;
     return result;

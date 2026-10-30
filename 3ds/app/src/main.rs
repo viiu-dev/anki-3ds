@@ -1232,6 +1232,10 @@ enum Screen {
     },
     Error(String),
 }
+
+fn screen_is_startup_or_decks(screen: &Screen) -> bool {
+    matches!(screen, Screen::Decks)
+}
 #[derive(Clone, Copy)]
 enum Action {
     None,
@@ -1957,8 +1961,8 @@ fn main() {
     let mut last_media_refresh = Instant::now();
     let mut exit_pending = false;
     let mut clock_job: Option<clock::Job> = None;
-    let mut next_clock_check =
-        Instant::now() + Duration::from_secs(if clock::needs_refresh() { 0 } else { 1800 });
+    let mut clock_auto_done = clock::is_known() && !clock::needs_refresh();
+    let mut next_clock_check = Instant::now();
     let mut clock_connected = false;
     let mut backend = if startup_error.is_some() {
         None
@@ -2057,29 +2061,36 @@ fn main() {
 
     while apt.main_loop() {
         leds::poll_wakeup();
+        if clock::ready() {
+            clock_auto_done = true;
+        }
         if let Some(result) = clock_job.as_mut().and_then(clock::Job::poll) {
             clock_job = None;
             match result {
                 Ok(offset) => {
+                    clock_auto_done = true;
                     if let Some(backend) = backend.as_mut() {
                         if let Err(error) = backend.set_clock_offset(offset) {
                             event(&format!("CLOCK_OFFSET_ERROR {error}"));
                         }
                     }
                 }
-                Err(error) => event(&format!("CLOCK_AUTO_ERROR {error}")),
+                Err(error) => {
+                    next_clock_check = Instant::now() + Duration::from_secs(60);
+                    event(&format!("CLOCK_AUTO_ERROR {error}"));
+                }
             }
         }
         let connected = clock::connected();
-        if connected && !clock_connected && clock::needs_refresh() {
+        if connected && !clock_connected && !clock_auto_done {
             next_clock_check = Instant::now();
         }
         clock_connected = connected;
-        if clock_job.is_none()
+        if !clock_auto_done
+            && clock_job.is_none()
             && job.is_none()
-            && !media_job
-                .as_ref()
-                .is_some_and(media_sync::MediaSync::is_running)
+            && media_job.is_none()
+            && screen_is_startup_or_decks(&screen)
             && connected
             && clock::needs_refresh()
             && Instant::now() >= next_clock_check

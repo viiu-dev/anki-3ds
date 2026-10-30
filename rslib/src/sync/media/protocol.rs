@@ -51,7 +51,7 @@ impl AsSyncEndpoint for MediaSyncMethod {
 
 pub enum MediaDownloadEvent {
     Downloaded { data: Vec<u8> },
-    Failed { error: String },
+    Failed { error: String, files: Vec<String> },
 }
 
 /// Shared, ordered set of media filenames that should be downloaded before

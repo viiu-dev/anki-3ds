@@ -25,6 +25,7 @@ use super::theme::current as current_theme;
 use super::ui::*;
 
 static KNOWN: AtomicBool = AtomicBool::new(false);
+static READY: AtomicBool = AtomicBool::new(false);
 static OFFSET: AtomicI32 = AtomicI32::new(0);
 static VERIFIED: Mutex<Option<(i64, i64, Instant)>> = Mutex::new(None);
 const PATH: &str = "sdmc:/3ds/anki-3ds/clock-correction.json";
@@ -93,6 +94,10 @@ pub fn init() -> i32 {
 
 pub fn is_known() -> bool {
     KNOWN.load(Ordering::Relaxed)
+}
+
+pub fn ready() -> bool {
+    READY.load(Ordering::Relaxed)
 }
 
 pub fn needs_refresh() -> bool {
@@ -188,6 +193,7 @@ impl Job {
             std::fs::write(PATH, data).map_err(|e| e.to_string())?;
             apply(&correction);
             KNOWN.store(true, Ordering::Relaxed);
+            READY.store(true, Ordering::Relaxed);
             super::event("CLOCK_AUTO_READY");
             Ok(correction.minutes)
         }))

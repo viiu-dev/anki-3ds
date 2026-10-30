@@ -50,6 +50,11 @@ use crate::version;
 /// Files accumulated before the downloaded additions are committed to the
 /// media database. Batching keeps SD journal writes rare during sync.
 const DOWNLOAD_COMMIT_FILES: usize = 100;
+const BATCH_RETRIES: u32 = 3;
+
+fn is_network_error(e: &AnkiError) -> bool {
+    matches!(e, AnkiError::NetworkError { .. })
+}
 
 pub struct MediaSyncer<T> {
     mgr: MediaManager,
@@ -145,7 +150,11 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             self.save_index();
         }
         while self.bulk_paused() {
-            self.fetch_priority_now().await?;
+            if let Err(e) = self.fetch_priority_now().await {
+                if matches!(e, AnkiError::Interrupted) {
+                    return Err(e);
+                }
+            }
             if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                 return Err(AnkiError::Interrupted);
             }
@@ -331,6 +340,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                         break;
                     }
                     debug!(?error, "direct priority download failed");
+                    for name in files {
+                        self.priority_attempted.remove(name);
+                    }
                 }
             }
         }
@@ -430,6 +442,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         to_download: &mut Vec<String>,
         pending: &mut Vec<AddedFile>,
     ) -> Result<()> {
+        let mut consecutive_failures = 0u32;
         while !to_download.is_empty() {
             self.pause_point().await?;
             self.fetch_priority_now().await?;
@@ -448,7 +461,19 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                 .chunks(MAX_MEDIA_FILES_IN_ZIP)
                 .map(|chunk| chunk.to_vec())
                 .collect();
-            self.download_group(batches, pending).await?;
+            match self.download_group(batches, pending).await {
+                Ok(()) => {
+                    consecutive_failures = 0;
+                }
+                Err(e) if is_network_error(&e) && consecutive_failures < 5 => {
+                    consecutive_failures += 1;
+                    to_download.splice(0..0, group.clone());
+                    std::thread::sleep(Duration::from_secs(2));
+                    self.pause_point().await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
             if let Some(priority) = &self.priority {
                 priority.remove(&group);
             }
@@ -495,15 +520,47 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             }
         }
 
+        self.download_group_serial(&batches, pending).await
+    }
+
+    async fn download_group_serial(
+        &mut self,
+        batches: &[Vec<String>],
+        pending: &mut Vec<AddedFile>,
+    ) -> Result<()> {
         for files in batches {
             if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                 return Err(AnkiError::Interrupted);
             }
-            let zip_data = self
-                .client
-                .download_files(DownloadFilesRequest { files }.try_into_sync_request()?)
-                .await?
-                .data;
+            let mut attempt = 0;
+            let zip_data = loop {
+                if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
+                    return Err(AnkiError::Interrupted);
+                }
+                match self
+                    .client
+                    .download_files(
+                        DownloadFilesRequest {
+                            files: files.clone(),
+                        }
+                        .try_into_sync_request()?,
+                    )
+                    .await
+                {
+                    Ok(r) => break r.data,
+                    Err(e) => {
+                        let net_err: AnkiError = e.into();
+                        if attempt < BATCH_RETRIES && is_network_error(&net_err) {
+                            attempt += 1;
+                            debug!(?net_err, attempt, "media batch failed, retrying");
+                            std::thread::sleep(Duration::from_millis(500 * attempt as u64));
+                            self.pause_point().await?;
+                        } else {
+                            return Err(net_err);
+                        }
+                    }
+                }
+            };
             self.progress
                 .update(false, |p| p.downloaded_bytes += zip_data.len() as u64)?;
             if self.write_zip(zip_data, pending)? {
@@ -521,13 +578,19 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
     ) -> Result<()> {
         let mut received = 0usize;
         let mut cancelled = false;
+        let mut retry: Vec<String> = Vec::new();
         while received < total {
             if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                 cancelled = true;
                 break;
             }
             if self.bulk_paused() {
-                self.fetch_priority_now().await?;
+                if let Err(e) = self.fetch_priority_now().await {
+                    if matches!(e, AnkiError::Interrupted) {
+                        cancelled = true;
+                        break;
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
@@ -542,8 +605,10 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                         break;
                     }
                 }
-                Ok(MediaDownloadEvent::Failed { error }) => {
-                    return Err(AnkiError::sync_error(error, SyncErrorKind::Other));
+                Ok(MediaDownloadEvent::Failed { error, files }) => {
+                    received += 1;
+                    debug!(error, "media batch failed, queueing serial retry");
+                    retry.extend(files);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -560,6 +625,18 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         drop(session);
         if cancelled {
             return Err(AnkiError::Interrupted);
+        }
+        if !retry.is_empty()
+            && !self.client.is_cancelled()
+            && self.progress.check_cancelled().is_ok()
+        {
+            let batches: Vec<Vec<String>> = retry
+                .chunks(MAX_MEDIA_FILES_IN_ZIP)
+                .map(<[_]>::to_vec)
+                .collect();
+            // Serial fallback for the failed batches; inlined instead of
+            // recursing through download_group to guarantee a serial path.
+            self.download_group_serial(&batches, pending).await?;
         }
         Ok(())
     }

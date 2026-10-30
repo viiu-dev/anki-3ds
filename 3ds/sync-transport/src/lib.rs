@@ -310,6 +310,56 @@ impl NativeSyncClient {
             >,
         >,
     ) -> Result<HttpResponse, SyncTransportError> {
+        const TRANSIENT_CURL: [i32; 6] = [7, 28, 35, 52, 55, 56];
+        let mut progress = progress;
+        let mut last: Option<SyncTransportError> = None;
+        for attempt in 0..2u32 {
+            if self.cancel.load(Ordering::Acquire) {
+                break;
+            }
+            if attempt > 0 {
+                for _ in 0..20 {
+                    if self.cancel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            let attempt_progress = if attempt == 0 { progress.take() } else { None };
+            match self.transfer_once(
+                path,
+                header_json,
+                compressed_body,
+                upload,
+                download,
+                attempt_progress,
+            ) {
+                Err(SyncTransportError::Transport(code, msg))
+                    if TRANSIENT_CURL.contains(&code) && !self.cancel.load(Ordering::Acquire) =>
+                {
+                    tracing::debug!(code, path, attempt, "transient transport error, retrying");
+                    last = Some(SyncTransportError::Transport(code, msg));
+                }
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or(SyncTransportError::Transport(42, "sync cancelled".into())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_once(
+        &self,
+        path: &str,
+        header_json: &str,
+        compressed_body: &[u8],
+        upload: Option<&Path>,
+        download: Option<&Path>,
+        progress: Option<
+            anki::progress::ThrottlingProgressHandler<
+                anki::sync::collection::progress::FullSyncProgress,
+            >,
+        >,
+    ) -> Result<HttpResponse, SyncTransportError> {
         if self.endpoint.scheme() != "https"
             || !self.endpoint.username().is_empty()
             || self.endpoint.password().is_some()
@@ -424,10 +474,11 @@ impl NativeSyncClient {
 
         let server_time = (raw_resp.server_time > 0).then_some(raw_resp.server_time);
         let status = raw_resp.http_status as u16;
+        let curl_code = raw_resp.curl_code;
         unsafe { anki_3ds_http_response_free(&mut raw_resp) };
 
         if rc != 0 {
-            return Err(SyncTransportError::Transport(rc, err_msg));
+            return Err(SyncTransportError::Transport(curl_code, err_msg));
         }
 
         Ok(HttpResponse {
@@ -707,7 +758,6 @@ impl MediaSyncProtocol for NativeSyncClient {
                             None => break,
                         }
                     };
-                    let mut attempt = 0u32;
                     let event = loop {
                         if stop_clone.load(Ordering::Acquire) || client.is_cancelled() {
                             break None;
@@ -721,6 +771,7 @@ impl MediaSyncProtocol for NativeSyncClient {
                             Err(error) => {
                                 break Some(MediaDownloadEvent::Failed {
                                     error: error.to_string(),
+                                    files: files.clone(),
                                 })
                             }
                         };
@@ -733,19 +784,55 @@ impl MediaSyncProtocol for NativeSyncClient {
                                 })
                             }
                             Err(error) => {
-                                attempt += 1;
-                                if attempt > 2 || client.is_cancelled() {
+                                if client.is_cancelled() || stop_clone.load(Ordering::Acquire) {
                                     break Some(MediaDownloadEvent::Failed {
                                         error: error.to_string(),
+                                        files: files.clone(),
                                     });
                                 }
-                                std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+                                // Re-run the same batch once on the same slot after 500 ms.
+                                std::thread::sleep(Duration::from_millis(500));
+                                if client.is_cancelled() || stop_clone.load(Ordering::Acquire) {
+                                    break Some(MediaDownloadEvent::Failed {
+                                        error: error.to_string(),
+                                        files: files.clone(),
+                                    });
+                                }
+                                let retry_request = match (DownloadFilesRequest {
+                                    files: files.clone(),
+                                })
+                                .try_into_sync_request()
+                                {
+                                    Ok(request) => request,
+                                    Err(error) => {
+                                        break Some(MediaDownloadEvent::Failed {
+                                            error: error.to_string(),
+                                            files: files.clone(),
+                                        })
+                                    }
+                                };
+                                match client
+                                    .request_sync(MediaSyncMethod::DownloadFiles, retry_request)
+                                    as HttpResult<SyncResponse<Vec<u8>>>
+                                {
+                                    Ok(response) => {
+                                        break Some(MediaDownloadEvent::Downloaded {
+                                            data: response.data,
+                                        })
+                                    }
+                                    Err(error) => {
+                                        break Some(MediaDownloadEvent::Failed {
+                                            error: error.to_string(),
+                                            files: files.clone(),
+                                        });
+                                    }
+                                }
                             }
                         }
                     };
                     match event {
-                        Some(MediaDownloadEvent::Failed { error }) => {
-                            let _ = sender.send(MediaDownloadEvent::Failed { error });
+                        Some(MediaDownloadEvent::Failed { error, files }) => {
+                            let _ = sender.send(MediaDownloadEvent::Failed { error, files });
                             break;
                         }
                         Some(event) => {
