@@ -5,6 +5,7 @@ mod assets;
 mod auth_store;
 mod backend;
 mod clock;
+mod controls;
 mod event_log;
 mod i18n;
 mod leds;
@@ -25,6 +26,8 @@ use backend::DeckOptions;
 use backend::LimitScope;
 use backend::NoteDraft;
 use backend::OfferedCard;
+use controls::ReviewAction;
+use controls::ScreenState;
 use ctru::prelude::*;
 use i18n::tr;
 use theme::current as current_theme;
@@ -248,6 +251,35 @@ fn next_closed_hint(top_card: &RichTextLayout, review: &ReviewState) -> Option<u
         .find(|id| !review.hints_open.contains(id))
 }
 
+fn review_action_to_action(
+    action: ReviewAction,
+    screen: &Screen,
+    top_card: &RichTextLayout,
+    review: &ReviewState,
+) -> Action {
+    match action {
+        ReviewAction::ShowAnswer => Action::Reveal,
+        ReviewAction::Again => Action::Rate(0),
+        ReviewAction::Hard => Action::Rate(1),
+        ReviewAction::Good => Action::Rate(2),
+        ReviewAction::Easy => Action::Rate(3),
+        ReviewAction::PlayAudio => Action::PlayAudio(None),
+        ReviewAction::Undo => Action::Undo,
+        ReviewAction::Bury => Action::Bury,
+        ReviewAction::Hint => {
+            if let Some(id) = next_closed_hint(top_card, review) {
+                Action::HintToggle(id)
+            } else if matches!(screen, Screen::Question { card, .. } if card.type_answer.is_some())
+            {
+                Action::TypeAnswer
+            } else {
+                Action::PlayAudio(None)
+            }
+        }
+        ReviewAction::ScrollUp | ReviewAction::ScrollDown => Action::None,
+    }
+}
+
 fn browse_chip_rects() -> [(f32, f32); 5] {
     let labels = [
         tr("All"),
@@ -301,6 +333,24 @@ fn card_audio(card: &backend::OfferedCard, answer: bool) -> Vec<backend::MediaRe
         &card.question_media
     };
     media.iter().filter(|item| item.audio).cloned().collect()
+}
+
+fn replay_audio(card: &backend::OfferedCard, answer: bool) -> Vec<backend::MediaRef> {
+    let mut audio = if answer && i18n::replay_all_audio() {
+        card_audio(card, false)
+    } else {
+        Vec::new()
+    };
+    audio.extend(card_audio(card, answer));
+    let mut seen = HashSet::new();
+    audio.retain(|item| seen.insert(item.filename.clone()));
+    audio
+}
+
+fn audio_path(backend: Option<&Backend>, item: &backend::MediaRef) -> String {
+    backend
+        .map(|active| active.media_path(&item.filename))
+        .unwrap_or_else(|| item.path())
 }
 
 fn audio_button_rects(visible: usize, paged: bool) -> Vec<(f32, f32)> {
@@ -402,8 +452,7 @@ fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase:
                     foreground,
                 );
                 for bar in 0..2 {
-                    let height =
-                        3.0 + (((phase + index as u64 * 2 + bar) % 8) as f32 - 4.0).abs();
+                    let height = 3.0 + (((phase + index as u64 * 2 + bar) % 8) as f32 - 4.0).abs();
                     Ui::draw_rect(
                         icon_x + 5.0 + bar as f32 * 4.0,
                         center_y - height * 0.5,
@@ -465,7 +514,6 @@ fn draw_audio_buttons(audio: &[backend::MediaRef], states: &[AudioState], phase:
     }
 }
 
-
 fn with_alpha(color: u32, alpha: f32) -> u32 {
     let a = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
     (color & 0x00ff_ffff) | (a << 24)
@@ -493,21 +541,83 @@ fn rating_colors(rating: i32) -> (u32, u32) {
 fn draw_rating_icon(rating: i32, cx: f32, cy: f32, scale: f32, color: u32) {
     match rating {
         0 => {
-            Ui::draw_line(cx - 6.0 * scale, cy - 6.0 * scale, cx + 6.0 * scale, cy + 6.0 * scale, 2.5 * scale, color);
-            Ui::draw_line(cx - 6.0 * scale, cy + 6.0 * scale, cx + 6.0 * scale, cy - 6.0 * scale, 2.5 * scale, color);
+            Ui::draw_line(
+                cx - 6.0 * scale,
+                cy - 6.0 * scale,
+                cx + 6.0 * scale,
+                cy + 6.0 * scale,
+                2.5 * scale,
+                color,
+            );
+            Ui::draw_line(
+                cx - 6.0 * scale,
+                cy + 6.0 * scale,
+                cx + 6.0 * scale,
+                cy - 6.0 * scale,
+                2.5 * scale,
+                color,
+            );
         }
         1 => {
-            Ui::draw_rect(cx - 8.0 * scale, cy - 1.5 * scale, 16.0 * scale, 3.0 * scale, color);
+            Ui::draw_rect(
+                cx - 8.0 * scale,
+                cy - 1.5 * scale,
+                16.0 * scale,
+                3.0 * scale,
+                color,
+            );
         }
         2 => {
-            Ui::draw_line(cx - 7.0 * scale, cy + 1.0 * scale, cx - 2.0 * scale, cy + 6.0 * scale, 2.5 * scale, color);
-            Ui::draw_line(cx - 2.0 * scale, cy + 6.0 * scale, cx + 8.0 * scale, cy - 6.0 * scale, 2.5 * scale, color);
+            Ui::draw_line(
+                cx - 7.0 * scale,
+                cy + 1.0 * scale,
+                cx - 2.0 * scale,
+                cy + 6.0 * scale,
+                2.5 * scale,
+                color,
+            );
+            Ui::draw_line(
+                cx - 2.0 * scale,
+                cy + 6.0 * scale,
+                cx + 8.0 * scale,
+                cy - 6.0 * scale,
+                2.5 * scale,
+                color,
+            );
         }
         _ => {
-            Ui::draw_line(cx - 9.0 * scale, cy + 0.5 * scale, cx - 5.0 * scale, cy + 5.0 * scale, 2.2 * scale, color);
-            Ui::draw_line(cx - 5.0 * scale, cy + 5.0 * scale, cx + 1.0 * scale, cy - 4.0 * scale, 2.2 * scale, color);
-            Ui::draw_line(cx - 1.0 * scale, cy + 0.5 * scale, cx + 3.0 * scale, cy + 5.0 * scale, 2.2 * scale, color);
-            Ui::draw_line(cx + 3.0 * scale, cy + 5.0 * scale, cx + 9.0 * scale, cy - 4.0 * scale, 2.2 * scale, color);
+            Ui::draw_line(
+                cx - 9.0 * scale,
+                cy + 0.5 * scale,
+                cx - 5.0 * scale,
+                cy + 5.0 * scale,
+                2.2 * scale,
+                color,
+            );
+            Ui::draw_line(
+                cx - 5.0 * scale,
+                cy + 5.0 * scale,
+                cx + 1.0 * scale,
+                cy - 4.0 * scale,
+                2.2 * scale,
+                color,
+            );
+            Ui::draw_line(
+                cx - 1.0 * scale,
+                cy + 0.5 * scale,
+                cx + 3.0 * scale,
+                cy + 5.0 * scale,
+                2.2 * scale,
+                color,
+            );
+            Ui::draw_line(
+                cx + 3.0 * scale,
+                cy + 5.0 * scale,
+                cx + 9.0 * scale,
+                cy - 4.0 * scale,
+                2.2 * scale,
+                color,
+            );
         }
     }
 }
@@ -525,7 +635,13 @@ fn draw_rating_badge(feedback: Option<(i32, Instant)>) {
     }
     let alpha = feedback_alpha(elapsed);
     let (_, foreground) = rating_colors(rating);
-    draw_rating_icon(rating, TOP_WIDTH - 20.0, 18.0, 1.0, with_alpha(foreground, alpha));
+    draw_rating_icon(
+        rating,
+        TOP_WIDTH - 20.0,
+        18.0,
+        1.0,
+        with_alpha(foreground, alpha),
+    );
 }
 
 fn draw_sync_button(x: f32, y: f32, w: f32, h: f32, state: i32) {
@@ -588,14 +704,7 @@ fn draw_leech_notice(notice: Option<&(String, Instant)>) {
         radius,
         with_alpha(theme.shadow, alpha),
     );
-    Ui::draw_rounded_rect(
-        x,
-        y,
-        width,
-        height,
-        radius,
-        with_alpha(theme.border, alpha),
-    );
+    Ui::draw_rounded_rect(x, y, width, height, radius, with_alpha(theme.border, alpha));
     Ui::draw_rounded_rect(
         x + 1.0,
         y + 1.0,
@@ -604,7 +713,13 @@ fn draw_leech_notice(notice: Option<&(String, Instant)>) {
         radius - 1.0,
         with_alpha(theme.surface_alt, alpha),
     );
-    Ui::draw_rect(x + 14.0, y + height * 0.5 - 2.0, 4.0, 4.0, with_alpha(theme.hard_fg, alpha));
+    Ui::draw_rect(
+        x + 14.0,
+        y + height * 0.5 - 2.0,
+        4.0,
+        4.0,
+        with_alpha(theme.hard_fg, alpha),
+    );
     Ui::fit_text(
         TOP_WIDTH / 2.0 + 5.0,
         y + 9.0,
@@ -1227,6 +1342,11 @@ enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    SettingsButton {
+        action: ReviewAction,
+        selected: usize,
+        previous: Box<Screen>,
+    },
     SettingsToolbar {
         selected: usize,
         previous: Box<Screen>,
@@ -1512,15 +1632,17 @@ const MAIN_MENU: [(Action, &str); 10] = [
 enum SettingsCategory {
     Appearance,
     Audio,
+    Controls,
     Network,
     System,
     Language,
 }
 
 impl SettingsCategory {
-    const ALL: [SettingsCategory; 5] = [
+    const ALL: [SettingsCategory; 6] = [
         SettingsCategory::Appearance,
         SettingsCategory::Audio,
+        SettingsCategory::Controls,
         SettingsCategory::Network,
         SettingsCategory::System,
         SettingsCategory::Language,
@@ -1530,6 +1652,7 @@ impl SettingsCategory {
         match self {
             SettingsCategory::Appearance => "Appearance and display",
             SettingsCategory::Audio => "Audio and review",
+            SettingsCategory::Controls => "Controls and keybinds",
             SettingsCategory::Network => "Sync and network",
             SettingsCategory::System => "System and hardware",
             SettingsCategory::Language => "Language",
@@ -1538,8 +1661,9 @@ impl SettingsCategory {
 
     fn hint(self) -> &'static str {
         match self {
-            SettingsCategory::Appearance => "Theme, font size and battery.",
+            SettingsCategory::Appearance => "Theme, spacing, counts and scrolling.",
             SettingsCategory::Audio => "Audio playback and review options.",
+            SettingsCategory::Controls => "Remap review buttons and reset defaults.",
             SettingsCategory::Network => "Account, clock and media downloads.",
             SettingsCategory::System => "Hardware lights and help.",
             SettingsCategory::Language => "Choose the interface language.",
@@ -1551,9 +1675,14 @@ impl SettingsCategory {
 enum ChoiceKind {
     Language,
     Theme,
+    Accent,
     FontScale,
+    Spacing,
+    ScrollSpeed,
     Battery,
     Connections,
+    AudioSpeed,
+    ReplayMode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1563,27 +1692,50 @@ enum ToggleKind {
     ConsoleLeds,
     RatingIcon,
     CardCounts,
+    RatingIntervals,
 }
 
 #[derive(Clone, Copy)]
 enum SettingsItem {
     Choice(ChoiceKind),
     Toggle(ToggleKind),
+    Binding(ReviewAction),
+    ResetControls,
     Action(Action, &'static str),
     Toolbar,
 }
 
-const APPEARANCE_ITEMS: [SettingsItem; 4] = [
+const APPEARANCE_ITEMS: [SettingsItem; 9] = [
     SettingsItem::Choice(ChoiceKind::Theme),
+    SettingsItem::Choice(ChoiceKind::Accent),
     SettingsItem::Choice(ChoiceKind::FontScale),
+    SettingsItem::Choice(ChoiceKind::Spacing),
+    SettingsItem::Choice(ChoiceKind::ScrollSpeed),
     SettingsItem::Choice(ChoiceKind::Battery),
+    SettingsItem::Toggle(ToggleKind::CardCounts),
+    SettingsItem::Toggle(ToggleKind::RatingIntervals),
     SettingsItem::Toolbar,
 ];
-const AUDIO_ITEMS: [SettingsItem; 4] = [
+const AUDIO_ITEMS: [SettingsItem; 5] = [
     SettingsItem::Toggle(ToggleKind::Autoplay),
     SettingsItem::Toggle(ToggleKind::AutoplayVideo),
+    SettingsItem::Choice(ChoiceKind::AudioSpeed),
+    SettingsItem::Choice(ChoiceKind::ReplayMode),
     SettingsItem::Toggle(ToggleKind::RatingIcon),
-    SettingsItem::Toggle(ToggleKind::CardCounts),
+];
+const CONTROLS_ITEMS: [SettingsItem; 12] = [
+    SettingsItem::Binding(ReviewAction::ShowAnswer),
+    SettingsItem::Binding(ReviewAction::Again),
+    SettingsItem::Binding(ReviewAction::Hard),
+    SettingsItem::Binding(ReviewAction::Good),
+    SettingsItem::Binding(ReviewAction::Easy),
+    SettingsItem::Binding(ReviewAction::PlayAudio),
+    SettingsItem::Binding(ReviewAction::Undo),
+    SettingsItem::Binding(ReviewAction::Bury),
+    SettingsItem::Binding(ReviewAction::Hint),
+    SettingsItem::Binding(ReviewAction::ScrollUp),
+    SettingsItem::Binding(ReviewAction::ScrollDown),
+    SettingsItem::ResetControls,
 ];
 const NETWORK_ITEMS: [SettingsItem; 6] = [
     SettingsItem::Action(Action::Login, "Log in"),
@@ -1603,6 +1755,7 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
     match category {
         SettingsCategory::Appearance => &APPEARANCE_ITEMS,
         SettingsCategory::Audio => &AUDIO_ITEMS,
+        SettingsCategory::Controls => &CONTROLS_ITEMS,
         SettingsCategory::Network => &NETWORK_ITEMS,
         SettingsCategory::System => &SYSTEM_ITEMS,
         SettingsCategory::Language => &LANGUAGE_ITEMS,
@@ -1617,9 +1770,14 @@ fn choice_title(kind: ChoiceKind) -> &'static str {
     match kind {
         ChoiceKind::Language => "Language",
         ChoiceKind::Theme => "Theme",
+        ChoiceKind::Accent => "Accent color",
         ChoiceKind::FontScale => "Font scale",
+        ChoiceKind::Spacing => "Text spacing",
+        ChoiceKind::ScrollSpeed => "Scrolling speed",
         ChoiceKind::Battery => "Battery indicator",
         ChoiceKind::Connections => "Download connections",
+        ChoiceKind::AudioSpeed => "Audio playback speed",
+        ChoiceKind::ReplayMode => "Replay audio",
     }
 }
 
@@ -1633,14 +1791,39 @@ fn choice_options(kind: ChoiceKind) -> Vec<String> {
             .iter()
             .map(|value| tr(value.label()).to_owned())
             .collect(),
+        ChoiceKind::Accent => theme::AccentKind::ALL
+            .iter()
+            .map(|value| tr(value.label()).to_owned())
+            .collect(),
         ChoiceKind::FontScale => i18n::FONT_SCALES
             .iter()
             .map(|value| format!("{value}%"))
             .collect(),
+        ChoiceKind::Spacing => vec![
+            tr("Compact").to_owned(),
+            tr("Normal").to_owned(),
+            tr("Relaxed").to_owned(),
+        ],
+        ChoiceKind::ScrollSpeed => vec![
+            tr("Slow").to_owned(),
+            tr("Normal").to_owned(),
+            tr("Fast").to_owned(),
+        ],
         ChoiceKind::Battery => {
-            vec![tr("Linear (25%)").to_owned(), tr("System default").to_owned()]
+            vec![
+                tr("Linear (25%)").to_owned(),
+                tr("System default").to_owned(),
+            ]
         }
         ChoiceKind::Connections => (1..=4).map(|value| value.to_string()).collect(),
+        ChoiceKind::AudioSpeed => i18n::AUDIO_SPEEDS
+            .iter()
+            .map(|value| format!("{value}x"))
+            .collect(),
+        ChoiceKind::ReplayMode => vec![
+            tr("Current side").to_owned(),
+            tr("All card audio").to_owned(),
+        ],
     }
 }
 
@@ -1651,12 +1834,20 @@ fn choice_selected(kind: ChoiceKind) -> usize {
             .iter()
             .position(|value| *value == theme::kind())
             .unwrap_or(0),
+        ChoiceKind::Accent => theme::AccentKind::ALL
+            .iter()
+            .position(|value| *value == theme::accent_kind())
+            .unwrap_or(0),
         ChoiceKind::FontScale => i18n::FONT_SCALES
             .iter()
             .position(|value| *value == i18n::font_scale())
             .unwrap_or(1),
+        ChoiceKind::Spacing => i18n::spacing_index(),
+        ChoiceKind::ScrollSpeed => i18n::scroll_speed_index(),
         ChoiceKind::Battery => usize::from(!i18n::battery_linear()),
         ChoiceKind::Connections => i18n::download_connections().saturating_sub(1),
+        ChoiceKind::AudioSpeed => i18n::audio_speed_index(),
+        ChoiceKind::ReplayMode => usize::from(i18n::replay_all_audio()),
     }
 }
 
@@ -1678,11 +1869,24 @@ fn apply_choice(kind: ChoiceKind, index: usize) -> std::io::Result<()> {
             Ui::apply_theme();
             event(&format!("THEME {}", value.key()));
         }
+        ChoiceKind::Accent => {
+            let value = theme::AccentKind::ALL[index.min(theme::AccentKind::ALL.len() - 1)];
+            theme::set_accent(value)?;
+            Ui::apply_theme();
+            event(&format!("ACCENT {}", value.key()));
+        }
         ChoiceKind::FontScale => {
-            let percent = i18n::set_font_scale(
-                i18n::FONT_SCALES[index.min(i18n::FONT_SCALES.len() - 1)],
-            )?;
+            let percent =
+                i18n::set_font_scale(i18n::FONT_SCALES[index.min(i18n::FONT_SCALES.len() - 1)])?;
             event(&format!("FONT_SCALE {percent}%"));
+        }
+        ChoiceKind::Spacing => {
+            let value = i18n::set_spacing_index(index)?;
+            event(&format!("TEXT_SPACING {value}"));
+        }
+        ChoiceKind::ScrollSpeed => {
+            let value = i18n::set_scroll_speed_index(index)?;
+            event(&format!("SCROLL_SPEED {value}"));
         }
         ChoiceKind::Battery => {
             let linear = index == 0;
@@ -1696,6 +1900,18 @@ fn apply_choice(kind: ChoiceKind, index: usize) -> std::io::Result<()> {
         ChoiceKind::Connections => {
             let value = i18n::set_download_connections(index as u8 + 1)?;
             event(&format!("DOWNLOAD_CONNECTIONS {value}"));
+        }
+        ChoiceKind::AudioSpeed => {
+            let value = i18n::set_audio_speed_index(index)?;
+            Ui::audio_set_speed(i18n::AUDIO_SPEEDS[value]);
+            event(&format!("AUDIO_SPEED {}", i18n::AUDIO_SPEEDS[value]));
+        }
+        ChoiceKind::ReplayMode => {
+            let value = i18n::set_replay_all_audio(index != 0)?;
+            event(&format!(
+                "REPLAY_AUDIO {}",
+                if value { "all" } else { "side" }
+            ));
         }
     }
     Ok(())
@@ -1730,6 +1946,13 @@ fn apply_toggle(kind: ToggleKind) -> std::io::Result<()> {
             let value = i18n::toggle_card_counts()?;
             event(&format!("CARD_COUNTS {}", if value { "on" } else { "off" }));
         }
+        ToggleKind::RatingIntervals => {
+            let value = i18n::toggle_rating_intervals()?;
+            event(&format!(
+                "RATING_INTERVALS {}",
+                if value { "on" } else { "off" }
+            ));
+        }
     }
     Ok(())
 }
@@ -1744,11 +1967,7 @@ fn settings_item_label(
         SettingsItem::Choice(kind) => choice_label(kind),
         SettingsItem::Toggle(ToggleKind::Autoplay) => i18n::format(
             "Auto-play audio: {0}",
-            &[tr(if i18n::autoplay_audio() {
-                "On"
-            } else {
-                "Off"
-            })],
+            &[tr(if i18n::autoplay_audio() { "On" } else { "Off" })],
         ),
         SettingsItem::Toggle(ToggleKind::AutoplayVideo) => i18n::format(
             "Auto-play video: {0}",
@@ -1766,13 +1985,28 @@ fn settings_item_label(
             "Card counts: {0}",
             &[tr(if i18n::card_counts() { "On" } else { "Off" })],
         ),
-        SettingsItem::Toolbar => i18n::format(
-            "Toolbar: {0}",
-            &[tr(if i18n::toolbar_visible() {
+        SettingsItem::Toggle(ToggleKind::RatingIntervals) => i18n::format(
+            "Rating intervals: {0}",
+            &[tr(if i18n::rating_intervals() {
                 "On"
             } else {
                 "Off"
             })],
+        ),
+        SettingsItem::Binding(action) => i18n::format(
+            "{0}: {1}",
+            &[
+                tr(action.label()),
+                match controls::button_for(action) {
+                    Some(button) => tr(button.label()),
+                    None => tr("Unbound"),
+                },
+            ],
+        ),
+        SettingsItem::ResetControls => tr("Reset to defaults").to_owned(),
+        SettingsItem::Toolbar => i18n::format(
+            "Toolbar: {0}",
+            &[tr(if i18n::toolbar_visible() { "On" } else { "Off" })],
         ),
         SettingsItem::Action(Action::MediaSync, _) => {
             media_sync_label(media_running, media_files, media_status)
@@ -1781,11 +2015,7 @@ fn settings_item_label(
     }
 }
 
-fn media_sync_label(
-    media_running: bool,
-    media_files: usize,
-    media_status: Option<&str>,
-) -> String {
+fn media_sync_label(media_running: bool, media_files: usize, media_status: Option<&str>) -> String {
     if media_running {
         if let Some(status) = media_status {
             i18n::format("Media sync: {0}. A stops.", &[status])
@@ -1834,7 +2064,29 @@ const SETTINGS_TILE_H: f32 = 20.0;
 const SETTINGS_TILE_GAP: f32 = 2.0;
 const CHOICE_TILE_H: f32 = 18.0;
 const CHOICE_TILE_GAP: f32 = 2.0;
+const SETTINGS_VISIBLE_ROWS: usize = 9;
+const CHOICE_VISIBLE_ROWS: usize = 9;
 const TOOLBAR_ROWS: usize = 6;
+
+fn list_start(selected: usize, length: usize) -> usize {
+    if length <= SETTINGS_VISIBLE_ROWS {
+        0
+    } else {
+        selected
+            .saturating_sub(SETTINGS_VISIBLE_ROWS - 1)
+            .min(length - SETTINGS_VISIBLE_ROWS)
+    }
+}
+
+fn choice_start(selected: usize, length: usize) -> usize {
+    if length <= CHOICE_VISIBLE_ROWS {
+        0
+    } else {
+        selected
+            .saturating_sub(CHOICE_VISIBLE_ROWS - 1)
+            .min(length - CHOICE_VISIBLE_ROWS)
+    }
+}
 
 fn settings_tile(row: usize) -> (f32, f32) {
     (
@@ -1850,22 +2102,24 @@ fn choice_tile(row: usize) -> (f32, f32) {
     )
 }
 
-fn choice_hit(x: f32, y: f32, length: usize) -> Option<usize> {
+fn choice_hit(x: f32, y: f32, start: usize, length: usize) -> Option<usize> {
     let row = ((y - SETTINGS_TILE_Y0) / (CHOICE_TILE_H + CHOICE_TILE_GAP)) as usize;
-    if row >= length {
+    let index = start + row;
+    if index >= length {
         return None;
     }
     let (tx, ty) = choice_tile(row);
-    (x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + CHOICE_TILE_H).then_some(row)
+    (x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + CHOICE_TILE_H).then_some(index)
 }
 
-fn list_hit(x: f32, y: f32, length: usize) -> Option<usize> {
+fn list_hit(x: f32, y: f32, start: usize, length: usize) -> Option<usize> {
     let row = ((y - SETTINGS_TILE_Y0) / (SETTINGS_TILE_H + SETTINGS_TILE_GAP)) as usize;
-    if row >= length {
+    let index = start + row;
+    if index >= length {
         return None;
     }
     let (tx, ty) = settings_tile(row);
-    (x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + SETTINGS_TILE_H).then_some(row)
+    (x >= tx && x < tx + SETTINGS_TILE_W && y >= ty && y < ty + SETTINGS_TILE_H).then_some(index)
 }
 
 fn list_step(selected: usize, length: usize, down: bool) -> usize {
@@ -1923,6 +2177,7 @@ fn main() {
         .init();
     i18n::init();
     theme::init();
+    controls::init();
     leds::init();
     // Hold one SOC handle for the app's lifetime, so the shared service never
     // drops to zero references between syncs and the static buffer is never
@@ -1931,6 +2186,7 @@ fn main() {
     let _soc_guard = anki_3ds_sync_transport::soc::NativeSoc::new().ok();
     Ui::apply_theme();
     Ui::set_battery_linear(i18n::battery_linear());
+    Ui::audio_set_speed(i18n::audio_speed());
     let startup_error = assets::prepare()
         .map_err(|e| e.to_string())
         .and_then(|_| {
@@ -2038,6 +2294,8 @@ fn main() {
     let mut card_media_pending = false;
     let mut prefetch = Prefetch::default();
     let mut playing_audio: Option<String> = None;
+    let mut audio_queue: Vec<(String, String)> = Vec::new();
+    let mut audio_queue_pos = 0usize;
     let mut frame: u64 = 0;
     let mut top_layout = TextLayout::default();
     let mut top_card = RichTextLayout::default();
@@ -2230,27 +2488,21 @@ fn main() {
         let down = hid.keys_down();
         let held = hid.keys_held();
         if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
-            let factor = i18n::font_scale_factor();
+            let factor = i18n::font_scale_factor() * i18n::scroll_speed_factor();
             let mut delta = 0.0f32;
-            if held.intersects(KeyPad::DPAD_DOWN | KeyPad::CSTICK_DOWN) {
+            if controls::button_for(ReviewAction::ScrollDown)
+                .is_some_and(|button| button.pressed(held))
+            {
                 delta += 5.5 * factor;
             }
-            if held.intersects(KeyPad::DPAD_UP | KeyPad::CSTICK_UP) {
+            if controls::button_for(ReviewAction::ScrollUp)
+                .is_some_and(|button| button.pressed(held))
+            {
                 delta -= 5.5 * factor;
             }
             let (_, pad_y) = hid.circlepad_position();
             if pad_y.abs() > 24 {
                 delta -= (f32::from(pad_y) / 156.0) * 9.0 * factor;
-            } else if held.contains(KeyPad::CPAD_DOWN) {
-                delta += 5.5 * factor;
-            } else if held.contains(KeyPad::CPAD_UP) {
-                delta -= 5.5 * factor;
-            }
-            if held.contains(KeyPad::ZL) {
-                delta -= 9.0 * factor;
-            }
-            if held.contains(KeyPad::ZR) {
-                delta += 9.0 * factor;
             }
             if delta != 0.0 {
                 review_scroll = (review_scroll + delta).clamp(0.0, review_max_scroll);
@@ -2279,54 +2531,47 @@ fn main() {
         } else {
             down
         };
+        let review_state = match &screen {
+            Screen::Question { .. } => Some(ScreenState::Front),
+            Screen::Answer { .. } => Some(ScreenState::Back),
+            _ => None,
+        };
+        let review_action = review_state.and_then(|state| {
+            controls::Button::ALL.iter().copied().find_map(|button| {
+                button
+                    .pressed(down)
+                    .then(|| controls::action_for(button, state))
+                    .flatten()
+            })
+        });
         let mut action = if down.contains(KeyPad::START) {
             Action::Exit
         } else if down.contains(KeyPad::SELECT) {
             Action::Menu
+        } else if let Some(review_action) = review_action {
+            review_action_to_action(review_action, &screen, &top_card, &review)
         } else if down.contains(KeyPad::B) {
             Action::Back
+        } else if review_state.is_some() {
+            if down.intersects(KeyPad::LEFT | KeyPad::CPAD_LEFT | KeyPad::CSTICK_LEFT) {
+                Action::AudioPage(-1)
+            } else if down.intersects(KeyPad::RIGHT | KeyPad::CPAD_RIGHT | KeyPad::CSTICK_RIGHT) {
+                Action::AudioPage(1)
+            } else {
+                Action::None
+            }
         } else if matches!(screen, Screen::Editor { .. } | Screen::Options { .. })
             && down.contains(KeyPad::X)
         {
             Action::Save
         } else if matches!(screen, Screen::Browser(_)) && down.contains(KeyPad::X) {
             Action::Search
-        } else if matches!(screen, Screen::Question { .. }) && down.contains(KeyPad::X) {
-            Action::Edit
-        } else if matches!(&screen, Screen::Question { card, .. } if card.type_answer.is_some())
-            && down.contains(KeyPad::Y)
-        {
-            Action::TypeAnswer
-        } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::Y) {
-            Action::Rate(0)
-        } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::X) {
-            Action::Rate(1)
-        } else if matches!(screen, Screen::Answer { .. }) && down.contains(KeyPad::R) {
-            Action::Rate(3)
         } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::Y) {
             Action::Left
         } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::X) {
             Action::Right
-        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
-            && down.contains(KeyPad::L)
-        {
-            // The L button opens the next closed hint; once all hints are
-            // open it replays audio as before.
-            next_closed_hint(&top_card, &review).map_or(Action::PlayAudio(None), Action::HintToggle)
         } else if down.contains(KeyPad::A) {
             Action::Primary
-        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
-            && down.intersects(KeyPad::LEFT | KeyPad::CPAD_LEFT | KeyPad::CSTICK_LEFT)
-        {
-            Action::AudioPage(-1)
-        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. })
-            && down.intersects(KeyPad::RIGHT | KeyPad::CPAD_RIGHT | KeyPad::CSTICK_RIGHT)
-        {
-            Action::AudioPage(1)
-        } else if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
-            // Review scrolling is pixel-based and handled above from the held
-            // key state. Do not also emit line-stepping actions here.
-            Action::None
         } else if repeat.intersects(KeyPad::DOWN | KeyPad::CPAD_DOWN | KeyPad::CSTICK_DOWN) {
             Action::Down
         } else if repeat.intersects(KeyPad::UP | KeyPad::CPAD_UP | KeyPad::CSTICK_UP) {
@@ -2547,7 +2792,8 @@ fn main() {
                     }
                 }
                 Screen::Settings { selected, .. } => {
-                    if let Some(index) = list_hit(x, y, SettingsCategory::ALL.len()) {
+                    let start = list_start(*selected, SettingsCategory::ALL.len());
+                    if let Some(index) = list_hit(x, y, start, SettingsCategory::ALL.len()) {
                         *selected = index;
                         Action::Primary
                     } else {
@@ -2557,17 +2803,29 @@ fn main() {
                 Screen::SettingsCategory {
                     category, selected, ..
                 } => {
-                    if let Some(index) = list_hit(x, y, settings_row_count(*category)) {
+                    let length = settings_row_count(*category);
+                    let start = list_start(*selected, length);
+                    if let Some(index) = list_hit(x, y, start, length) {
                         *selected = index;
                         Action::Primary
                     } else {
                         Action::None
                     }
                 }
-                Screen::SettingsChoice {
-                    kind, selected, ..
-                } => {
-                    if let Some(index) = choice_hit(x, y, choice_options(*kind).len()) {
+                Screen::SettingsChoice { kind, selected, .. } => {
+                    let length = choice_options(*kind).len();
+                    let start = choice_start(*selected, length);
+                    if let Some(index) = choice_hit(x, y, start, length) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::SettingsButton { selected, .. } => {
+                    let length = controls::button_option_count();
+                    let start = choice_start(*selected, length);
+                    if let Some(index) = choice_hit(x, y, start, length) {
                         *selected = index;
                         Action::Primary
                     } else {
@@ -2575,7 +2833,8 @@ fn main() {
                     }
                 }
                 Screen::SettingsToolbar { selected, .. } => {
-                    if let Some(index) = list_hit(x, y, 5) {
+                    let start = list_start(*selected, 5);
+                    if let Some(index) = list_hit(x, y, start, 5) {
                         *selected = index;
                         Action::Primary
                     } else if (150.0..170.0).contains(&y) && (10.0..150.0).contains(&x) {
@@ -2736,7 +2995,8 @@ fn main() {
             if let Screen::Settings { selected, .. } = &screen {
                 if matches!(action, Action::Primary) {
                     let index = *selected;
-                    let category = SettingsCategory::ALL[index.min(SettingsCategory::ALL.len() - 1)];
+                    let category =
+                        SettingsCategory::ALL[index.min(SettingsCategory::ALL.len() - 1)];
                     let old = std::mem::replace(&mut screen, Screen::Decks);
                     if let Screen::Settings { selected, previous } = old {
                         let settings = Screen::Settings { selected, previous };
@@ -2787,6 +3047,31 @@ fn main() {
                                 }
                             }
                             SettingsItem::Toggle(kind) => apply_toggle(kind)?,
+                            SettingsItem::Binding(action) => {
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsCategory {
+                                    category,
+                                    selected,
+                                    previous,
+                                } = old
+                                {
+                                    screen = Screen::SettingsButton {
+                                        action,
+                                        selected: controls::button_option_index(
+                                            controls::button_for(action),
+                                        ),
+                                        previous: Box::new(Screen::SettingsCategory {
+                                            category,
+                                            selected,
+                                            previous,
+                                        }),
+                                    };
+                                }
+                            }
+                            SettingsItem::ResetControls => {
+                                controls::reset()?;
+                                event("CONTROLS_RESET");
+                            }
                             SettingsItem::Toolbar => {
                                 let old = std::mem::replace(&mut screen, Screen::Decks);
                                 if let Screen::SettingsCategory {
@@ -2810,10 +3095,8 @@ fn main() {
                                     active.cancel();
                                     event("MEDIA_SYNC_CANCEL");
                                 } else if auth.is_none() {
-                                    media_result = Some(i18n::format(
-                                        "failed: {0}",
-                                        &[&tr("Not logged in")],
-                                    ));
+                                    media_result =
+                                        Some(i18n::format("failed: {0}", &[&tr("Not logged in")]));
                                     media_notice_until = Instant::now() + Duration::from_secs(3600);
                                 } else {
                                     let priority = backend
@@ -2844,8 +3127,8 @@ fn main() {
                                                         "failed: {0}",
                                                         &[&error],
                                                     ));
-                                                    media_notice_until = Instant::now()
-                                                        + Duration::from_secs(3600);
+                                                    media_notice_until =
+                                                        Instant::now() + Duration::from_secs(3600);
                                                 }
                                             }
                                         }
@@ -2871,7 +3154,11 @@ fn main() {
                         return Ok(());
                     }
                     Action::Left | Action::Right => {
-                        let direction = if matches!(action, Action::Right) { 1 } else { -1 };
+                        let direction = if matches!(action, Action::Right) {
+                            1
+                        } else {
+                            -1
+                        };
                         match item {
                             SettingsItem::Choice(kind) => {
                                 let count = choice_options(kind).len();
@@ -2892,8 +3179,80 @@ fn main() {
                                 }
                             }
                             SettingsItem::Toggle(kind) => apply_toggle(kind)?,
-                            SettingsItem::Action(_, _) => {}
-                            SettingsItem::Toolbar => {}
+                            SettingsItem::Action(_, _)
+                            | SettingsItem::Binding(_)
+                            | SettingsItem::ResetControls
+                            | SettingsItem::Toolbar => {}
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            if let Screen::SettingsButton {
+                action: review_action,
+                selected,
+                ..
+            } = &screen
+            {
+                let review_action = *review_action;
+                let index = *selected;
+                let length = controls::button_option_count();
+                match action {
+                    Action::Primary => {
+                        let chosen = controls::button_option(index);
+                        match controls::try_assign(review_action, chosen)? {
+                            None => {
+                                event(&format!(
+                                    "CONTROL {}={}",
+                                    review_action.key(),
+                                    chosen.map_or("none", controls::Button::key)
+                                ));
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsButton { previous, .. } = old {
+                                    screen = *previous;
+                                }
+                            }
+                            Some(conflict) => {
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsButton {
+                                    action,
+                                    selected,
+                                    previous,
+                                } = old
+                                {
+                                    screen = Screen::Info {
+                                        title: tr("Controls and keybinds").into(),
+                                        text: i18n::format(
+                                            "{0} is already used by {1} on the same screen.",
+                                            &[
+                                                tr(chosen
+                                                    .map_or("Unbound", controls::Button::label)),
+                                                tr(conflict.label()),
+                                            ],
+                                        ),
+                                        previous: Box::new(Screen::SettingsButton {
+                                            action,
+                                            selected,
+                                            previous,
+                                        }),
+                                    };
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Action::Back => {
+                        let old = std::mem::replace(&mut screen, Screen::Decks);
+                        if let Screen::SettingsButton { previous, .. } = old {
+                            screen = *previous;
+                        }
+                        return Ok(());
+                    }
+                    Action::Up | Action::Down => {
+                        if let Screen::SettingsButton { selected, .. } = &mut screen {
+                            *selected =
+                                list_step(*selected, length, matches!(action, Action::Down));
                         }
                         return Ok(());
                     }
@@ -2907,10 +3266,7 @@ fn main() {
                         match index {
                             0 => {
                                 let value = i18n::toggle_toolbar_visible()?;
-                                event(&format!(
-                                    "TOOLBAR {}",
-                                    if value { "on" } else { "off" }
-                                ));
+                                event(&format!("TOOLBAR {}", if value { "on" } else { "off" }));
                             }
                             1..=4 => {
                                 let item = i18n::toolbar_order()[index - 1];
@@ -2923,16 +3279,17 @@ fn main() {
                             }
                             _ => {
                                 let value = i18n::toggle_deck_title()?;
-                                event(&format!(
-                                    "DECK_TITLE {}",
-                                    if value { "on" } else { "off" }
-                                ));
+                                event(&format!("DECK_TITLE {}", if value { "on" } else { "off" }));
                             }
                         }
                         return Ok(());
                     }
                     Action::Left | Action::Right if (1..=4).contains(&index) => {
-                        let delta = if matches!(action, Action::Right) { 1 } else { -1 };
+                        let delta = if matches!(action, Action::Right) {
+                            1
+                        } else {
+                            -1
+                        };
                         let target = i18n::move_toolbar_item(index - 1, delta)?;
                         if let Screen::SettingsToolbar { selected, .. } = &mut screen {
                             *selected = target + 1;
@@ -2963,10 +3320,14 @@ fn main() {
                     }
                     Action::Left | Action::Right => {
                         let count = choice_options(kind).len();
-                        let step = if matches!(action, Action::Right) { 1 } else { -1 };
+                        let step = if matches!(action, Action::Right) {
+                            1
+                        } else {
+                            -1
+                        };
                         if let Screen::SettingsChoice { selected, .. } = &mut screen {
-                            *selected = ((*selected as i32 + step + count as i32)
-                                % count as i32) as usize;
+                            *selected =
+                                ((*selected as i32 + step + count as i32) % count as i32) as usize;
                         }
                         return Ok(());
                     }
@@ -3242,7 +3603,7 @@ fn main() {
                 }
                 Action::Help | Action::Stats => {
                     let (title, text) = match action {
-                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: A reveals. Y Again; X Hard; A Good; R Easy.\nScroll the top screen with Circle Pad, D-pad, C-stick or ZL/ZR.\nSELECT opens Menu. B returns. START closes and exits.\nMenu > Settings has font scale, theme and account options.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
+                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: use the buttons assigned in Settings > Controls and keybinds.\nScroll the top screen with the assigned scroll buttons or the Circle Pad.\nSELECT opens Menu. B returns. START closes and exits.\nSettings also has appearance, audio, controls and account options.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
                         Action::Stats => (tr("Statistics"), backend.as_mut().ok_or("collection unavailable")?.statistics()?),
                         _ => unreachable!(),
                     };
@@ -3405,19 +3766,28 @@ fn main() {
                     card_scroll = 0;
                 }
                 Action::PlayAudio(index) => {
-                    let audio = match &screen {
-                        Screen::Question { card, .. } => card_audio(card, false),
-                        Screen::Answer { card, .. } => card_audio(card, true),
-                        _ => Vec::new(),
+                    let (card, answer) = match &screen {
+                        Screen::Question { card, .. } => (card, false),
+                        Screen::Answer { card, .. } => (card, true),
+                        _ => return Ok(()),
+                    };
+                    let audio = match index {
+                        Some(_) => card_audio(card, answer),
+                        None => replay_audio(card, answer),
                     };
                     if audio.is_empty() {
                         return Ok(());
                     }
+                    let mut queue = Vec::with_capacity(audio.len());
+                    for item in &audio {
+                        queue.push((item.filename.clone(), audio_path(backend.as_ref(), item)));
+                    }
                     let chosen = match index {
-                        Some(value) => value.min(audio.len() - 1),
+                        Some(value) => value.min(queue.len() - 1),
                         None => {
-                            if audio_index + 1 < audio.len() {
-                                audio_index + 1
+                            let playing = playing_audio.is_some() && Ui::audio_is_playing();
+                            if playing && audio_queue_pos + 1 < queue.len() {
+                                audio_queue_pos + 1
                             } else {
                                 0
                             }
@@ -3425,16 +3795,14 @@ fn main() {
                     };
                     audio_index = chosen;
                     audio_page = chosen / AUDIO_VISIBLE;
-                    let resolved = backend
-                        .as_ref()
-                        .map(|active| active.media_path(&audio[chosen].filename))
-                        .unwrap_or_else(|| audio[chosen].path());
+                    audio_queue = queue;
+                    audio_queue_pos = chosen;
+                    let (filename, resolved) = audio_queue[chosen].clone();
                     match Ui::audio_play(&resolved) {
                         AudioAttempt::Done(true) => {
-                            playing_audio = Some(audio[chosen].filename.clone());
+                            playing_audio = Some(filename.clone());
                             event(&format!(
-                                "AUDIO play index={chosen} ok=true file={}",
-                                audio[chosen].filename
+                                "AUDIO play index={chosen} ok=true file={filename}"
                             ));
                         }
                         AudioAttempt::Done(false) => {
@@ -3443,13 +3811,17 @@ fn main() {
                                 log_media_once(
                                     &format!("audio|{resolved}|{diag}"),
                                     &format!(
-                                        "AUDIO play index={chosen} ok=false decode={decoded} file={} {diag}",
-                                        audio[chosen].filename
+                                        "AUDIO play index={chosen} ok=false decode={decoded} file={filename} {diag}"
                                     ),
                                 );
                             }
+                            audio_queue.clear();
+                            audio_queue_pos = 0;
                         }
-                        AudioAttempt::Busy => {}
+                        AudioAttempt::Busy => {
+                            audio_queue.clear();
+                            audio_queue_pos = 0;
+                        }
                     }
                 }
                 Action::AudioPage(delta) => {
@@ -3554,6 +3926,7 @@ fn main() {
                         | Screen::Settings { previous, .. }
                         | Screen::SettingsCategory { previous, .. }
                         | Screen::SettingsChoice { previous, .. }
+                        | Screen::SettingsButton { previous, .. }
                         | Screen::SettingsToolbar { previous, .. }
                         | Screen::CardChoice { previous, .. } => *previous,
                         Screen::Editor {
@@ -3904,8 +4277,11 @@ fn main() {
                                 );
                             }
                             Screen::SettingsToolbar { selected, .. } => {
-                                *selected =
-                                    list_step(*selected, TOOLBAR_ROWS, matches!(action, Action::Down));
+                                *selected = list_step(
+                                    *selected,
+                                    TOOLBAR_ROWS,
+                                    matches!(action, Action::Down),
+                                );
                             }
                             _ => {
                                 card_scroll = next(card_scroll, top_max + 1);
@@ -3935,7 +4311,11 @@ fn main() {
                             .map(|row| row.2)
                             .unwrap_or(OptField::Section);
                         if kind == OptField::LimitScope {
-                            let delta = if matches!(action, Action::Right) { 1 } else { -1 };
+                            let delta = if matches!(action, Action::Right) {
+                                1
+                            } else {
+                                -1
+                            };
                             options.set_scope(options.limit_scope.cycle(delta));
                         }
                     } else if let Screen::Menu { selected, .. } = &mut screen {
@@ -3961,7 +4341,11 @@ fn main() {
                         };
                     }
                 }
-                Action::None | Action::Menu | Action::Settings | Action::MediaSync | Action::Exit => {}
+                Action::None
+                | Action::Menu
+                | Action::Settings
+                | Action::MediaSync
+                | Action::Exit => {}
             }
             Ok(())
         })();
@@ -4027,6 +4411,25 @@ fn main() {
         }
         if playing_audio.is_some() && !Ui::audio_is_playing() {
             playing_audio = None;
+            if audio_queue_pos + 1 < audio_queue.len() {
+                audio_queue_pos += 1;
+                let (filename, resolved) = audio_queue[audio_queue_pos].clone();
+                match Ui::audio_play(&resolved) {
+                    AudioAttempt::Done(true) => {
+                        playing_audio = Some(filename.clone());
+                        event(&format!(
+                            "AUDIO queue index={audio_queue_pos} ok=true file={filename}"
+                        ));
+                    }
+                    AudioAttempt::Done(_) | AudioAttempt::Busy => {
+                        audio_queue.clear();
+                        audio_queue_pos = 0;
+                    }
+                }
+            } else {
+                audio_queue.clear();
+                audio_queue_pos = 0;
+            }
         }
         let card_changed = review_card != last_review_card;
         if card_changed {
@@ -4034,6 +4437,8 @@ fn main() {
             audio_index = 0;
             audio_page = 0;
             playing_audio = None;
+            audio_queue.clear();
+            audio_queue_pos = 0;
             Ui::audio_stop();
             if media_job
                 .as_ref()
@@ -4105,6 +4510,8 @@ fn main() {
                         _ => Vec::new(),
                     };
                     if let Some(first) = audio.first() {
+                        audio_queue.clear();
+                        audio_queue_pos = 0;
                         let resolved = backend
                             .as_ref()
                             .map(|active| active.media_path(&first.filename))
@@ -4154,6 +4561,7 @@ fn main() {
             Screen::Settings { .. } => "SETTINGS",
             Screen::SettingsCategory { .. } => "SETTINGS_CATEGORY",
             Screen::SettingsChoice { .. } => "SETTINGS_CHOICE",
+            Screen::SettingsButton { .. } => "SETTINGS_BUTTON",
             Screen::SettingsToolbar { .. } => "SETTINGS_TOOLBAR",
             Screen::CardChoice { .. } => "CARD_CHOICE",
             Screen::Info { .. } => "INFO",
@@ -4183,9 +4591,7 @@ fn main() {
             last_state = state.into();
         }
 
-        let media_running_now = media_job
-            .as_ref()
-            .is_some_and(|active| active.is_running());
+        let media_running_now = media_job.as_ref().is_some_and(|active| active.is_running());
         let media_processed_now = media_job
             .as_ref()
             .map(|active| active.processed_files())
@@ -4194,9 +4600,9 @@ fn main() {
             .as_ref()
             .map(|active| active.checked_files())
             .unwrap_or(0);
-        let media_result_now = media_result.as_ref().and_then(|text| {
-            (Instant::now() < media_notice_until).then(|| text.as_str())
-        });
+        let media_result_now = media_result
+            .as_ref()
+            .and_then(|text| (Instant::now() < media_notice_until).then(|| text.as_str()));
         let clock_known_now = clock::is_known();
         if media_running_now != last_media_running
             || media_processed_now != last_media_processed
@@ -4497,6 +4903,35 @@ fn main() {
                     tr("A opens or changes. B returns."),
                 );
             }
+            Screen::SettingsButton { action, .. } => {
+                Ui::fit_text(
+                    200.0,
+                    34.0,
+                    0.62,
+                    360.0,
+                    current_theme().text,
+                    tr(action.label()),
+                );
+                let current = controls::button_for(*action)
+                    .map_or(tr("Unbound").to_owned(), |button| {
+                        tr(button.label()).to_owned()
+                    });
+                Ui::fit_text(
+                    200.0,
+                    76.0,
+                    0.50,
+                    360.0,
+                    current_theme().text_muted,
+                    &i18n::format("Current: {0}", &[&current]),
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    128.0,
+                    0.46,
+                    current_theme().text_muted,
+                    tr("Choose a button. A assigns. B returns."),
+                );
+            }
             Screen::SettingsChoice { kind, .. } => {
                 Ui::fit_text(
                     200.0,
@@ -4739,12 +5174,24 @@ fn main() {
                 draw_hint_chips(&top_card, &review, 126.0);
                 draw_media_bar(&top_card, &review, true);
                 draw_undo_button(236.0, 148.0, 72.0, 36.0, undo_available);
+                let rating_actions = [
+                    ReviewAction::Again,
+                    ReviewAction::Hard,
+                    ReviewAction::Good,
+                    ReviewAction::Easy,
+                ];
                 for (i, label) in [tr("Again"), tr("Hard"), tr("Good"), tr("Easy")]
                     .iter()
                     .enumerate()
                 {
                     let interval = card.intervals.get(i).map(String::as_str).unwrap_or("?");
-                    let hint = format!("{interval} [{}]", ["Y", "X", "A", "R"][i]);
+                    let key = controls::button_for(rating_actions[i])
+                        .map_or("--", controls::Button::label);
+                    let hint = if i18n::rating_intervals() {
+                        format!("{interval} [{key}]")
+                    } else {
+                        format!("[{key}]")
+                    };
                     let hint = Ui::ellipsize(&hint, 0.42, 68.0);
                     let x = 8.0 + i as f32 * 76.0;
                     Ui::draw_button(
@@ -4858,8 +5305,7 @@ fn main() {
                 for (index, category) in SettingsCategory::ALL.iter().enumerate() {
                     let (x, y) = settings_tile(index);
                     let style = if index == *selected { 0 } else { 6 };
-                    let label =
-                        Ui::ellipsize(tr(category.label()), 0.50, SETTINGS_TILE_W - 12.0);
+                    let label = Ui::ellipsize(tr(category.label()), 0.50, SETTINGS_TILE_W - 12.0);
                     Ui::draw_button(
                         x,
                         y,
@@ -4885,10 +5331,18 @@ fn main() {
                 } else {
                     media_result.as_deref()
                 };
-                for (index, item) in settings_items(*category).iter().enumerate() {
-                    let (x, y) = settings_tile(index);
+                let items = settings_items(*category);
+                let start = list_start(*selected, items.len());
+                for (index, item) in items
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(SETTINGS_VISIBLE_ROWS)
+                {
+                    let (x, y) = settings_tile(index - start);
                     let style = if index == *selected { 0 } else { 6 };
-                    let label = settings_item_label(*item, media_running, media_files, media_status);
+                    let label =
+                        settings_item_label(*item, media_running, media_files, media_status);
                     let label = Ui::ellipsize(&label, 0.50, SETTINGS_TILE_W - 12.0);
                     Ui::draw_button(
                         x,
@@ -4905,10 +5359,57 @@ fn main() {
             Screen::SettingsChoice { kind, selected, .. } => {
                 header(320.0, tr(choice_title(*kind)));
                 let active = choice_selected(*kind);
-                for (index, option) in choice_options(*kind).iter().enumerate() {
-                    let (x, y) = choice_tile(index);
+                let options = choice_options(*kind);
+                let start = choice_start(*selected, options.len());
+                for (index, option) in options
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(CHOICE_VISIBLE_ROWS)
+                {
+                    let (x, y) = choice_tile(index - start);
                     let style = if index == *selected { 0 } else { 6 };
                     let label = Ui::ellipsize(option, 0.48, SETTINGS_TILE_W - 28.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        CHOICE_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
+                    if index == active {
+                        Ui::draw_sync_icon(
+                            x + SETTINGS_TILE_W - 20.0,
+                            y + (CHOICE_TILE_H - 10.0) * 0.5,
+                            10.0,
+                            0,
+                        );
+                    }
+                }
+            }
+            Screen::SettingsButton {
+                action, selected, ..
+            } => {
+                header(320.0, tr("Controls and keybinds"));
+                let active = controls::button_option_index(controls::button_for(*action));
+                let length = controls::button_option_count();
+                let start = choice_start(*selected, length);
+                for index in start..(start + CHOICE_VISIBLE_ROWS).min(length) {
+                    let (x, y) = choice_tile(index - start);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let button = controls::button_option(index);
+                    let mut label = button.map_or(tr("Unbound").to_owned(), |button| {
+                        tr(button.label()).to_owned()
+                    });
+                    if button
+                        .is_some_and(|button| controls::conflict_for(*action, button).is_some())
+                    {
+                        label = i18n::format("{0} (used)", &[&label]);
+                    }
+                    let label = Ui::ellipsize(&label, 0.48, SETTINGS_TILE_W - 28.0);
                     Ui::draw_button(
                         x,
                         y,
@@ -5044,6 +5545,7 @@ fn main() {
                 | Screen::Settings { .. }
                 | Screen::SettingsCategory { .. }
                 | Screen::SettingsChoice { .. }
+                | Screen::SettingsButton { .. }
                 | Screen::SettingsToolbar { .. }
         );
         if !hide_footer {

@@ -1441,6 +1441,8 @@ static int16_t* s_prefetch_pcm = NULL;
 static char s_prefetch_audio_path[MEDIA_PATH_MAX];
 static ndspWaveBuf s_audio_wave;
 static bool s_audio_ready = false;
+static float s_audio_speed = 1.0f;
+static float s_audio_rate = 44100.0f;
 
 static uint16_t audio_le16(const uint8_t* data) {
     return (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
@@ -1535,6 +1537,9 @@ static bool audio_start(int channels, int rate, size_t samples) {
     if (samples % (size_t)channels != 0) return false;
     size_t frames = samples / (size_t)channels;
     if (frames == 0) return false;
+    float playback_rate = (float)rate * s_audio_speed;
+    if (playback_rate < 4000.0f) playback_rate = 4000.0f;
+    if (playback_rate > 192000.0f) playback_rate = 192000.0f;
     ui_audio_stop();
     memset(&s_audio_wave, 0, sizeof(s_audio_wave));
     s_audio_wave.data_vaddr = s_audio_pcm;
@@ -1543,12 +1548,25 @@ static bool audio_start(int channels, int rate, size_t samples) {
     ndspChnSetFormat(
         AUDIO_CHANNEL,
         channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
-    ndspChnSetRate(AUDIO_CHANNEL, (float)rate);
+    s_audio_rate = (float)rate;
+    ndspChnSetRate(AUDIO_CHANNEL, playback_rate);
     audio_set_mix(channels);
     DSP_FlushDataCache(s_audio_pcm, (u32)(samples * sizeof(int16_t)));
     ndspChnWaveBufAdd(AUDIO_CHANNEL, &s_audio_wave);
     ndspChnSetPaused(AUDIO_CHANNEL, false);
     return true;
+}
+
+void ui_audio_set_speed(float speed) {
+    if (speed < 0.5f) speed = 0.5f;
+    if (speed > 2.0f) speed = 2.0f;
+    s_audio_speed = speed;
+    if (s_audio_ready && ndspChnIsPlaying(AUDIO_CHANNEL)) {
+        float playback_rate = s_audio_rate * s_audio_speed;
+        if (playback_rate < 4000.0f) playback_rate = 4000.0f;
+        if (playback_rate > 192000.0f) playback_rate = 192000.0f;
+        ndspChnSetRate(AUDIO_CHANNEL, playback_rate);
+    }
 }
 
 static bool audio_decode_mp3(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {

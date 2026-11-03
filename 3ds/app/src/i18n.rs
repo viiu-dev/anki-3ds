@@ -56,7 +56,12 @@ pub fn init() {
     load_console_leds();
     load_rating_icon();
     load_card_counts();
+    load_rating_intervals();
     load_deck_title();
+    load_audio_speed();
+    load_replay_mode();
+    load_scroll_speed();
+    load_spacing();
     load_toolbar();
     let saved = fs::read_to_string(PATH)
         .ok()
@@ -248,7 +253,6 @@ pub fn set_battery_linear(value: bool) -> io::Result<()> {
     Ok(())
 }
 
-
 fn load_battery_linear() {
     let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
         return;
@@ -335,6 +339,129 @@ pub fn toggle_card_counts() -> io::Result<bool> {
 
 fn load_card_counts() {
     load_bool_setting("card_counts", &CARD_COUNTS);
+}
+
+static RATING_INTERVALS: AtomicBool = AtomicBool::new(true);
+
+pub fn rating_intervals() -> bool {
+    RATING_INTERVALS.load(Ordering::Relaxed)
+}
+
+pub fn toggle_rating_intervals() -> io::Result<bool> {
+    let value = !rating_intervals();
+    write_setting("rating_intervals", serde_json::json!(value))?;
+    RATING_INTERVALS.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_rating_intervals() {
+    load_bool_setting("rating_intervals", &RATING_INTERVALS);
+}
+
+pub const AUDIO_SPEEDS: [f32; 4] = [0.75, 1.0, 1.25, 1.5];
+static AUDIO_SPEED: AtomicU8 = AtomicU8::new(1);
+
+pub fn audio_speed_index() -> usize {
+    usize::from(AUDIO_SPEED.load(Ordering::Relaxed)).min(AUDIO_SPEEDS.len() - 1)
+}
+
+pub fn audio_speed() -> f32 {
+    AUDIO_SPEEDS[audio_speed_index()]
+}
+
+pub fn set_audio_speed_index(index: usize) -> io::Result<usize> {
+    let index = index.min(AUDIO_SPEEDS.len() - 1);
+    write_setting("audio_speed", serde_json::json!(index))?;
+    AUDIO_SPEED.store(index as u8, Ordering::Relaxed);
+    Ok(index)
+}
+
+fn load_audio_speed() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("audio_speed").and_then(|v| v.as_u64()))
+        .unwrap_or(1)
+        .min(AUDIO_SPEEDS.len() as u64 - 1);
+    AUDIO_SPEED.store(value as u8, Ordering::Relaxed);
+}
+
+static REPLAY_ALL_AUDIO: AtomicBool = AtomicBool::new(false);
+
+pub fn replay_all_audio() -> bool {
+    REPLAY_ALL_AUDIO.load(Ordering::Relaxed)
+}
+
+pub fn set_replay_all_audio(value: bool) -> io::Result<bool> {
+    write_setting("replay_all_audio", serde_json::json!(value))?;
+    REPLAY_ALL_AUDIO.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_replay_mode() {
+    load_bool_setting("replay_all_audio", &REPLAY_ALL_AUDIO);
+}
+
+pub const SCROLL_SPEEDS: [f32; 3] = [0.6, 1.0, 1.6];
+static SCROLL_SPEED: AtomicU8 = AtomicU8::new(1);
+
+pub fn scroll_speed_index() -> usize {
+    usize::from(SCROLL_SPEED.load(Ordering::Relaxed)).min(SCROLL_SPEEDS.len() - 1)
+}
+
+pub fn scroll_speed_factor() -> f32 {
+    SCROLL_SPEEDS[scroll_speed_index()]
+}
+
+pub fn set_scroll_speed_index(index: usize) -> io::Result<usize> {
+    let index = index.min(SCROLL_SPEEDS.len() - 1);
+    write_setting("scroll_speed", serde_json::json!(index))?;
+    SCROLL_SPEED.store(index as u8, Ordering::Relaxed);
+    Ok(index)
+}
+
+fn load_scroll_speed() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("scroll_speed").and_then(|v| v.as_u64()))
+        .unwrap_or(1)
+        .min(SCROLL_SPEEDS.len() as u64 - 1);
+    SCROLL_SPEED.store(value as u8, Ordering::Relaxed);
+}
+
+pub const CARD_SPACING: [f32; 3] = [0.88, 1.0, 1.16];
+static SPACING: AtomicU8 = AtomicU8::new(1);
+
+pub fn spacing_index() -> usize {
+    usize::from(SPACING.load(Ordering::Relaxed)).min(CARD_SPACING.len() - 1)
+}
+
+pub fn spacing_factor() -> f32 {
+    CARD_SPACING[spacing_index()]
+}
+
+pub fn set_spacing_index(index: usize) -> io::Result<usize> {
+    let index = index.min(CARD_SPACING.len() - 1);
+    write_setting("card_spacing", serde_json::json!(index))?;
+    SPACING.store(index as u8, Ordering::Relaxed);
+    Ok(index)
+}
+
+fn load_spacing() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("card_spacing").and_then(|v| v.as_u64()))
+        .unwrap_or(1)
+        .min(CARD_SPACING.len() as u64 - 1);
+    SPACING.store(value as u8, Ordering::Relaxed);
 }
 
 static DECK_TITLE: AtomicBool = AtomicBool::new(true);
@@ -536,7 +663,10 @@ fn load_toolbar() {
             state &= !TOOLBAR_VISIBLE_BIT;
         }
     }
-    if let Some(hidden) = document.get("toolbar_hidden").and_then(|value| value.as_array()) {
+    if let Some(hidden) = document
+        .get("toolbar_hidden")
+        .and_then(|value| value.as_array())
+    {
         for item in ToolbarItem::ALL {
             let is_hidden = hidden
                 .iter()
@@ -548,7 +678,10 @@ fn load_toolbar() {
             }
         }
     }
-    if let Some(order) = document.get("toolbar_order").and_then(|value| value.as_array()) {
+    if let Some(order) = document
+        .get("toolbar_order")
+        .and_then(|value| value.as_array())
+    {
         let mut seen = [false; 4];
         let mut items = Vec::with_capacity(4);
         for value in order {
@@ -607,7 +740,6 @@ pub fn set_download_connections(value: u8) -> io::Result<u8> {
     DOWNLOAD_CONNECTIONS.store(value, Ordering::Relaxed);
     Ok(value)
 }
-
 
 fn load_download_connections() {
     let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {

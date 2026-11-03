@@ -29,25 +29,33 @@ backend creates an empty collection; you can then sign in and download a collect
 Use disposable data until final hardware and authenticated AnkiWeb verification.
 
 - Decks: D-pad selects; A studies; Left/Right expands or collapses.
-- Review: the top screen shows the card front, then the card back after A.
-  The bottom screen shows the deck, counters, a large Show Answer button, and
-  rating buttons with their intervals. Y Again, X Hard, A Good, R Easy.
-  Touch ratings also work. Revealed cloze answers appear highlighted in their
-  context on the top screen. Tables, code blocks, blockquotes, hint pills
-  ("Show Hint N" buttons on the bottom screen, L opens the next one) and
-  LaTeX/MathJax approximations render inline. Cards with a type-answer field
-  show a "Type answer" button (or press Y); the typed text appears in the
-  input box, and the answer screen shows the green/red comparison. Scroll
-  with the Circle Pad, D-pad, C-stick, ZL or ZR; a subtle scrollbar appears
-  at the right edge when the card is taller than the screen.
+- Review: the top screen shows the card front, then the card back after the
+  Show Answer binding. The bottom screen shows the deck, optional counters, a
+  large Show Answer button, and rating buttons with their intervals and assigned
+  buttons. The default review bindings are A Show Answer/Good, Y Again, X Hard,
+  R Easy, L Play/Replay audio, ZL Undo, ZR Bury and X Reveal hint/Type answer;
+  D-pad Up/Down scroll. Touch ratings and audio buttons also work. Revealed
+  cloze answers appear highlighted in their context on the top screen. Tables,
+  code blocks, blockquotes, hint pills ("Show Hint N" buttons on the bottom
+  screen) and LaTeX/MathJax approximations render inline. Cards with a
+  type-answer field show a "Type answer" button; the typed text appears in the
+  input box, and the answer screen shows the green/red comparison. Scroll with
+  the assigned buttons or the Circle Pad; a subtle scrollbar appears at the
+  right edge when the card is taller than the screen.
+- Controls: Settings → Controls and keybinds remaps every review action to A, B,
+  X, Y, L, R, ZL, ZR, D-pad, Circle Pad or C-stick directions. Bindings that
+  would collide on the same review screen are refused, the profile is saved in
+  `settings.json`, and Reset to defaults restores the standard layout.
 - Font scale: Settings → Font scale offers 85%, 100%, 125%, 150%, 175%, 200%
   and 250%. A advances the setting and Left/Right adjusts it. It scales card
   text, furigana and line spacing, and is saved in `settings.json`. Card text is
   drawn with the bundled Noto Sans JP font (SIL Open Font License), rasterized
   on demand, so no `cjk.bcfnt` needs to be copied to the SD card.
-- Theme: Settings → Theme cycles Light, Cream, Dark and Black (AMOLED). A
-  advances the setting and Left/Right adjusts it. The choice is saved in
-  `settings.json` and applies to both screens.
+- Appearance: Settings → Theme selects Light, Cream, Dark and Black (AMOLED).
+  Accent color selects a UI accent preset. Text spacing offers Compact, Normal
+  and Relaxed. Scrolling speed offers Slow, Normal and Fast. Card counts and
+  rating intervals can each be hidden, and the toolbar and deck title remain
+  configurable. All choices are saved in `settings.json`.
 - Add/Edit: select a field for the Nintendo keyboard; X saves, B cancels.
 - Browse: upstream search syntax plus quick filters (All, Current deck, Buried,
   Suspended, Leeches). The selected card shows whether it is buried, suspended
@@ -74,9 +82,12 @@ Use disposable data until final hardware and authenticated AnkiWeb verification.
   Play/Pause controls on the bottom screen. H.264 MP4 and VP8/VP9 WebM cannot
   be decoded on this hardware and show an "Unsupported video" poster instead.
   Settings → Auto-play video starts card video without tapping.
-- Card audio appears as tappable Audio buttons on the bottom screen; press L to
-  replay/cycle. Settings → Auto-play audio plays the first clip when a card is
-  revealed. MP3, Ogg Vorbis, Opus and WAV audio are decoded on the console.
+- Card audio appears as tappable Audio buttons on the bottom screen; the Play/
+  Replay audio binding cycles the clips and continues automatically. Settings →
+  Audio and review selects playback speed (0.75x, 1.0x, 1.25x or 1.5x) and
+  whether Replay uses every clip on the card or only the current side. Auto-play
+  audio plays the first clip when a card is revealed. MP3, Ogg Vorbis, Opus and
+  WAV audio are decoded on the console.
 - SELECT opens a two-column Menu of the common review actions (Undo,
   Bury/Suspend, Edit/Add note, Browse, Sync, Statistics, deck options). Settings
   holds the preferences, account and help, so the whole menu fits one page.

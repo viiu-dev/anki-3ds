@@ -212,6 +212,7 @@ const BLACK: Theme = Theme {
 
 static THEMES: [Theme; 4] = [LIGHT, CREAM, DARK, BLACK];
 static INDEX: AtomicUsize = AtomicUsize::new(0);
+static ACCENT_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 const _: () = assert!(std::mem::size_of::<Theme>() == 35 * 4);
 
@@ -263,12 +264,126 @@ impl ThemeKind {
     }
 }
 
-pub fn current() -> &'static Theme {
-    &THEMES[INDEX.load(Ordering::Relaxed)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AccentKind {
+    ThemeDefault,
+    Blue,
+    Teal,
+    Green,
+    Purple,
+    Orange,
+    Pink,
+}
+
+impl AccentKind {
+    pub const ALL: [AccentKind; 7] = [
+        AccentKind::ThemeDefault,
+        AccentKind::Blue,
+        AccentKind::Teal,
+        AccentKind::Green,
+        AccentKind::Purple,
+        AccentKind::Orange,
+        AccentKind::Pink,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            AccentKind::ThemeDefault => "default",
+            AccentKind::Blue => "blue",
+            AccentKind::Teal => "teal",
+            AccentKind::Green => "green",
+            AccentKind::Purple => "purple",
+            AccentKind::Orange => "orange",
+            AccentKind::Pink => "pink",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AccentKind::ThemeDefault => "Theme default",
+            AccentKind::Blue => "Blue",
+            AccentKind::Teal => "Teal",
+            AccentKind::Green => "Green",
+            AccentKind::Purple => "Purple",
+            AccentKind::Orange => "Orange",
+            AccentKind::Pink => "Pink",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|value| *value == self)
+            .unwrap_or(0)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL[index.min(Self::ALL.len() - 1)]
+    }
+
+    fn rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
+            AccentKind::ThemeDefault => None,
+            AccentKind::Blue => Some((59, 130, 246)),
+            AccentKind::Teal => Some((20, 184, 166)),
+            AccentKind::Green => Some((34, 197, 94)),
+            AccentKind::Purple => Some((168, 85, 247)),
+            AccentKind::Orange => Some((249, 115, 22)),
+            AccentKind::Pink => Some((236, 72, 153)),
+        }
+    }
+}
+
+pub fn current() -> Theme {
+    let mut theme = THEMES[INDEX.load(Ordering::Relaxed)];
+    let accent = AccentKind::from_index(ACCENT_INDEX.load(Ordering::Relaxed));
+    if let Some((r, g, b)) = accent.rgb() {
+        let color = c(r, g, b);
+        let luminance = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+        theme.accent = color;
+        theme.new = color;
+        theme.tab_active_fg = color;
+        theme.on_accent = if luminance > 150.0 {
+            c(0, 0, 0)
+        } else {
+            c(255, 255, 255)
+        };
+    }
+    theme
 }
 
 pub fn kind() -> ThemeKind {
     ThemeKind::from_index(INDEX.load(Ordering::Relaxed))
+}
+
+pub fn accent_kind() -> AccentKind {
+    AccentKind::from_index(ACCENT_INDEX.load(Ordering::Relaxed))
+}
+
+pub fn set_accent(kind: AccentKind) -> io::Result<()> {
+    let mut document = fs::read_to_string(SETTINGS_PATH)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !document.is_object() {
+        document = serde_json::json!({});
+    }
+    document["accent"] = serde_json::json!(kind.key());
+    let text = serde_json::to_string_pretty(&document).map_err(io::Error::other)? + "\n";
+    if let Some(parent) = std::path::Path::new(SETTINGS_PATH).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = format!("{SETTINGS_PATH}.tmp");
+    fs::write(&temporary, text.as_bytes())?;
+    match fs::rename(&temporary, SETTINGS_PATH) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = fs::remove_file(&temporary);
+            fs::write(SETTINGS_PATH, text.as_bytes())
+        }
+    }?;
+    ACCENT_INDEX.store(kind.index(), Ordering::Relaxed);
+    Ok(())
 }
 
 pub fn init() {
@@ -288,6 +403,19 @@ pub fn init() {
             INDEX.store(found.index(), Ordering::Relaxed);
         }
     }
+    let accent = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("accent")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    if let Some(key) = accent {
+        if let Some(found) = AccentKind::ALL.iter().find(|accent| accent.key() == key) {
+            ACCENT_INDEX.store(found.index(), Ordering::Relaxed);
+        }
+    }
 }
 
 pub fn set(kind: ThemeKind) -> io::Result<()> {
@@ -295,7 +423,6 @@ pub fn set(kind: ThemeKind) -> io::Result<()> {
     INDEX.store(kind.index(), Ordering::Relaxed);
     Ok(())
 }
-
 
 fn save(kind: ThemeKind) -> io::Result<()> {
     let mut document = fs::read_to_string(SETTINGS_PATH)

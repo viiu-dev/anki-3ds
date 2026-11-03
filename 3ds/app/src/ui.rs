@@ -57,7 +57,7 @@ pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
 pub use super::theme::Theme;
 
 #[inline]
-fn theme() -> &'static Theme {
+fn theme() -> Theme {
     super::theme::current()
 }
 
@@ -134,6 +134,7 @@ extern "C" {
     fn ui_audio_prefetch_clear();
     fn ui_audio_stop();
     fn ui_audio_is_playing() -> bool;
+    fn ui_audio_set_speed(speed: f32);
     fn ui_draw_status_compact(
         x_right: f32,
         y: f32,
@@ -308,7 +309,8 @@ impl Ui {
     }
 
     pub fn apply_theme() {
-        unsafe { ui_set_theme(theme() as *const Theme) }
+        let theme = theme();
+        unsafe { ui_set_theme(&theme) }
     }
 
     pub fn frame_begin() {
@@ -576,6 +578,10 @@ impl Ui {
 
     pub fn audio_is_playing() -> bool {
         unsafe { ui_audio_is_playing() }
+    }
+
+    pub fn audio_set_speed(speed: f32) {
+        unsafe { ui_audio_set_speed(speed) }
     }
 
     pub fn draw_status_compact(
@@ -906,6 +912,7 @@ pub struct RichTextLayout {
     image_paths: Vec<String>,
     width: f32,
     font_scale: f32,
+    spacing: f32,
     typed: String,
     open_hints: HashSet<u16>,
     hint_order: Vec<u16>,
@@ -938,11 +945,13 @@ impl RichTextLayout {
         typed: &str,
     ) {
         let font_scale = font_scale.clamp(0.5, 2.5);
+        let spacing = super::i18n::spacing_factor();
         if self.ready
             && self.html == html
             && self.image_paths == images
             && (self.width - width).abs() < 0.01
             && (self.font_scale - font_scale).abs() < 0.001
+            && (self.spacing - spacing).abs() < 0.001
             && &self.open_hints == hints_open
             && self.typed == typed
         {
@@ -955,6 +964,7 @@ impl RichTextLayout {
         self.images.clear();
         self.width = width;
         self.font_scale = font_scale;
+        self.spacing = spacing;
         self.typed.clear();
         self.typed.push_str(typed);
         self.open_hints = hints_open.clone();
@@ -962,10 +972,10 @@ impl RichTextLayout {
         let blocks = super::review_text::parse_html(html);
         self.hint_order = collect_hint_ids(&blocks);
         self.open_anims(&blocks);
-        let nominal = CARD_LINE_HEIGHT * font_scale;
-        let block_gap = CARD_BLOCK_GAP * font_scale;
-        let section_gap = CARD_SECTION_GAP * font_scale;
-        let list_gap = CARD_LIST_GAP * font_scale;
+        let nominal = CARD_LINE_HEIGHT * font_scale * spacing;
+        let block_gap = CARD_BLOCK_GAP * font_scale * spacing;
+        let section_gap = CARD_SECTION_GAP * font_scale * spacing;
+        let list_gap = CARD_LIST_GAP * font_scale * spacing;
         let rule_height = CARD_RULE_HEIGHT * font_scale;
         let mut lines = Vec::new();
         let mut tables = Vec::new();
@@ -1024,7 +1034,7 @@ impl RichTextLayout {
                 .min(4.0);
             let draw_w = image_w as f32 * scale;
             let draw_h = image_h as f32 * scale;
-            cursor += CARD_BLOCK_GAP * font_scale;
+            cursor += block_gap;
             self.images.push(CardImage {
                 texture,
                 top: cursor,
@@ -2405,7 +2415,7 @@ impl RichTextLayout {
             width,
             height,
         });
-        *cursor += height + CARD_BLOCK_GAP * metrics.font_scale;
+        *cursor += height + CARD_BLOCK_GAP * metrics.font_scale * super::i18n::spacing_factor();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2480,8 +2490,8 @@ impl RichTextLayout {
                     let count = end.saturating_sub(start);
                     if count > 0 {
                         for index in start..end {
-                            let shift = ruby_shift * (index - previous_index) as f32
-                                / (count + 1) as f32;
+                            let shift =
+                                ruby_shift * (index - previous_index) as f32 / (count + 1) as f32;
                             draft.pieces[index].x += shift;
                         }
                     }
@@ -2515,9 +2525,9 @@ impl RichTextLayout {
         }
         draft.max_scale = draft.max_scale.max(scale_multiplier);
         if style.pitch.high || style.pitch.downstep || style.pitch.upstep || style.pitch.nasal {
-            draft.pitch_height = draft.pitch_height.max(
-                CARD_PITCH_HEIGHT * metrics.font_scale * scale_multiplier.max(1.0),
-            );
+            draft.pitch_height = draft
+                .pitch_height
+                .max(CARD_PITCH_HEIGHT * metrics.font_scale * scale_multiplier.max(1.0));
         }
         if draft
             .pieces
@@ -2591,9 +2601,9 @@ impl RichTextLayout {
             }
             draft.max_scale = draft.max_scale.max(piece_scale);
             if style.pitch.high || style.pitch.downstep || style.pitch.upstep || style.pitch.nasal {
-                draft.pitch_height = draft.pitch_height.max(
-                    CARD_PITCH_HEIGHT * metrics.font_scale * piece_scale.max(1.0),
-                );
+                draft.pitch_height = draft
+                    .pitch_height
+                    .max(CARD_PITCH_HEIGHT * metrics.font_scale * piece_scale.max(1.0));
             }
         }
         *pending_space = false;
@@ -2750,8 +2760,12 @@ fn is_nasal_marker(ch: char) -> bool {
 }
 
 fn has_dakuten(text: &str) -> bool {
-    text.chars()
-        .any(|ch| matches!(ch, 'ガ' | 'ギ' | 'グ' | 'ゲ' | 'ゴ' | 'が' | 'ぎ' | 'ぐ' | 'げ' | 'ご'))
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            'ガ' | 'ギ' | 'グ' | 'ゲ' | 'ゴ' | 'が' | 'ぎ' | 'ぐ' | 'げ' | 'ご'
+        )
+    })
 }
 
 fn nasal_pad(text: &str, font_scale: f32, scale_multiplier: f32) -> f32 {

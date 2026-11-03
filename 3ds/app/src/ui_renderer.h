@@ -140,6 +140,7 @@ bool ui_audio_decode(const char* path);
 bool ui_audio_prefetch(const char* path);
 void ui_audio_prefetch_clear(void);
 bool ui_audio_is_playing(void);
+void ui_audio_set_speed(float speed);
 void ui_audio_stop(void);
 void ui_audio_init(void);
 void ui_audio_fini(void);
