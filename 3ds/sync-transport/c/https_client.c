@@ -52,7 +52,16 @@ static size_t header_cb(char *data, size_t size, size_t count, void *context) {
     size_t bytes = size * count;
     struct ResponseBuffer *buf = context;
     Anki3dsHttpResponse *response = buf->resp;
-    if (bytes >= 5 && !strncmp(data, "HTTP/", 5)) response->server_time = 0;
+    if (bytes >= 5 && !strncmp(data, "HTTP/", 5)) {
+        response->server_time = 0;
+        buf->content_length = -1;
+        if (buf->size > 0) {
+            buf->size = 0;
+            if (buf->options && buf->options->write_body) {
+                buf->options->write_body(buf->options->context, NULL, 0, 0);
+            }
+        }
+    }
     if (bytes > 5 && bytes < 128 && !strncasecmp(data, "Date:", 5)) {
         char value[128];
         memcpy(value, data + 5, bytes - 5);
@@ -89,6 +98,16 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
         size_t written = fwrite(ptr, 1, bytes, buf->file);
         buf->size += written;
         return written;
+    }
+    if (bytes == 0) return 0;
+    if (buf->options && buf->options->write_body) {
+        size_t hint = (buf->content_length > 0 && (uint64_t)buf->content_length <= MAX_RESPONSE_BYTES)
+            ? (size_t)buf->content_length
+            : 0;
+        if (buf->options->write_body(buf->options->context, (const uint8_t *)ptr, bytes, hint) != 0)
+            return 0;
+        buf->size += bytes;
+        return bytes;
     }
     if (bytes > MAX_RESPONSE_BYTES - buf->size) return 0;
     if (buf->size + bytes > buf->capacity) {
@@ -473,6 +492,9 @@ int anki_3ds_https_post(
             if (options->upload_file == NULL && options->download_file != NULL) {
                 /* truncate partial download file */
                 FILE *f = fopen(options->download_file, "wb"); if (f) fclose(f);
+            }
+            if (options->write_body) {
+                options->write_body(options->context, NULL, 0, 0);
             }
             anki_3ds_http_response_free(out_resp);
             memset(out_resp, 0, sizeof(*out_resp));

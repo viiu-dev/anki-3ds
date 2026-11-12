@@ -46,6 +46,7 @@ typedef struct {
     size_t max_file_bytes;
     int (*cancelled)(void *);
     int (*progress)(void *, uint64_t, uint64_t);
+    int (*write_body)(void *context, const uint8_t *data, size_t len, size_t content_length_hint);
     void *context;
 } Anki3dsRequestOptions;
 

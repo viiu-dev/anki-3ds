@@ -129,6 +129,7 @@ struct RequestOptions {
     max_file_bytes: usize,
     cancelled: extern "C" fn(*mut std::ffi::c_void) -> i32,
     progress: extern "C" fn(*mut std::ffi::c_void, u64, u64) -> i32,
+    write_body: Option<extern "C" fn(*mut std::ffi::c_void, *const u8, usize, usize) -> i32>,
     context: *mut std::ffi::c_void,
 }
 
@@ -139,6 +140,8 @@ struct TransferContext<'a> {
             anki::sync::collection::progress::FullSyncProgress,
         >,
     >,
+    body: Vec<u8>,
+    write_error: Option<&'static str>,
 }
 extern "C" fn check_cancel(context: *mut std::ffi::c_void) -> i32 {
     let context = unsafe { &*(context as *const TransferContext) };
@@ -159,6 +162,39 @@ extern "C" fn update_progress(context: *mut std::ffi::c_void, done: u64, total: 
         }
     }
     check_cancel(context as *mut TransferContext as *mut _)
+}
+extern "C" fn write_body_chunk(
+    context: *mut std::ffi::c_void,
+    data: *const u8,
+    len: usize,
+    content_length_hint: usize,
+) -> i32 {
+    let context = unsafe { &mut *(context as *mut TransferContext) };
+    if data.is_null() {
+        context.body.clear();
+        context.write_error = None;
+        return 0;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if len > MAX_RESPONSE_BYTES.saturating_sub(context.body.len()) {
+        context.write_error = Some("response exceeds 8 MiB buffer budget");
+        return -1;
+    }
+    if context.body.is_empty()
+        && content_length_hint > len
+        && content_length_hint <= MAX_RESPONSE_BYTES
+    {
+        let _ = context.body.try_reserve_exact(content_length_hint);
+    }
+    if context.body.try_reserve(len).is_err() {
+        context.write_error = Some("response allocation failed");
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(data, len) };
+    context.body.extend_from_slice(slice);
+    0
 }
 
 extern "C" {
@@ -390,6 +426,8 @@ impl NativeSyncClient {
         let mut context = TransferContext {
             cancel: &self.cancel,
             progress,
+            body: Vec::new(),
+            write_error: None,
         };
         let options = RequestOptions {
             port: self.endpoint.port_or_known_default().unwrap_or(443) as u32,
@@ -399,6 +437,10 @@ impl NativeSyncClient {
             max_file_bytes: *anki::sync::request::MAXIMUM_SYNC_PAYLOAD_BYTES,
             cancelled: check_cancel,
             progress: update_progress,
+            write_body: download.is_none().then_some(
+                write_body_chunk
+                    as extern "C" fn(*mut std::ffi::c_void, *const u8, usize, usize) -> i32,
+            ),
             context: &mut context as *mut TransferContext as *mut _,
         };
         let mut raw_resp = RawHttpResponse {
@@ -435,7 +477,8 @@ impl NativeSyncClient {
         };
 
         tracing::debug!(target: "anki_3ds_sync_transport", compressed_request_bytes = compressed_body.len(),
-            response_bytes = raw_resp.response_body_len, response_capacity_peak = raw_resp.response_capacity_peak,
+            response_bytes = context.body.len().max(raw_resp.response_body_len),
+            response_capacity_peak = context.body.capacity().max(raw_resp.response_capacity_peak),
             sampled_heap_peak = raw_resp.sampled_heap_peak, curl_code = raw_resp.curl_code,
             path, http_status = raw_resp.http_status, dns_ms = raw_resp.dns_ms, tcp_ms = raw_resp.tcp_ms,
             tls_ms = raw_resp.tls_ms, first_byte_ms = raw_resp.first_byte_ms, total_ms = raw_resp.total_ms,
@@ -454,30 +497,40 @@ impl NativeSyncClient {
             }
         };
 
-        let body_bytes = if !raw_resp.response_body.is_null() && raw_resp.response_body_len > 0 {
-            let slice = unsafe {
-                std::slice::from_raw_parts(raw_resp.response_body, raw_resp.response_body_len)
-            };
-            let mut copy = Vec::new();
-            if copy.try_reserve_exact(slice.len()).is_err() {
-                unsafe { anki_3ds_http_response_free(&mut raw_resp) };
-                return Err(SyncTransportError::Transport(
-                    -4,
-                    "response allocation failed".into(),
-                ));
+        let server_time = (raw_resp.server_time > 0).then_some(raw_resp.server_time);
+        let status = raw_resp.http_status as u16;
+        let curl_code = raw_resp.curl_code;
+        let write_error = context.write_error;
+        let body_bytes = if rc == 0 {
+            if !context.body.is_empty() {
+                std::mem::take(&mut context.body)
+            } else if !raw_resp.response_body.is_null() && raw_resp.response_body_len > 0 {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(raw_resp.response_body, raw_resp.response_body_len)
+                };
+                let mut copy = Vec::new();
+                if copy.try_reserve_exact(slice.len()).is_err() {
+                    unsafe { anki_3ds_http_response_free(&mut raw_resp) };
+                    return Err(SyncTransportError::Transport(
+                        -4,
+                        "response allocation failed".into(),
+                    ));
+                }
+                copy.extend_from_slice(slice);
+                copy
+            } else {
+                Vec::new()
             }
-            copy.extend_from_slice(slice);
-            copy
         } else {
             Vec::new()
         };
 
-        let server_time = (raw_resp.server_time > 0).then_some(raw_resp.server_time);
-        let status = raw_resp.http_status as u16;
-        let curl_code = raw_resp.curl_code;
         unsafe { anki_3ds_http_response_free(&mut raw_resp) };
 
         if rc != 0 {
+            if let Some(msg) = write_error {
+                return Err(SyncTransportError::Transport(-4, msg.into()));
+            }
             return Err(SyncTransportError::Transport(curl_code, err_msg));
         }
 
@@ -529,6 +582,7 @@ impl NativeSyncClient {
             context: format!("failed to compress request body: {e}"),
             source: None,
         })?;
+        drop(request.data);
 
         if compressed_body.len() > MAX_RESPONSE_BYTES {
             return Err(HttpError::new_without_source(
@@ -539,6 +593,7 @@ impl NativeSyncClient {
         let resp = self
             .post_raw(path, &header_json, &compressed_body)
             .map_err(|e| self.transport_error(e))?;
+        drop(compressed_body);
 
         let status_code = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
 
@@ -563,47 +618,133 @@ impl NativeSyncClient {
             });
         }
 
-        let decompressed_body = decompress_zstd_body_if_needed(&resp.body)?;
+        let decompressed_body = decompress_zstd_body_if_needed(resp.body)?;
         Ok(SyncResponse::from_vec(decompressed_body))
     }
 }
 
-fn decompress_zstd_body_if_needed(body: &[u8]) -> HttpResult<Vec<u8>> {
+fn alloc_with_backoff(min_cap: usize, desired_cap: usize) -> Option<Vec<u8>> {
+    let mut cap = desired_cap.max(min_cap);
+    loop {
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(cap).is_ok() {
+            return Some(buf);
+        }
+        if cap <= min_cap {
+            return None;
+        }
+        cap = min_cap + (cap - min_cap) / 2;
+    }
+}
+
+fn decompress_zstd_body_if_needed(body: Vec<u8>) -> HttpResult<Vec<u8>> {
     if body.len() >= 4 && body[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-        let mut decoder = zstd::Decoder::new(body).map_err(|e| HttpError {
-            code: StatusCode::BAD_GATEWAY,
-            context: format!("invalid zstd stream: {e}"),
-            source: None,
+        // Single-pass ZSTD_decompressDCtx (~150 KiB DCtx) instead of ZSTD_DStream,
+        // which tries to malloc a contiguous windowSize buffer (up to ~8.4 MiB)
+        // when streamed responses omit the pledged frame content size.
+        let mut dctx = zstd::zstd_safe::DCtx::try_create().ok_or_else(|| {
+            HttpError::new_without_source(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "zstd context allocation failed",
+            )
         })?;
-        decoder.window_log_max(23).map_err(io_http)?;
-        let mut out = Vec::new();
-        let mut buffer = [0u8; 8192];
-        loop {
-            let count = decoder.read(&mut buffer).map_err(|e| HttpError {
+        dctx.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(23))
+            .map_err(|code| HttpError {
                 code: StatusCode::BAD_GATEWAY,
-                context: format!("zstd decompression error: {e}"),
+                context: format!(
+                    "zstd parameter error: {}",
+                    zstd::zstd_safe::get_error_name(code)
+                ),
                 source: None,
             })?;
-            if count == 0 {
-                break;
+
+        let exact_single_frame = match (
+            zstd::zstd_safe::find_frame_compressed_size(&body),
+            zstd::zstd_safe::get_frame_content_size(&body),
+        ) {
+            (Ok(frame_len), Ok(Some(known))) if frame_len == body.len() => {
+                if known > MAX_DECOMPRESSED_BYTES as u64 {
+                    return Err(HttpError::new_without_source(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "decompressed sync response exceeds 16 MiB budget",
+                    ));
+                }
+                Some(known as usize)
             }
-            if count > MAX_DECOMPRESSED_BYTES - out.len() {
-                return Err(HttpError::new_without_source(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "decompressed sync response exceeds 16 MiB budget",
-                ));
-            }
-            out.try_reserve(count).map_err(|_| {
+            _ => None,
+        };
+
+        let (mut min_cap, mut desired_cap) = match exact_single_frame {
+            Some(exact) => (exact, exact),
+            None => (
+                1,
+                body.len()
+                    .saturating_mul(4)
+                    .clamp(4096, MAX_DECOMPRESSED_BYTES),
+            ),
+        };
+
+        loop {
+            let mut out = alloc_with_backoff(min_cap, desired_cap).ok_or_else(|| {
                 HttpError::new_without_source(
                     StatusCode::INSUFFICIENT_STORAGE,
                     "sync response allocation failed",
                 )
             })?;
-            out.extend_from_slice(&buffer[..count]);
+
+            match dctx.decompress(&mut out, &body) {
+                Ok(written) => {
+                    if written > MAX_DECOMPRESSED_BYTES {
+                        return Err(HttpError::new_without_source(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "decompressed sync response exceeds 16 MiB budget",
+                        ));
+                    }
+                    if out.capacity() > written.saturating_add(65536) {
+                        out.shrink_to_fit();
+                    }
+                    return Ok(out);
+                }
+                Err(code) => {
+                    let err_code = unsafe { zstd::zstd_safe::zstd_sys::ZSTD_getErrorCode(code) };
+                    if err_code
+                        == zstd::zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall
+                    {
+                        let prev_cap = out.capacity();
+                        drop(out);
+                        if prev_cap >= MAX_DECOMPRESSED_BYTES {
+                            return Err(HttpError::new_without_source(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "decompressed sync response exceeds 16 MiB budget",
+                            ));
+                        }
+                        min_cap = prev_cap + 1;
+                        desired_cap = prev_cap
+                            .saturating_mul(2)
+                            .max(4096)
+                            .min(MAX_DECOMPRESSED_BYTES);
+                        continue;
+                    }
+                    let status = if err_code
+                        == zstd::zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_memory_allocation
+                    {
+                        StatusCode::INSUFFICIENT_STORAGE
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    return Err(HttpError {
+                        code: status,
+                        context: format!(
+                            "zstd decompression error: {}",
+                            zstd::zstd_safe::get_error_name(code)
+                        ),
+                        source: None,
+                    });
+                }
+            }
         }
-        Ok(out)
     } else {
-        Ok(body.to_vec())
+        Ok(body)
     }
 }
 
@@ -905,9 +1046,49 @@ mod tests {
     #[test]
     fn response_preserves_binary_bytes() {
         let bytes = [0, 255, 0, 128, 10, 13];
-        assert_eq!(decompress_zstd_body_if_needed(&bytes).unwrap(), bytes);
+        assert_eq!(
+            decompress_zstd_body_if_needed(bytes.to_vec()).unwrap(),
+            bytes
+        );
         let compressed = zstd::encode_all(&bytes[..], 0).unwrap();
-        assert_eq!(decompress_zstd_body_if_needed(&compressed).unwrap(), bytes);
+        assert_eq!(decompress_zstd_body_if_needed(compressed).unwrap(), bytes);
+    }
+
+    #[test]
+    fn streamed_zstd_unknown_content_size_and_multiframe_decompress() {
+        use std::io::Write;
+
+        let empty_known = zstd::encode_all(&b""[..], 1).unwrap();
+        assert_eq!(
+            decompress_zstd_body_if_needed(empty_known).unwrap(),
+            Vec::<u8>::new()
+        );
+
+        let mut empty_enc = zstd::Encoder::new(Vec::new(), 1).unwrap();
+        empty_enc.flush().unwrap();
+        let empty_flushed = empty_enc.finish().unwrap();
+        assert_eq!(
+            decompress_zstd_body_if_needed(empty_flushed).unwrap(),
+            Vec::<u8>::new()
+        );
+
+        let payload: Vec<u8> = (0..(256 * 1024 + 37)).map(|i| (i % 251) as u8).collect();
+        let mut enc = zstd::Encoder::new(Vec::new(), 3).unwrap();
+        enc.write_all(&payload).unwrap();
+        let streamed = enc.finish().unwrap();
+        assert!(zstd::zstd_safe::get_frame_content_size(&streamed)
+            .unwrap()
+            .is_none());
+        assert_eq!(decompress_zstd_body_if_needed(streamed).unwrap(), payload);
+
+        let mut multiframe = zstd::encode_all(&b"first frame "[..], 1).unwrap();
+        let mut enc2 = zstd::Encoder::new(&mut multiframe, 1).unwrap();
+        enc2.write_all(b"second frame").unwrap();
+        enc2.finish().unwrap();
+        assert_eq!(
+            decompress_zstd_body_if_needed(multiframe).unwrap(),
+            b"first frame second frame"
+        );
     }
 
     #[test]
@@ -915,9 +1096,7 @@ mod tests {
         let input = vec![0; MAX_DECOMPRESSED_BYTES + 1];
         let compressed = zstd::encode_all(&input[..], 0).unwrap();
         assert_eq!(
-            decompress_zstd_body_if_needed(&compressed)
-                .unwrap_err()
-                .code,
+            decompress_zstd_body_if_needed(compressed).unwrap_err().code,
             StatusCode::PAYLOAD_TOO_LARGE
         );
     }
@@ -925,7 +1104,7 @@ mod tests {
     #[test]
     fn damaged_zstd_response_fails() {
         assert_eq!(
-            decompress_zstd_body_if_needed(&[0x28, 0xb5, 0x2f, 0xfd, 255])
+            decompress_zstd_body_if_needed(vec![0x28, 0xb5, 0x2f, 0xfd, 255])
                 .unwrap_err()
                 .code,
             StatusCode::BAD_GATEWAY
@@ -1094,7 +1273,7 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             .map_err(|e| self.transport_error(e))?;
         let response = self.check_file_response(response)?;
         Ok(SyncResponse::from_vec(decompress_zstd_body_if_needed(
-            &response.body,
+            response.body,
         )?))
     }
 
@@ -1131,7 +1310,7 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             path = %compressed.display(),
             "full download scratch created"
         );
-        let body = zstd::encode_all(&request.data[..], 0).map_err(io_http)?;
+        let body = compress_low_mem(&request.data).map_err(io_http)?;
         let header = self.file_header(request)?;
         let endpoint = SyncMethod::Download.as_sync_endpoint(&self.endpoint);
         let response = self
@@ -1144,6 +1323,7 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
                 Some(progress),
             )
             .map_err(|e| self.transport_error(e))?;
+        drop(body);
         self.check_file_response(response)?;
         tracing::debug!(
             target: "anki_3ds_sync_transport",
