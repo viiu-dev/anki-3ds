@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use super::i18n::tr;
 use super::review_text::Block;
+use super::review_text::BoxStyle;
 use super::review_text::Cell;
 use super::review_text::DiffClass;
 use super::review_text::Inline;
@@ -856,8 +857,17 @@ struct TableGrid {
 struct CardImage {
     texture: i32,
     top: f32,
+    x: f32,
     width: f32,
     height: f32,
+}
+
+struct PlacedBox {
+    top: f32,
+    height: f32,
+    x: f32,
+    width: f32,
+    style: BoxStyle,
 }
 
 const MEDIA_IMAGE_SLOTS: usize = 8;
@@ -909,6 +919,8 @@ fn fallback_media_path(path: &str) -> Option<String> {
 #[derive(Default)]
 pub struct RichTextLayout {
     html: String,
+    css: String,
+    dark_mode: bool,
     image_paths: Vec<String>,
     width: f32,
     font_scale: f32,
@@ -921,6 +933,7 @@ pub struct RichTextLayout {
     tables: Vec<TableGrid>,
     codes: Vec<PlacedCode>,
     quote_bars: Vec<(f32, f32, f32)>,
+    boxes: Vec<PlacedBox>,
     anims: Vec<AnimHandle>,
     controls: Vec<AnimHandle>,
     placed_anims: Vec<PlacedAnim>,
@@ -928,16 +941,37 @@ pub struct RichTextLayout {
     ready: bool,
 }
 
+struct LayoutScratch<'a> {
+    lines: Vec<CardLine>,
+    tables: Vec<TableGrid>,
+    codes: Vec<PlacedCode>,
+    bars: Vec<(f32, f32, f32)>,
+    boxes: Vec<PlacedBox>,
+    placed: Vec<PlacedAnim>,
+    images: Vec<CardImage>,
+    used_images: HashSet<String>,
+    saw_img_tag: bool,
+    busy: bool,
+    image_paths: &'a [String],
+    font_scale: f32,
+    nominal: f32,
+    block_gap: f32,
+    section_gap: f32,
+    list_gap: f32,
+    rule_height: f32,
+}
+
 impl RichTextLayout {
-    /// Discard the measured layout so the next `set_text` call re-reads media
-    /// that background sync has just written.
     pub fn invalidate(&mut self) {
         self.ready = false;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_text(
         &mut self,
         html: &str,
+        css: &str,
+        dark_mode: bool,
         images: &[String],
         width: f32,
         font_scale: f32,
@@ -948,6 +982,8 @@ impl RichTextLayout {
         let spacing = super::i18n::spacing_factor();
         if self.ready
             && self.html == html
+            && self.css == css
+            && self.dark_mode == dark_mode
             && self.image_paths == images
             && (self.width - width).abs() < 0.01
             && (self.font_scale - font_scale).abs() < 0.001
@@ -959,9 +995,13 @@ impl RichTextLayout {
         }
         self.html.clear();
         self.html.push_str(html);
+        self.css.clear();
+        self.css.push_str(css);
+        self.dark_mode = dark_mode;
         self.image_paths.clear();
         self.image_paths.extend(images.iter().cloned());
         self.images.clear();
+        self.boxes.clear();
         self.width = width;
         self.font_scale = font_scale;
         self.spacing = spacing;
@@ -969,7 +1009,7 @@ impl RichTextLayout {
         self.typed.push_str(typed);
         self.open_hints = hints_open.clone();
 
-        let blocks = super::review_text::parse_html(html);
+        let blocks = super::review_text::parse_html_with_css(html, css, dark_mode);
         self.hint_order = collect_hint_ids(&blocks);
         self.open_anims(&blocks);
         let nominal = CARD_LINE_HEIGHT * font_scale * spacing;
@@ -977,79 +1017,68 @@ impl RichTextLayout {
         let section_gap = CARD_SECTION_GAP * font_scale * spacing;
         let list_gap = CARD_LIST_GAP * font_scale * spacing;
         let rule_height = CARD_RULE_HEIGHT * font_scale;
-        let mut lines = Vec::new();
-        let mut tables = Vec::new();
-        let mut codes = Vec::new();
-        let mut bars = Vec::new();
-        let mut placed = Vec::new();
-        let mut cursor = 0.0f32;
-        let mut first = true;
-        self.layout_blocks(
-            &blocks,
-            0.0,
-            0,
-            true,
-            width,
+        let mut scratch = LayoutScratch {
+            lines: Vec::new(),
+            tables: Vec::new(),
+            codes: Vec::new(),
+            bars: Vec::new(),
+            boxes: Vec::new(),
+            placed: Vec::new(),
+            images: Vec::new(),
+            used_images: HashSet::new(),
+            saw_img_tag: false,
+            busy: false,
+            image_paths: images,
             font_scale,
             nominal,
             block_gap,
             section_gap,
             list_gap,
             rule_height,
-            &mut lines,
-            &mut tables,
-            &mut codes,
-            &mut bars,
-            &mut placed,
+        };
+        let mut cursor = 0.0f32;
+        let mut first = true;
+        let mut headword_pending = true;
+        self.layout_blocks(
+            &blocks,
+            0.0,
+            0,
+            width,
+            &mut scratch,
             &mut cursor,
             &mut first,
+            &mut headword_pending,
         );
-        let max_width = (width - 8.0).max(32.0);
-        let max_height = TOP_HEIGHT - 60.0;
-        let mut busy = false;
-        for path in images {
-            if self.images.len() >= MEDIA_IMAGE_SLOTS {
-                break;
-            }
-            let (texture, image_w, image_h) = match Ui::media_image(path) {
-                ImageLoad::Ready(texture, image_w, image_h) => (texture, image_w, image_h),
-                ImageLoad::Missing => {
-                    let diag = super::media_diag(path);
-                    super::log_media_once(
-                        &format!("image|{path}|{diag}"),
-                        &format!("IMAGE load fail file={} {diag}", image_name(path)),
-                    );
+        if !scratch.saw_img_tag {
+            for path in images {
+                if scratch.used_images.contains(path) || scratch.images.len() >= MEDIA_IMAGE_SLOTS {
                     continue;
                 }
-                ImageLoad::Busy => {
-                    busy = true;
-                    continue;
+                if !first {
+                    cursor += block_gap;
                 }
-            };
-            if image_w <= 0 || image_h <= 0 {
-                continue;
+                place_resolved_image(
+                    path,
+                    0.0,
+                    width,
+                    None,
+                    None,
+                    &mut scratch.images,
+                    &mut cursor,
+                    &mut scratch.busy,
+                );
+                first = false;
             }
-            let scale = (max_width / image_w as f32)
-                .min(max_height / image_h as f32)
-                .min(4.0);
-            let draw_w = image_w as f32 * scale;
-            let draw_h = image_h as f32 * scale;
-            cursor += block_gap;
-            self.images.push(CardImage {
-                texture,
-                top: cursor,
-                width: draw_w,
-                height: draw_h,
-            });
-            cursor += draw_h;
         }
         self.content_height = cursor;
-        self.lines = lines;
-        self.tables = tables;
-        self.codes = codes;
-        self.quote_bars = bars;
-        self.placed_anims = placed;
-        self.ready = !busy;
+        self.lines = scratch.lines;
+        self.images = scratch.images;
+        self.tables = scratch.tables;
+        self.codes = scratch.codes;
+        self.quote_bars = scratch.bars;
+        self.boxes = scratch.boxes;
+        self.placed_anims = scratch.placed;
+        self.ready = !scratch.busy;
     }
 
     /// Hint ids in document order for the bottom-screen toggle buttons.
@@ -1113,38 +1142,29 @@ impl RichTextLayout {
         blocks: &[Block],
         indent: f32,
         depth: u8,
-        headword: bool,
         width: f32,
-        font_scale: f32,
-        nominal: f32,
-        block_gap: f32,
-        section_gap: f32,
-        list_gap: f32,
-        rule_height: f32,
-        lines: &mut Vec<CardLine>,
-        tables: &mut Vec<TableGrid>,
-        codes: &mut Vec<PlacedCode>,
-        bars: &mut Vec<(f32, f32, f32)>,
-        placed: &mut Vec<PlacedAnim>,
+        scratch: &mut LayoutScratch<'_>,
         cursor: &mut f32,
         first: &mut bool,
+        headword_pending: &mut bool,
     ) {
+        let multi_block = blocks.len() > 1;
         for block in blocks {
             let between = if *first {
                 0.0
             } else if matches!(block, Block::ListItem { .. }) {
-                list_gap
+                scratch.list_gap
             } else if matches!(block, Block::Section(_)) {
-                section_gap
+                scratch.section_gap
             } else {
-                block_gap
+                scratch.block_gap
             };
             match block {
                 Block::Rule => {
                     *cursor += between;
-                    lines.push(CardLine {
+                    scratch.lines.push(CardLine {
                         top: *cursor,
-                        height: rule_height,
+                        height: scratch.rule_height,
                         ruby_height: 0.0,
                         upper: 0.0,
                         width,
@@ -1154,105 +1174,141 @@ impl RichTextLayout {
                         rule: true,
                         indent: 0.0,
                     });
-                    *cursor += rule_height;
+                    *cursor += scratch.rule_height;
                 }
                 Block::Paragraph(content) | Block::Section(content) => {
                     *cursor += between;
-                    let block_scale = if *first && headword {
-                        headword_multiplier(content)
-                    } else {
-                        1.0
-                    };
+                    let block_scale =
+                        if *headword_pending && multi_block && is_metadata_block(content) {
+                            0.85
+                        } else if *headword_pending {
+                            let hw = headword_multiplier(content);
+                            if !block_text(content).trim().is_empty() {
+                                *headword_pending = false;
+                            }
+                            hw
+                        } else {
+                            1.0
+                        };
                     self.layout_inlines(
                         content,
                         None,
                         width,
-                        font_scale,
+                        scratch.font_scale,
                         block_scale,
                         indent,
-                        lines,
-                        placed,
+                        scratch,
                         cursor,
-                        nominal,
+                        scratch.nominal,
                     );
                 }
                 Block::ListItem { marker, content } => {
+                    *headword_pending = false;
                     *cursor += between;
                     self.layout_inlines(
                         content,
                         Some(marker.clone()),
                         width,
-                        font_scale,
+                        scratch.font_scale,
                         1.0,
                         indent,
-                        lines,
-                        placed,
+                        scratch,
                         cursor,
-                        nominal,
+                        scratch.nominal,
                     );
                 }
                 Block::Table { rows } => {
+                    *headword_pending = false;
                     *cursor += between;
-                    self.layout_table(
-                        rows, indent, width, font_scale, nominal, lines, tables, placed, cursor,
-                    );
+                    self.layout_table(rows, indent, width, scratch, cursor);
                 }
                 Block::Code { text } => {
+                    *headword_pending = false;
                     *cursor += between;
-                    layout_code(text, indent, font_scale, nominal, codes, cursor);
+                    layout_code(
+                        text,
+                        indent,
+                        scratch.font_scale,
+                        scratch.nominal,
+                        &mut scratch.codes,
+                        cursor,
+                    );
                 }
                 Block::Hint { id, content } => {
                     *cursor += between;
                     if self.open_hints.contains(id) {
                         let mut nested_first = true;
+                        let mut nested_hw = false;
                         self.layout_blocks(
                             content,
                             indent,
                             depth,
-                            false,
                             width,
-                            font_scale,
-                            nominal,
-                            block_gap,
-                            section_gap,
-                            list_gap,
-                            rule_height,
-                            lines,
-                            tables,
-                            codes,
-                            bars,
-                            placed,
+                            scratch,
                             cursor,
                             &mut nested_first,
+                            &mut nested_hw,
                         );
                     }
                 }
                 Block::Quote(inner) => {
+                    *headword_pending = false;
                     *cursor += between;
                     let top = *cursor;
                     let mut nested_first = true;
+                    let mut nested_hw = false;
                     self.layout_blocks(
                         inner,
                         indent + 10.0,
                         depth + 1,
-                        false,
                         width,
-                        font_scale,
-                        nominal,
-                        block_gap,
-                        section_gap,
-                        list_gap,
-                        rule_height,
-                        lines,
-                        tables,
-                        codes,
-                        bars,
-                        placed,
+                        scratch,
                         cursor,
                         &mut nested_first,
+                        &mut nested_hw,
                     );
                     if *cursor > top {
-                        bars.push((top, *cursor - top, indent + 3.0));
+                        scratch.bars.push((top, *cursor - top, indent + 3.0));
+                    }
+                }
+                Block::Callout { style, content } => {
+                    *headword_pending = false;
+                    *cursor += between;
+                    let box_x = indent;
+                    let box_w = (width - box_x).max(24.0);
+                    let inner_pad = if style.border_left.is_some() {
+                        9.0
+                    } else {
+                        6.0
+                    };
+                    let pad_y = if style.bg.is_some() || style.border_all.is_some() {
+                        5.0
+                    } else {
+                        2.0
+                    };
+                    let top = *cursor;
+                    *cursor += pad_y;
+                    let mut nested_first = true;
+                    let mut nested_hw = false;
+                    self.layout_blocks(
+                        content,
+                        indent + inner_pad,
+                        depth + 1,
+                        (width - 5.0).max(indent + inner_pad + 24.0),
+                        scratch,
+                        cursor,
+                        &mut nested_first,
+                        &mut nested_hw,
+                    );
+                    *cursor += pad_y;
+                    if *cursor > top + 2.0 * pad_y {
+                        scratch.boxes.push(PlacedBox {
+                            top,
+                            height: *cursor - top,
+                            x: box_x,
+                            width: box_w,
+                            style: *style,
+                        });
                     }
                 }
             }
@@ -1330,19 +1386,16 @@ impl RichTextLayout {
             .collect();
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn layout_table(
         &self,
         rows: &[Vec<Cell>],
         indent: f32,
         width: f32,
-        font_scale: f32,
-        nominal: f32,
-        lines: &mut Vec<CardLine>,
-        tables: &mut Vec<TableGrid>,
-        placed: &mut Vec<PlacedAnim>,
+        scratch: &mut LayoutScratch<'_>,
         cursor: &mut f32,
     ) {
+        let font_scale = scratch.font_scale;
+        let nominal = scratch.nominal;
         let columns = rows
             .iter()
             .map(|row| row.iter().map(|cell| cell.colspan as usize).sum())
@@ -1440,8 +1493,7 @@ impl RichTextLayout {
                     font_scale * cell_scale,
                     1.0,
                     indent + col_x[column],
-                    lines,
-                    placed,
+                    scratch,
                     cursor,
                     nominal * cell_scale,
                 );
@@ -1458,7 +1510,7 @@ impl RichTextLayout {
             }
         }
         // Header backgrounds use the row height, now known.
-        tables.push(TableGrid {
+        scratch.tables.push(TableGrid {
             top: table_top,
             height: (*cursor - table_top).max(0.0),
             col_x: col_x.iter().map(|x| indent + x).collect(),
@@ -1472,6 +1524,7 @@ impl RichTextLayout {
             && self.images.is_empty()
             && self.tables.is_empty()
             && self.codes.is_empty()
+            && self.boxes.is_empty()
             && self.placed_anims.is_empty()
         {
             return;
@@ -1485,14 +1538,39 @@ impl RichTextLayout {
         let scale = CARD_TEXT_SCALE * self.font_scale;
         let ruby_scale = scale * CARD_RUBY_SCALE;
         if !self.prepare_visible(origin, scale, ruby_scale) {
-            // The atlas is a cache, not a hard limit. If a long card or a very
-            // large font filled it, start a fresh atlas and try this frame
-            // again before drawing anything.
             Ui::reset_card_text();
             let _ = self.prepare_visible(origin, scale, ruby_scale);
         }
         Ui::commit_card_text();
         let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0;
+        for bx in &self.boxes {
+            let top = origin + bx.top;
+            if top > TOP_HEIGHT || top + bx.height < 0.0 {
+                continue;
+            }
+            let x = content_left + bx.x;
+            if let Some(bg) = bx.style.bg {
+                let alpha = bx.style.bg_alpha.max(22);
+                Ui::draw_rounded_rect(
+                    x,
+                    top,
+                    bx.width,
+                    bx.height,
+                    4.0,
+                    blend_over(theme().bg_top, bg, alpha),
+                );
+            }
+            if let Some(border) = bx.style.border_all {
+                let bc = rgba(border[0], border[1], border[2], 200);
+                Ui::draw_line(x, top, x + bx.width, top, 1.0, bc);
+                Ui::draw_line(x, top + bx.height, x + bx.width, top + bx.height, 1.0, bc);
+                Ui::draw_line(x + bx.width, top, x + bx.width, top + bx.height, 1.0, bc);
+                Ui::draw_line(x, top, x, top + bx.height, 1.0, bc);
+            }
+            if let Some(left) = bx.style.border_left {
+                Ui::draw_rect(x, top, 2.5, bx.height, rgba(left[0], left[1], left[2], 255));
+            }
+        }
         for grid in &self.tables {
             for (x, y, w, h) in &grid.header {
                 Ui::draw_rect(content_left + x, origin + y, *w, *h, theme().surface);
@@ -1523,15 +1601,17 @@ impl RichTextLayout {
             let pitch_top = top + line.pitch_height + line.upper;
             let text_top = pitch_top + line.ruby_height;
             if let Some(marker) = &line.marker {
-                Ui::draw_card_text(
-                    line_left,
-                    text_top,
-                    scale,
-                    theme().text_muted,
-                    marker,
-                    false,
-                    false,
-                );
+                if !marker.is_empty() {
+                    Ui::draw_card_text(
+                        line_left,
+                        text_top,
+                        scale,
+                        theme().text_muted,
+                        marker,
+                        false,
+                        false,
+                    );
+                }
             }
             let mut previous_piece: Option<&CardPiece> = None;
             let mut previous_base_right = 0.0;
@@ -1559,9 +1639,16 @@ impl RichTextLayout {
                     Some(DiffClass::Bad) => (rgba(255, 255, 255, 255), Some(theme().diff_bad)),
                     Some(DiffClass::Missed) => (theme().text_muted, None),
                     None => {
-                        let color = if let Some(rgb) = piece.style.color {
-                            rgba(rgb[0], rgb[1], rgb[2], 255)
-                        } else if piece.style.cloze_inactive {
+                        let color = if let Some(pill) = piece.style.pill {
+                            pill_text_color(piece.style.color, pill, theme().text)
+                        } else if let Some(rgb) = piece.style.color {
+                            contrast_text_color(
+                                rgb,
+                                theme().bg_top,
+                                theme().text,
+                                piece.style.muted,
+                            )
+                        } else if piece.style.cloze_inactive || piece.style.muted {
                             theme().text_muted
                         } else if piece.style.cloze {
                             theme().new
@@ -1573,6 +1660,48 @@ impl RichTextLayout {
                         (color, None)
                     }
                 };
+                if let Some(pill) = piece.style.pill {
+                    let pill_h = (17.0 * self.font_scale * piece.scale).max(14.5 * self.font_scale);
+                    let pill_y = y - 1.5 * self.font_scale;
+                    if let Some(border) = pill.border {
+                        Ui::draw_rounded_rect(
+                            x,
+                            pill_y,
+                            piece.width,
+                            pill_h,
+                            4.0,
+                            blend_over(theme().bg_top, border, 220),
+                        );
+                        if pill.bg_alpha >= 16 {
+                            Ui::draw_rounded_rect(
+                                x + 1.0,
+                                pill_y + 1.0,
+                                (piece.width - 2.0).max(2.0),
+                                (pill_h - 2.0).max(2.0),
+                                3.0,
+                                blend_over(theme().bg_top, pill.bg, pill.bg_alpha.max(45)),
+                            );
+                        } else {
+                            Ui::draw_rounded_rect(
+                                x + 1.0,
+                                pill_y + 1.0,
+                                (piece.width - 2.0).max(2.0),
+                                (pill_h - 2.0).max(2.0),
+                                3.0,
+                                theme().surface,
+                            );
+                        }
+                    } else if pill.bg_alpha >= 16 {
+                        Ui::draw_rounded_rect(
+                            x,
+                            pill_y,
+                            piece.width,
+                            pill_h,
+                            4.0,
+                            blend_over(theme().bg_top, pill.bg, pill.bg_alpha.max(45)),
+                        );
+                    }
+                }
                 let highlight = diff_bg.or_else(|| {
                     piece
                         .style
@@ -1650,6 +1779,13 @@ impl RichTextLayout {
                 }
                 if piece.style.pitch.high || piece.style.pitch.downstep || piece.style.pitch.upstep
                 {
+                    let pitch_color = piece
+                        .style
+                        .pitch
+                        .color
+                        .or(piece.style.color)
+                        .map(|rgb| contrast_text_color(rgb, theme().bg_top, theme().pitch, false))
+                        .unwrap_or(theme().pitch);
                     if piece.style.pitch.high {
                         let bar_start = match previous_piece {
                             Some(previous)
@@ -1667,7 +1803,7 @@ impl RichTextLayout {
                             base_x + piece.base_width,
                             bar_y,
                             1.5,
-                            theme().pitch,
+                            pitch_color,
                         );
                     }
                     if piece.style.pitch.downstep {
@@ -1677,7 +1813,7 @@ impl RichTextLayout {
                             base_x + piece.base_width,
                             y + 2.0 * self.font_scale,
                             1.5,
-                            theme().pitch,
+                            pitch_color,
                         );
                     }
                     if piece.style.pitch.upstep {
@@ -1687,7 +1823,7 @@ impl RichTextLayout {
                             base_x,
                             bar_y,
                             1.5,
-                            theme().pitch,
+                            pitch_color,
                         );
                     }
                 }
@@ -1746,8 +1882,13 @@ impl RichTextLayout {
             if top > TOP_HEIGHT || top + image.height < 0.0 {
                 continue;
             }
-            let x = (TOP_WIDTH - image.width) / 2.0;
-            Ui::media_draw(image.texture, x, top, image.width, image.height);
+            Ui::media_draw(
+                image.texture,
+                content_left + image.x,
+                top,
+                image.width,
+                image.height,
+            );
         }
         for code in &self.codes {
             let top = origin + code.top;
@@ -1931,13 +2072,33 @@ impl RichTextLayout {
             }
             PitchMarker::Accent(number) => {
                 let text = number.to_string();
-                let text_scale = scale * 0.62;
+                let text_scale = scale * 0.65;
                 let text_width = Ui::get_card_text_width(text_scale, &text);
+                let badge_h = 12.0 * factor;
+                let badge_w = (text_width + 5.0 * factor).max(badge_h);
+                let badge_x = x + (width - badge_w) / 2.0;
+                let badge_y = text_top + 1.5 * factor;
+                Ui::draw_rounded_rect(
+                    badge_x,
+                    badge_y,
+                    badge_w,
+                    badge_h,
+                    badge_h * 0.5,
+                    theme().border,
+                );
+                Ui::draw_rounded_rect(
+                    badge_x + 1.0,
+                    badge_y + 1.0,
+                    badge_w - 2.0,
+                    badge_h - 2.0,
+                    (badge_h - 2.0) * 0.5,
+                    theme().surface,
+                );
                 Ui::draw_card_text(
-                    x + (width - text_width) / 2.0,
-                    text_top + 1.0,
+                    badge_x + (badge_w - text_width) / 2.0,
+                    badge_y,
                     text_scale,
-                    theme().pitch,
+                    theme().text,
                     &text,
                     false,
                     false,
@@ -1967,21 +2128,21 @@ impl RichTextLayout {
         font_scale: f32,
         block_scale: f32,
         indent: f32,
-        lines: &mut Vec<CardLine>,
-        placed: &mut Vec<PlacedAnim>,
+        scratch: &mut LayoutScratch<'_>,
         cursor: &mut f32,
         nominal: f32,
     ) {
         let scale = CARD_TEXT_SCALE * font_scale;
         let marker_width = marker
             .as_ref()
+            .filter(|m| !m.is_empty())
             .map(|marker| Ui::get_card_text_width(scale, marker))
             .unwrap_or(0.0);
         let content_left = indent
-            + if marker.is_some() {
-                marker_width + 4.0 * font_scale
-            } else {
-                0.0
+            + match marker.as_deref() {
+                Some("") => 6.0 * font_scale,
+                Some(_) => marker_width + 4.0 * font_scale,
+                None => 0.0,
             };
         let metrics = CardMetrics {
             width,
@@ -1992,6 +2153,7 @@ impl RichTextLayout {
         };
         let mut draft = LineDraft::new(content_left, marker);
         let mut pending_space = false;
+        let lines = &mut scratch.lines;
         for inline in inlines {
             match inline {
                 Inline::Text { text, style } => {
@@ -2089,7 +2251,44 @@ impl RichTextLayout {
                     );
                 }
                 Inline::Media { path, .. } => {
-                    self.place_anim(path, metrics, &mut draft, lines, placed, cursor);
+                    self.place_anim(
+                        path,
+                        metrics,
+                        &mut draft,
+                        lines,
+                        &mut scratch.placed,
+                        cursor,
+                    );
+                }
+                Inline::Image { src, max_w, max_h } => {
+                    scratch.saw_img_tag = true;
+                    if max_w.is_some_and(|w| w <= 20.0) && max_h.is_some_and(|h| h <= 20.0) {
+                        continue;
+                    }
+                    if scratch.images.len() >= MEDIA_IMAGE_SLOTS {
+                        continue;
+                    }
+                    if let Some(resolved) = resolve_image_path(scratch.image_paths, src) {
+                        if draft.has_content() || draft.marker.is_some() {
+                            finish_line(&mut draft, lines, cursor, metrics, true);
+                        }
+                        scratch.used_images.insert(resolved.to_owned());
+                        let prev = scratch.images.len();
+                        place_resolved_image(
+                            resolved,
+                            metrics.indent,
+                            (metrics.width - metrics.indent).max(32.0),
+                            *max_w,
+                            *max_h,
+                            &mut scratch.images,
+                            cursor,
+                            &mut scratch.busy,
+                        );
+                        if scratch.images.len() > prev {
+                            *cursor += scratch.block_gap;
+                        }
+                        pending_space = false;
+                    }
                 }
                 Inline::Break => {
                     let force = !(draft.pieces.is_empty() && draft.marker.is_none());
@@ -2125,8 +2324,16 @@ impl RichTextLayout {
         if text.is_empty() {
             return;
         }
+        let css_scale = style.scale.map(|s| s as f32 / 100.0).unwrap_or_else(|| {
+            if style.pill.is_some() {
+                0.86
+            } else {
+                1.0
+            }
+        });
+        let eff_block_scale = block_scale * css_scale;
         if ruby.is_some() {
-            let multiplier = block_scale * script_multiplier(text);
+            let multiplier = eff_block_scale * script_multiplier(text);
             self.place_run(
                 text,
                 style,
@@ -2147,7 +2354,22 @@ impl RichTextLayout {
                 text,
                 accent,
                 &clean,
-                block_scale,
+                eff_block_scale,
+                metrics,
+                draft,
+                pending_space,
+                lines,
+                cursor,
+            );
+            return;
+        }
+        if style.pill.is_some() {
+            let multiplier = eff_block_scale * script_multiplier(text);
+            self.place_run(
+                text,
+                style,
+                None,
+                multiplier,
                 metrics,
                 draft,
                 pending_space,
@@ -2158,7 +2380,7 @@ impl RichTextLayout {
         }
         for (start, end) in script_runs(text) {
             let run = &text[start..end];
-            let multiplier = block_scale
+            let multiplier = eff_block_scale
                 * if is_cjk_text(run) {
                     CARD_CJK_SCALE
                 } else {
@@ -2261,7 +2483,13 @@ impl RichTextLayout {
         let width = match marker {
             PitchMarker::High => 10.0 * factor,
             PitchMarker::Up | PitchMarker::Down => 7.0 * factor,
-            PitchMarker::Accent(_) => 10.0 * factor,
+            PitchMarker::Accent(n) => {
+                if *n >= 10 {
+                    15.0 * factor
+                } else {
+                    13.0 * factor
+                }
+            }
             PitchMarker::Graph(_) => 30.0 * factor,
         };
         if draft.has_content() && draft.x + width > metrics.width {
@@ -2440,6 +2668,11 @@ impl RichTextLayout {
         );
         let space_gap = if draft.has_content() && *pending_space {
             self.space_width(metrics)
+        } else if draft.has_content()
+            && style.pill.is_some()
+            && draft.pieces.last().is_some_and(|p| p.style.pill.is_some())
+        {
+            3.0 * metrics.font_scale
         } else {
             0.0
         };
@@ -2631,6 +2864,9 @@ impl RichTextLayout {
         if style.bold {
             width += 0.7 * font_scale * scale_multiplier;
         }
+        if style.pill.is_some() {
+            width = (width + 10.0 * font_scale).max(16.0 * font_scale);
+        }
         let ruby_scale = CARD_TEXT_SCALE * font_scale * CARD_RUBY_SCALE * scale_multiplier;
         let ruby_width = ruby
             .map(|reading| Ui::get_card_text_width(ruby_scale, reading))
@@ -2805,12 +3041,47 @@ fn block_text(content: &[Inline]) -> String {
             Inline::Text { text: value, .. } => text.push_str(value),
             Inline::Ruby { base, .. } | Inline::PitchWord { base, .. } => text.push_str(base),
             Inline::HintToggle { label, .. } => text.push_str(label),
-            Inline::Marker(_) => {}
+            Inline::Marker(_) | Inline::TypeInput | Inline::Media { .. } | Inline::Image { .. } => {
+            }
             Inline::Break => text.push(' '),
-            Inline::TypeInput | Inline::Media { .. } => {}
         }
     }
     text
+}
+
+fn is_metadata_block(content: &[Inline]) -> bool {
+    let mut has_text = false;
+    let mut all_small_or_muted_or_pill = true;
+    for inline in content {
+        if let Inline::Text { text, style } = inline {
+            if !text.trim().is_empty() {
+                has_text = true;
+                if style.scale.is_none_or(|s| s >= 95) && !style.muted && style.pill.is_none() {
+                    all_small_or_muted_or_pill = false;
+                }
+            }
+        } else if matches!(inline, Inline::Ruby { .. } | Inline::PitchWord { .. }) {
+            has_text = true;
+            all_small_or_muted_or_pill = false;
+        }
+    }
+    if has_text && all_small_or_muted_or_pill {
+        return true;
+    }
+    let text = block_text(content);
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 10 {
+        return false;
+    }
+    let mut has_digit = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+        } else if !(ch.is_ascii_punctuation() || ch.is_whitespace() || ch == '#' || ch == '★') {
+            return false;
+        }
+    }
+    has_digit
 }
 
 fn headword_multiplier(content: &[Inline]) -> f32 {
@@ -2821,6 +3092,138 @@ fn headword_multiplier(content: &[Inline]) -> f32 {
     } else {
         1.0
     }
+}
+
+fn rgb_luma(rgb: [u8; 3]) -> i32 {
+    (299 * rgb[0] as i32 + 587 * rgb[1] as i32 + 114 * rgb[2] as i32) / 1000
+}
+
+fn packed_rgb(packed: u32) -> [u8; 3] {
+    [packed as u8, (packed >> 8) as u8, (packed >> 16) as u8]
+}
+
+fn blend_over(bg_packed: u32, fg: [u8; 3], alpha: u8) -> u32 {
+    let bg = packed_rgb(bg_packed);
+    let a = alpha as u16;
+    let inv = 255 - a;
+    rgba(
+        ((fg[0] as u16 * a + bg[0] as u16 * inv) / 255) as u8,
+        ((fg[1] as u16 * a + bg[1] as u16 * inv) / 255) as u8,
+        ((fg[2] as u16 * a + bg[2] as u16 * inv) / 255) as u8,
+        255,
+    )
+}
+
+fn contrast_text_color(rgb: [u8; 3], bg_packed: u32, fallback: u32, muted: bool) -> u32 {
+    let bg = packed_rgb(bg_packed);
+    let mut out = if (rgb_luma(rgb) - rgb_luma(bg)).abs() < 36 {
+        packed_rgb(fallback)
+    } else {
+        rgb
+    };
+    if muted {
+        let blend = |a: u8, b: u8| -> u8 { ((a as u16 * 55 + b as u16 * 45) / 100) as u8 };
+        out = [
+            blend(out[0], bg[0]),
+            blend(out[1], bg[1]),
+            blend(out[2], bg[2]),
+        ];
+    }
+    rgba(out[0], out[1], out[2], 255)
+}
+
+fn pill_text_color(
+    explicit: Option<[u8; 3]>,
+    pill: super::review_text::PillStyle,
+    fallback: u32,
+) -> u32 {
+    if pill.bg_alpha >= 100 {
+        let bg_luma = rgb_luma(pill.bg);
+        if let Some(rgb) = explicit {
+            if (rgb_luma(rgb) - bg_luma).abs() >= 45 {
+                return rgba(rgb[0], rgb[1], rgb[2], 255);
+            }
+        }
+        if bg_luma >= 145 {
+            rgba(20, 20, 20, 255)
+        } else {
+            rgba(255, 255, 255, 255)
+        }
+    } else if let Some(rgb) = explicit {
+        contrast_text_color(rgb, theme().bg_top, fallback, false)
+    } else {
+        fallback
+    }
+}
+
+fn resolve_image_path<'a>(images: &'a [String], src: &str) -> Option<&'a str> {
+    let target = image_name(src);
+    let unescaped = target.replace("%20", " ");
+    for path in images {
+        let name = image_name(path);
+        if name == target || name == unescaped || name.eq_ignore_ascii_case(target) {
+            return Some(path.as_str());
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_resolved_image(
+    path: &str,
+    indent: f32,
+    avail_width: f32,
+    max_w: Option<f32>,
+    max_h: Option<f32>,
+    out: &mut Vec<CardImage>,
+    cursor: &mut f32,
+    busy: &mut bool,
+) {
+    let (texture, image_w, image_h) = match Ui::media_image(path) {
+        ImageLoad::Ready(texture, image_w, image_h) => (texture, image_w, image_h),
+        ImageLoad::Missing => {
+            let diag = super::media_diag(path);
+            super::log_media_once(
+                &format!("image|{path}|{diag}"),
+                &format!("IMAGE load fail file={} {diag}", image_name(path)),
+            );
+            return;
+        }
+        ImageLoad::Busy => {
+            *busy = true;
+            return;
+        }
+    };
+    if image_w <= 0 || image_h <= 0 {
+        return;
+    }
+    let max_width = max_w
+        .unwrap_or(avail_width - 8.0)
+        .min(avail_width - 8.0)
+        .max(16.0);
+    let max_height = max_h
+        .unwrap_or(TOP_HEIGHT - 60.0)
+        .min(TOP_HEIGHT - 60.0)
+        .max(16.0);
+    let max_up = if image_w <= 36 && image_h <= 36 {
+        1.2
+    } else {
+        4.0
+    };
+    let scale = (max_width / image_w as f32)
+        .min(max_height / image_h as f32)
+        .min(max_up);
+    let draw_w = image_w as f32 * scale;
+    let draw_h = image_h as f32 * scale;
+    let x = indent + (avail_width - draw_w).max(0.0) / 2.0;
+    out.push(CardImage {
+        texture,
+        top: *cursor,
+        x,
+        width: draw_w,
+        height: draw_h,
+    });
+    *cursor += draw_h;
 }
 
 /// Plain text of a table cell for width measurement.
@@ -2870,7 +3273,7 @@ fn collect_hint_ids(blocks: &[Block]) -> Vec<u16> {
                     }
                     walk(content, ids);
                 }
-                Block::Quote(inner) => walk(inner, ids),
+                Block::Quote(inner) | Block::Callout { content: inner, .. } => walk(inner, ids),
                 Block::Code { .. } | Block::Rule => {}
             }
         }
@@ -2907,7 +3310,9 @@ fn collect_media<'a>(blocks: &'a [Block], out: &mut Vec<(String, bool, bool)>) {
                 }
             }
             Block::Hint { content, .. } => collect_media(content, out),
-            Block::Quote(inner) => collect_media(inner, out),
+            Block::Quote(inner) | Block::Callout { content: inner, .. } => {
+                collect_media(inner, out)
+            }
             Block::Code { .. } | Block::Rule => {}
         }
     }

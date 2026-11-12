@@ -28,7 +28,6 @@ use regex::Regex;
 
 use super::i18n::tr;
 use super::review_text::media_kind_for_filename;
-
 pub use super::review_text::MediaKind;
 
 pub const PATH: &str = "sdmc:/3ds/anki-3ds/prototype.anki2";
@@ -258,6 +257,7 @@ pub struct OfferedCard {
     pub intervals: Vec<String>,
     pub question_html: String,
     pub answer_html: String,
+    pub css: String,
     pub cloze_answer_html: Option<String>,
     pub type_answer: Option<TypeAnswer>,
     pub question_media: Vec<MediaRef>,
@@ -633,6 +633,7 @@ impl Backend {
             intervals,
             question_html,
             answer_html,
+            css: rendered.css,
             cloze_answer_html,
             type_answer,
             question_media,

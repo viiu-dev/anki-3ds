@@ -2164,20 +2164,27 @@ void ui_draw_rect(float x, float y, float w, float h, uint32_t color) {
 
 void ui_draw_rounded_rect(float x, float y, float w, float h, float radius, uint32_t color) {
     if (w <= 0.0f || h <= 0.0f) return;
-    if (radius > w * 0.5f) radius = w * 0.5f;
-    if (radius > h * 0.5f) radius = h * 0.5f;
+    float ix = roundf(x);
+    float iy = roundf(y);
+    float iw = roundf(x + w) - ix;
+    float ih = roundf(y + h) - iy;
+    if (iw <= 0.0f || ih <= 0.0f) return;
+    if (radius > iw * 0.5f) radius = iw * 0.5f;
+    if (radius > ih * 0.5f) radius = ih * 0.5f;
     if (radius < 0.0f) radius = 0.0f;
     if (radius <= 0.5f) {
-        ui_draw_rect(x, y, w, h, color);
+        ui_draw_rect(ix, iy, iw, ih, color);
         return;
     }
-    ui_draw_rect(x + radius, y, w - radius * 2.0f, h, color);
-    ui_draw_rect(x, y + radius, radius, h - radius * 2.0f, color);
-    ui_draw_rect(x + w - radius, y + radius, radius, h - radius * 2.0f, color);
-    ui_draw_circle(x + radius, y + radius, radius, color);
-    ui_draw_circle(x + w - radius, y + radius, radius, color);
-    ui_draw_circle(x + radius, y + h - radius, radius, color);
-    ui_draw_circle(x + w - radius, y + h - radius, radius, color);
+    float r = roundf(radius);
+    if (r < 1.0f) r = 1.0f;
+    ui_draw_rect(ix + r, iy, iw - r * 2.0f, ih, color);
+    ui_draw_rect(ix, iy + r, r, ih - r * 2.0f, color);
+    ui_draw_rect(ix + iw - r, iy + r, r, ih - r * 2.0f, color);
+    ui_draw_circle(ix + r, iy + r, r, color);
+    ui_draw_circle(ix + iw - r, iy + r, r, color);
+    ui_draw_circle(ix + r, iy + ih - r, r, color);
+    ui_draw_circle(ix + iw - r, iy + ih - r, r, color);
 }
 
 void ui_draw_rect_gradient(float x, float y, float w, float h, uint32_t c_top, uint32_t c_bot) {

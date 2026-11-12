@@ -356,6 +356,10 @@ pub fn kind() -> ThemeKind {
     ThemeKind::from_index(INDEX.load(Ordering::Relaxed))
 }
 
+pub fn is_dark() -> bool {
+    matches!(kind(), ThemeKind::Dark | ThemeKind::Black)
+}
+
 pub fn accent_kind() -> AccentKind {
     AccentKind::from_index(ACCENT_INDEX.load(Ordering::Relaxed))
 }

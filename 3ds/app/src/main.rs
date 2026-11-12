@@ -4787,6 +4787,8 @@ fn main() {
                     .collect();
                 top_card.set_text(
                     html,
+                    &card.css,
+                    theme::is_dark(),
                     &images,
                     CARD_WIDTH,
                     i18n::font_scale_factor(),
