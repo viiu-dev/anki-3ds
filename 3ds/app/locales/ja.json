@@ -361,5 +361,19 @@
     "You are ready to study!": "準備が完了しました！",
     "Reopen anytime in Settings > System.": "設定 > システムからいつでも再表示。",
     "Finish": "完了",
-    "Log in and Sync": "ログインして同期"
+    "Log in and Sync": "ログインして同期",
+    "Animations": "アニメーション",
+    "Animations: {0}": "アニメーション: {0}",
+    "Smooth transitions and button feedback.": "滑らかな画面切替とボタン反応を有効にします。",
+    "Card transitions": "カードの切替",
+    "Button feedback": "ボタンの反応",
+    "Menu transitions": "メニューの切替",
+    "Deck completion": "デッキ完了演出",
+    "Fade and slide when revealing or advancing cards.": "解答表示や次のカードへの切替にフェードとスライドを使います。",
+    "Press and release feedback on buttons and touch.": "タッチや物理ボタンの押下時に視覚効果を表示します。",
+    "Smooth transitions between menus and screens.": "メニューや各画面の移動を滑らかに表示します。",
+    "Celebratory animation when finishing a deck.": "デッキの復習を終えたときにお祝い演出を表示します。",
+    "All animations": "すべてのアニメーション",
+    "A or LEFT/RIGHT toggles. B returns.": "A または左右で切替・B で戻る",
+    "Deck complete!": "デッキ完了！"
 }

@@ -361,5 +361,19 @@
     "You are ready to study!": "Всё готово к обучению!",
     "Reopen anytime in Settings > System.": "Доступно в Настройки > Система.",
     "Finish": "Готово",
-    "Log in and Sync": "Войти и синхрониз."
+    "Log in and Sync": "Войти и синхрониз.",
+    "Animations": "Анимации",
+    "Animations: {0}": "Анимации: {0}",
+    "Smooth transitions and button feedback.": "Плавные переходы и отклик кнопок.",
+    "Card transitions": "Переходы карт",
+    "Button feedback": "Отклик кнопок",
+    "Menu transitions": "Переходы меню",
+    "Deck completion": "Завершение колоды",
+    "Fade and slide when revealing or advancing cards.": "Плавное появление и сдвиг при смене карт.",
+    "Press and release feedback on buttons and touch.": "Отклик при нажатии кнопок и касании экрана.",
+    "Smooth transitions between menus and screens.": "Плавные переходы между меню и экранами.",
+    "Celebratory animation when finishing a deck.": "Праздничная анимация по завершении колоды.",
+    "All animations": "Все анимации",
+    "A or LEFT/RIGHT toggles. B returns.": "A или ВЛЕВО/ВПРАВО: вкл/выкл. B: назад.",
+    "Deck complete!": "Колода завершена!"
 }

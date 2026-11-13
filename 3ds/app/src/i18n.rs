@@ -64,6 +64,7 @@ pub fn init() {
     load_spacing();
     load_toolbar();
     load_quickstart_done();
+    load_animations();
     let saved = fs::read_to_string(PATH)
         .ok()
         .and_then(|text| index_of(text.trim()));
@@ -794,6 +795,155 @@ pub fn set_quickstart_done(value: bool) -> io::Result<()> {
 
 fn load_quickstart_done() {
     load_bool_setting("quickstart_done", &QUICKSTART_DONE);
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimKind {
+    CardTransitions = 0,
+    ButtonFeedback = 1,
+    MenuTransitions = 2,
+    DeckCelebration = 3,
+}
+
+impl AnimKind {
+    pub const ALL: [AnimKind; 4] = [
+        AnimKind::CardTransitions,
+        AnimKind::ButtonFeedback,
+        AnimKind::MenuTransitions,
+        AnimKind::DeckCelebration,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            AnimKind::CardTransitions => "card_transitions",
+            AnimKind::ButtonFeedback => "button_feedback",
+            AnimKind::MenuTransitions => "menu_transitions",
+            AnimKind::DeckCelebration => "deck_celebration",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AnimKind::CardTransitions => "Card transitions",
+            AnimKind::ButtonFeedback => "Button feedback",
+            AnimKind::MenuTransitions => "Menu transitions",
+            AnimKind::DeckCelebration => "Deck completion",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            AnimKind::CardTransitions => "Fade and slide when revealing or advancing cards.",
+            AnimKind::ButtonFeedback => "Press and release feedback on buttons and touch.",
+            AnimKind::MenuTransitions => "Smooth transitions between menus and screens.",
+            AnimKind::DeckCelebration => "Celebratory animation when finishing a deck.",
+        }
+    }
+}
+
+const ANIM_MASTER_BIT: u8 = 1;
+const ANIM_ALL_ITEMS_MASK: u8 = 0b0001_1110;
+const DEFAULT_ANIM_STATE: u8 = ANIM_ALL_ITEMS_MASK;
+static ANIM_STATE: AtomicU8 = AtomicU8::new(DEFAULT_ANIM_STATE);
+
+fn anim_item_bit(kind: AnimKind) -> u8 {
+    1 << (kind as u8 + 1)
+}
+
+pub fn animations_enabled() -> bool {
+    ANIM_STATE.load(Ordering::Relaxed) & ANIM_MASTER_BIT != 0
+}
+
+pub fn anim_item_enabled(kind: AnimKind) -> bool {
+    ANIM_STATE.load(Ordering::Relaxed) & anim_item_bit(kind) != 0
+}
+
+pub fn anim_active(kind: AnimKind) -> bool {
+    let state = ANIM_STATE.load(Ordering::Relaxed);
+    (state & ANIM_MASTER_BIT != 0) && (state & anim_item_bit(kind) != 0)
+}
+
+pub fn toggle_animations() -> io::Result<bool> {
+    let mut state = ANIM_STATE.load(Ordering::Relaxed);
+    let value = state & ANIM_MASTER_BIT == 0;
+    if value {
+        state |= ANIM_MASTER_BIT;
+        if state & ANIM_ALL_ITEMS_MASK == 0 {
+            state |= ANIM_ALL_ITEMS_MASK;
+            ANIM_STATE.store(state, Ordering::Relaxed);
+            save_animations_disabled()?;
+        }
+    } else {
+        state &= !ANIM_MASTER_BIT;
+    }
+    ANIM_STATE.store(state, Ordering::Relaxed);
+    write_setting("animations", serde_json::json!(value))?;
+    Ok(value)
+}
+
+pub fn toggle_anim_item(kind: AnimKind) -> io::Result<bool> {
+    let mut state = ANIM_STATE.load(Ordering::Relaxed);
+    let bit = anim_item_bit(kind);
+    let value = state & bit == 0;
+    if value {
+        state |= bit;
+        if state & ANIM_MASTER_BIT == 0 {
+            state |= ANIM_MASTER_BIT;
+            write_setting("animations", serde_json::json!(true))?;
+        }
+    } else {
+        state &= !bit;
+        if state & ANIM_ALL_ITEMS_MASK == 0 {
+            state &= !ANIM_MASTER_BIT;
+            write_setting("animations", serde_json::json!(false))?;
+        }
+    }
+    ANIM_STATE.store(state, Ordering::Relaxed);
+    save_animations_disabled()?;
+    Ok(value)
+}
+
+fn save_animations_disabled() -> io::Result<()> {
+    let disabled: Vec<&str> = AnimKind::ALL
+        .iter()
+        .filter(|kind| !anim_item_enabled(**kind))
+        .map(|kind| kind.key())
+        .collect();
+    write_setting("animations_disabled", serde_json::json!(disabled))
+}
+
+fn load_animations() {
+    let mut state = DEFAULT_ANIM_STATE;
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        ANIM_STATE.store(state, Ordering::Relaxed);
+        return;
+    };
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+        ANIM_STATE.store(state, Ordering::Relaxed);
+        return;
+    };
+    if let Some(enabled) = document.get("animations").and_then(|v| v.as_bool()) {
+        if enabled {
+            state |= ANIM_MASTER_BIT;
+        } else {
+            state &= !ANIM_MASTER_BIT;
+        }
+    }
+    if let Some(disabled) = document
+        .get("animations_disabled")
+        .and_then(|v| v.as_array())
+    {
+        for kind in AnimKind::ALL {
+            let is_off = disabled.iter().any(|v| v.as_str() == Some(kind.key()));
+            if is_off {
+                state &= !anim_item_bit(kind);
+            } else {
+                state |= anim_item_bit(kind);
+            }
+        }
+    }
+    ANIM_STATE.store(state, Ordering::Relaxed);
 }
 
 pub fn tr(message: &'static str) -> &'static str {

@@ -361,5 +361,19 @@
     "You are ready to study!": "Tutto pronto per studiare!",
     "Reopen anytime in Settings > System.": "Riapri da Impostazioni > Sistema.",
     "Finish": "Fine",
-    "Log in and Sync": "Accedi e sincronizza"
+    "Log in and Sync": "Accedi e sincronizza",
+    "Animations": "Animazioni",
+    "Animations: {0}": "Animazioni: {0}",
+    "Smooth transitions and button feedback.": "Transizioni fluide e feedback ai pulsanti.",
+    "Card transitions": "Transizioni carte",
+    "Button feedback": "Feedback pulsanti",
+    "Menu transitions": "Transizioni menu",
+    "Deck completion": "Fine mazzo",
+    "Fade and slide when revealing or advancing cards.": "Dissolvenza e scorrimento tra carte e risposte.",
+    "Press and release feedback on buttons and touch.": "Feedback visivo su pulsanti fisici e tocco.",
+    "Smooth transitions between menus and screens.": "Transizioni morbide tra menu e schermate.",
+    "Celebratory animation when finishing a deck.": "Animazione celebrativa al termine del mazzo.",
+    "All animations": "Tutte le animazioni",
+    "A or LEFT/RIGHT toggles. B returns.": "A o SIN/DES attiva. B indietro.",
+    "Deck complete!": "Mazzo completato!"
 }

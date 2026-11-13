@@ -361,5 +361,19 @@
     "You are ready to study!": "You are ready to study!",
     "Reopen anytime in Settings > System.": "Reopen anytime in Settings > System.",
     "Finish": "Finish",
-    "Log in and Sync": "Log in and Sync"
+    "Log in and Sync": "Log in and Sync",
+    "Animations": "Animations",
+    "Animations: {0}": "Animations: {0}",
+    "Smooth transitions and button feedback.": "Smooth transitions and button feedback.",
+    "Card transitions": "Card transitions",
+    "Button feedback": "Button feedback",
+    "Menu transitions": "Menu transitions",
+    "Deck completion": "Deck completion",
+    "Fade and slide when revealing or advancing cards.": "Fade and slide when revealing or advancing cards.",
+    "Press and release feedback on buttons and touch.": "Press and release feedback on buttons and touch.",
+    "Smooth transitions between menus and screens.": "Smooth transitions between menus and screens.",
+    "Celebratory animation when finishing a deck.": "Celebratory animation when finishing a deck.",
+    "All animations": "All animations",
+    "A or LEFT/RIGHT toggles. B returns.": "A or LEFT/RIGHT toggles. B returns.",
+    "Deck complete!": "Deck complete!"
 }

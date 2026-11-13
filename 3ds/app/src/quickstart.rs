@@ -163,38 +163,47 @@ fn draw_top_preferences(selected: usize) {
             tr(if i18n::autoplay_audio() { "On" } else { "Off" }),
             tr("Play card audio automatically."),
         ),
+        (
+            tr("Animations"),
+            tr(if i18n::animations_enabled() {
+                "On"
+            } else {
+                "Off"
+            }),
+            tr("Smooth transitions and button feedback."),
+        ),
     ];
     for (i, &(title, value, desc)) in cards.iter().enumerate() {
-        let cy = 36.0 + i as f32 * 64.0;
+        let cy = 34.0 + i as f32 * 48.0;
         let active = i == selected;
         draw_card(
             10.0,
             cy,
             380.0,
-            56.0,
+            44.0,
             if active { th.accent } else { th.border },
             if active { th.row_selected } else { th.surface },
         );
         Ui::draw_text(
             20.0,
-            cy + 8.0,
-            0.48,
+            cy + 5.0,
+            0.45,
             th.text,
-            &Ui::ellipsize(title, 0.48, 220.0),
+            &Ui::ellipsize(title, 0.45, 220.0),
         );
         Ui::draw_text_right(
             380.0,
-            cy + 9.0,
-            0.44,
+            cy + 6.0,
+            0.42,
             if active { th.accent } else { th.text_muted },
-            &Ui::ellipsize(value, 0.44, 130.0),
+            &Ui::ellipsize(value, 0.42, 130.0),
         );
         Ui::draw_text(
             20.0,
-            cy + 30.0,
-            0.40,
+            cy + 24.0,
+            0.38,
             th.text_muted,
-            &Ui::ellipsize(desc, 0.40, 360.0),
+            &Ui::ellipsize(desc, 0.38, 360.0),
         );
     }
 }
@@ -332,15 +341,23 @@ pub fn draw_bottom(step: usize, selected: usize) {
                     "Auto-play audio: {0}",
                     &[tr(if i18n::autoplay_audio() { "On" } else { "Off" })],
                 ),
+                i18n::format(
+                    "Animations: {0}",
+                    &[tr(if i18n::animations_enabled() {
+                        "On"
+                    } else {
+                        "Off"
+                    })],
+                ),
             ];
             for (i, label) in rows.iter().enumerate() {
-                let y = 50.0 + i as f32 * 40.0;
+                let y = 46.0 + i as f32 * 31.0;
                 let style = if i == selected { 0 } else { 6 };
-                Ui::draw_button(12.0, y, 296.0, 32.0, label, None, style, false);
+                Ui::draw_button(12.0, y, 296.0, 27.0, label, None, style, false);
             }
             Ui::fit_text(
                 160.0,
-                172.0,
+                175.0,
                 0.38,
                 296.0,
                 th.text_muted,
@@ -416,9 +433,14 @@ pub fn touch_hit(step: usize, x: f32, y: f32) -> TouchAction {
             TouchAction::None
         }
         1 | 2 => {
-            for i in 0..3 {
-                let by = 50.0 + i as f32 * 40.0;
-                if (12.0..308.0).contains(&x) && y >= by && y < by + 32.0 {
+            let (rows, y0, step_h, h) = if step == 1 {
+                (3, 50.0, 40.0, 32.0)
+            } else {
+                (4, 46.0, 31.0, 27.0)
+            };
+            for i in 0..rows {
+                let by = y0 + i as f32 * step_h;
+                if (12.0..308.0).contains(&x) && y >= by && y < by + h {
                     return TouchAction::SelectRow(i);
                 }
             }
@@ -495,6 +517,9 @@ pub fn apply_step_change(step: usize, row: usize, forward: bool) -> std::io::Res
         }
         (2, 2) => {
             i18n::toggle_autoplay_audio()?;
+        }
+        (2, 3) => {
+            i18n::toggle_animations()?;
         }
         _ => {}
     }

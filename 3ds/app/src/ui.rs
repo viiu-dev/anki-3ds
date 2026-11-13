@@ -710,6 +710,11 @@ impl Ui {
         style: i32,
         pressed: bool,
     ) {
+        let (x, y, w, h, pressed, glow) =
+            super::anim::adjust_button(x, y, w, h, style, pressed);
+        if let Some(color) = glow {
+            super::anim::draw_button_halo(x, y, w, h, color);
+        }
         if let Ok(c_text) = CString::new(display_text(text).as_bytes()) {
             let c_sub = subtext.and_then(|s| CString::new(display_text(s).as_bytes()).ok());
             let sub_ptr = c_sub
@@ -1520,6 +1525,10 @@ impl RichTextLayout {
     }
 
     pub fn draw(&self, scroll: f32) {
+        self.draw_offset(scroll, 0.0, 0.0);
+    }
+
+    pub fn draw_offset(&self, scroll: f32, offset_x: f32, offset_y: f32) {
         if self.lines.is_empty()
             && self.images.is_empty()
             && self.tables.is_empty()
@@ -1534,7 +1543,7 @@ impl RichTextLayout {
             CARD_Y_PADDING + (TOP_HEIGHT - total) / 2.0
         } else {
             CARD_Y_PADDING - scroll.max(0.0)
-        };
+        } + offset_y;
         let scale = CARD_TEXT_SCALE * self.font_scale;
         let ruby_scale = scale * CARD_RUBY_SCALE;
         if !self.prepare_visible(origin, scale, ruby_scale) {
@@ -1542,7 +1551,7 @@ impl RichTextLayout {
             let _ = self.prepare_visible(origin, scale, ruby_scale);
         }
         Ui::commit_card_text();
-        let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0;
+        let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0 + offset_x;
         for bx in &self.boxes {
             let top = origin + bx.top;
             if top > TOP_HEIGHT || top + bx.height < 0.0 {

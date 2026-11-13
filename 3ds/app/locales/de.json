@@ -361,5 +361,19 @@
     "You are ready to study!": "Alles bereit zum Lernen!",
     "Reopen anytime in Settings > System.": "Jederzeit unter Einstellungen > System.",
     "Finish": "Fertig",
-    "Log in and Sync": "Anmelden und synchronisieren"
+    "Log in and Sync": "Anmelden und synchronisieren",
+    "Animations": "Animationen",
+    "Animations: {0}": "Animationen: {0}",
+    "Smooth transitions and button feedback.": "Flüssige Übergänge und Tasten-Feedback.",
+    "Card transitions": "Kartenübergänge",
+    "Button feedback": "Tasten-Feedback",
+    "Menu transitions": "Menüübergänge",
+    "Deck completion": "Stapel-Abschluss",
+    "Fade and slide when revealing or advancing cards.": "Einblenden und Gleiten bei Kartenwechseln.",
+    "Press and release feedback on buttons and touch.": "Druckfeedback bei Tasten und Touchscreen.",
+    "Smooth transitions between menus and screens.": "Sanfte Übergänge zwischen Menüs und Ansichten.",
+    "Celebratory animation when finishing a deck.": "Feierliche Animation nach Abschluss eines Stapels.",
+    "All animations": "Alle Animationen",
+    "A or LEFT/RIGHT toggles. B returns.": "A oder LINKS/RECHTS schaltet um. B zurück.",
+    "Deck complete!": "Stapel fertig!"
 }

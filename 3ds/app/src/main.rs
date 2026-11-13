@@ -1,6 +1,7 @@
 // Copyright: Anki 3DS contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+mod anim;
 mod assets;
 mod auth_store;
 mod backend;
@@ -1355,6 +1356,10 @@ enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    SettingsAnimations {
+        selected: usize,
+        previous: Box<Screen>,
+    },
     SettingsBackups {
         selected: usize,
         backups: Vec<backup::Entry>,
@@ -1733,9 +1738,10 @@ enum SettingsItem {
     ResetControls,
     Action(Action, &'static str),
     Toolbar,
+    Animations,
 }
 
-const APPEARANCE_ITEMS: [SettingsItem; 8] = [
+const APPEARANCE_ITEMS: [SettingsItem; 9] = [
     SettingsItem::Choice(ChoiceKind::Theme),
     SettingsItem::Choice(ChoiceKind::Accent),
     SettingsItem::Choice(ChoiceKind::FontScale),
@@ -1744,6 +1750,7 @@ const APPEARANCE_ITEMS: [SettingsItem; 8] = [
     SettingsItem::Toggle(ToggleKind::CardCounts),
     SettingsItem::Toggle(ToggleKind::RatingIntervals),
     SettingsItem::Toolbar,
+    SettingsItem::Animations,
 ];
 const AUDIO_ITEMS: [SettingsItem; 5] = [
     SettingsItem::Toggle(ToggleKind::Autoplay),
@@ -2041,6 +2048,14 @@ fn settings_item_label(
         SettingsItem::Toolbar => i18n::format(
             "Toolbar: {0}",
             &[tr(if i18n::toolbar_visible() { "On" } else { "Off" })],
+        ),
+        SettingsItem::Animations => i18n::format(
+            "Animations: {0}",
+            &[tr(if i18n::animations_enabled() {
+                "On"
+            } else {
+                "Off"
+            })],
         ),
         SettingsItem::Action(Action::MediaSync, _) => {
             media_sync_label(media_running, media_files, media_status)
@@ -2356,6 +2371,7 @@ fn main() {
     let mut frame: u64 = 0;
     let mut top_layout = TextLayout::default();
     let mut top_card = RichTextLayout::default();
+    let mut ui_anim = anim::UiAnimState::new();
     let mut top_max = 0usize;
     let mut last_empty_poll = Instant::now();
     let mut repeat_at = Instant::now();
@@ -2652,6 +2668,7 @@ fn main() {
             }
             let x = x as f32;
             let y = y as f32;
+            anim::record_touch(x, y);
             action = match &mut screen {
                 Screen::SyncWait if y >= 194.0 => Action::Back,
                 Screen::SyncChoice {
@@ -2914,6 +2931,15 @@ fn main() {
                         Action::None
                     }
                 }
+                Screen::SettingsAnimations { selected, .. } => {
+                    let start = list_start(*selected, 5);
+                    if let Some(index) = list_hit(x, y, start, 5) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
                 Screen::SettingsBackups {
                     selected, backups, ..
                 } => {
@@ -2974,6 +3000,7 @@ fn main() {
                         | Screen::SyncChoice { .. }
                         | Screen::SettingsBackups { .. }
                         | Screen::BackupConfirm { .. }
+                        | Screen::SettingsAnimations { .. }
                         | Screen::CardChoice { .. }
                         | Screen::Stats { .. }
                         | Screen::Quickstart { .. }
@@ -3056,6 +3083,30 @@ fn main() {
                     }
                     _ => Action::None,
                 };
+            }
+        }
+        if !down.contains(KeyPad::TOUCH) {
+            match &action {
+                Action::Rate(rating) if (0..4).contains(rating) => {
+                    anim::record_button_style((*rating + 2) as u8);
+                }
+                Action::Primary | Action::Reveal | Action::Save | Action::Sync | Action::Field => {
+                    anim::record_button_style(0);
+                }
+                Action::Left | Action::Right
+                    if matches!(
+                        screen,
+                        Screen::SettingsCategory { .. }
+                            | Screen::SettingsAnimations { .. }
+                            | Screen::SettingsToolbar { .. }
+                            | Screen::SettingsChoice { .. }
+                            | Screen::Quickstart { .. }
+                            | Screen::Stats { .. }
+                    ) =>
+                {
+                    anim::record_button_style(0);
+                }
+                _ => {}
             }
         }
         if matches!(action, Action::Exit) {
@@ -3208,6 +3259,24 @@ fn main() {
                                     };
                                 }
                             }
+                            SettingsItem::Animations => {
+                                let old = std::mem::replace(&mut screen, Screen::Decks);
+                                if let Screen::SettingsCategory {
+                                    category,
+                                    selected,
+                                    previous,
+                                } = old
+                                {
+                                    screen = Screen::SettingsAnimations {
+                                        selected: 0,
+                                        previous: Box::new(Screen::SettingsCategory {
+                                            category,
+                                            selected,
+                                            previous,
+                                        }),
+                                    };
+                                }
+                            }
                             SettingsItem::Action(Action::MediaSync, _) => {
                                 if let Some(active) = &media_job {
                                     active.cancel();
@@ -3296,6 +3365,10 @@ fn main() {
                                 }
                             }
                             SettingsItem::Toggle(kind) => apply_toggle(kind)?,
+                            SettingsItem::Animations => {
+                                let value = i18n::toggle_animations()?;
+                                event(&format!("ANIMATIONS {}", if value { "on" } else { "off" }));
+                            }
                             SettingsItem::Action(_, _)
                             | SettingsItem::Binding(_)
                             | SettingsItem::ResetControls
@@ -3414,6 +3487,29 @@ fn main() {
                         let order = i18n::toolbar_order();
                         let keys: Vec<&str> = order.iter().map(|item| item.key()).collect();
                         event(&format!("TOOLBAR_ORDER {}", keys.join(",")));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            if let Screen::SettingsAnimations { selected, .. } = &mut screen {
+                match action {
+                    Action::Primary | Action::Left | Action::Right => {
+                        if *selected == 0 {
+                            let value = i18n::toggle_animations()?;
+                            event(&format!("ANIMATIONS {}", if value { "on" } else { "off" }));
+                        } else if let Some(kind) = i18n::AnimKind::ALL.get(*selected - 1).copied() {
+                            let value = i18n::toggle_anim_item(kind)?;
+                            event(&format!(
+                                "ANIMATION_ITEM {} {}",
+                                kind.key(),
+                                if value { "on" } else { "off" }
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    Action::Up | Action::Down => {
+                        *selected = list_step(*selected, 5, matches!(action, Action::Down));
                         return Ok(());
                     }
                     _ => {}
@@ -3598,8 +3694,9 @@ fn main() {
                                 }
                                 1 | 2 => match action {
                                     Action::Up | Action::Down => {
+                                        let rows = if *step == 2 { 4 } else { 3 };
                                         *selected =
-                                            list_step(*selected, 3, matches!(action, Action::Down));
+                                            list_step(*selected, rows, matches!(action, Action::Down));
                                     }
                                     Action::Left | Action::Right => {
                                         quickstart::apply_step_change(
@@ -3624,6 +3721,7 @@ fn main() {
                             if *step + 1 < quickstart::STEPS {
                                 *step += 1;
                                 *selected = 0;
+                                ui_anim.trigger_menu_transition();
                                 event(&format!("QUICKSTART_STEP {}", *step));
                                 return Ok(());
                             } else {
@@ -3638,6 +3736,7 @@ fn main() {
                                 } else {
                                     0
                                 };
+                                ui_anim.trigger_menu_transition();
                                 event(&format!("QUICKSTART_STEP {}", *step));
                                 return Ok(());
                             } else {
@@ -3717,7 +3816,10 @@ fn main() {
                 event(&format!("BURY card={card_id} mode={mode}"));
                 let deck_name = deck_name.clone();
                 screen = match b.next()? {
-                    Some(card) => Screen::Question { card, deck_name },
+                    Some(card) => {
+                        ui_anim.trigger_next_card();
+                        Screen::Question { card, deck_name }
+                    }
                     None => Screen::Empty { deck_name },
                 };
                 card_scroll = 0;
@@ -4098,7 +4200,10 @@ fn main() {
                             b.undo()?;
                             event(&format!("UNDO_REVIEW card={card_id}"));
                             screen = match b.reopen_card(card_id)? {
-                                Some(card) => Screen::Question { card, deck_name },
+                                Some(card) => {
+                                    ui_anim.trigger_next_card();
+                                    Screen::Question { card, deck_name }
+                                }
                                 None => Screen::Empty { deck_name },
                             };
                         }
@@ -4300,6 +4405,7 @@ fn main() {
                         | Screen::SettingsChoice { previous, .. }
                         | Screen::SettingsButton { previous, .. }
                         | Screen::SettingsToolbar { previous, .. }
+                        | Screen::SettingsAnimations { previous, .. }
                         | Screen::SettingsBackups { previous, .. }
                         | Screen::BackupConfirm { previous, .. }
                         | Screen::CardChoice { previous, .. }
@@ -4352,7 +4458,10 @@ fn main() {
                                 .ok_or("collection unavailable")?
                                 .select(did)?
                             {
-                                Some(card) => Screen::Question { card, deck_name },
+                                Some(card) => {
+                                    ui_anim.trigger_next_card();
+                                    Screen::Question { card, deck_name }
+                                }
                                 None => Screen::Empty { deck_name },
                             };
                             card_scroll = 0;
@@ -4391,6 +4500,7 @@ fn main() {
                                     }
                                 }
                                 screen = Screen::Answer { card, deck_name };
+                                ui_anim.trigger_card_reveal();
                             }
                             card_scroll = 0;
                             event("QUESTION -> ANSWER");
@@ -4416,7 +4526,10 @@ fn main() {
                                     outcome.card_id, outcome.leech
                                 ));
                                 screen = match b.next()? {
-                                    Some(card) => Screen::Question { card, deck_name },
+                                    Some(card) => {
+                                        ui_anim.trigger_next_card();
+                                        Screen::Question { card, deck_name }
+                                    }
                                     None => Screen::Empty { deck_name },
                                 };
                             }
@@ -4785,6 +4898,7 @@ fn main() {
                 if let Some(b) = backend.as_mut() {
                     match b.next() {
                         Ok(Some(card)) => {
+                            ui_anim.trigger_next_card();
                             screen = Screen::Question {
                                 card,
                                 deck_name: name,
@@ -4973,6 +5087,7 @@ fn main() {
             Screen::SettingsChoice { .. } => "SETTINGS_CHOICE",
             Screen::SettingsButton { .. } => "SETTINGS_BUTTON",
             Screen::SettingsToolbar { .. } => "SETTINGS_TOOLBAR",
+            Screen::SettingsAnimations { .. } => "SETTINGS_ANIMATIONS",
             Screen::SettingsBackups { .. } => "SETTINGS_BACKUPS",
             Screen::BackupConfirm { .. } => "BACKUP_CONFIRM",
             Screen::CardChoice { .. } => "CARD_CHOICE",
@@ -4982,6 +5097,20 @@ fn main() {
             Screen::Error(_) => "ERROR",
         };
         if state != last_state {
+            if !last_state.is_empty()
+                && !matches!(
+                    (last_state.as_str(), state),
+                    ("QUESTION", "ANSWER") | ("ANSWER", "QUESTION")
+                )
+            {
+                ui_anim.trigger_menu_transition();
+            }
+            if !matches!(state, "QUESTION" | "ANSWER") {
+                ui_anim.clear_card_transition();
+            }
+            if state == "EMPTY" {
+                ui_anim.trigger_celebration();
+            }
             if state == "DECKS" {
                 if let Some(b) = backend.as_mut() {
                     daily_studied = b.studied_today_text().unwrap_or_default();
@@ -5232,7 +5361,9 @@ fn main() {
                 top_card.tick_anims(elapsed);
                 review_max_scroll = top_card.max_scroll();
                 review_scroll = review_scroll.min(review_max_scroll);
-                top_card.draw(review_scroll);
+                let (offset_x, offset_y, fade) = ui_anim.card_transition();
+                top_card.draw_offset(review_scroll, offset_x, offset_y);
+                anim::draw_card_transition_overlay(fade, answer);
                 Ui::draw_scroll_indicator(
                     TOP_WIDTH - 4.0,
                     0.0,
@@ -5294,30 +5425,36 @@ fn main() {
                     tr("Choose a category. B returns."),
                 );
             }
-            Screen::SettingsCategory { category, .. } => {
-                Ui::fit_text(
-                    200.0,
-                    38.0,
-                    0.60,
-                    360.0,
-                    current_theme().text,
-                    tr(category.label()),
-                );
-                Ui::fit_text(
-                    200.0,
-                    86.0,
-                    0.48,
-                    360.0,
-                    current_theme().text_muted,
-                    tr(category.hint()),
-                );
-                Ui::draw_text_centered(
-                    200.0,
-                    130.0,
-                    0.44,
-                    current_theme().text_faint,
-                    tr("A opens or changes. B returns."),
-                );
+            Screen::SettingsCategory {
+                category, selected, ..
+            } => {
+                if matches!(settings_items(*category).get(*selected), Some(SettingsItem::Animations)) {
+                    anim::draw_settings_preview(0, frame);
+                } else {
+                    Ui::fit_text(
+                        200.0,
+                        38.0,
+                        0.60,
+                        360.0,
+                        current_theme().text,
+                        tr(category.label()),
+                    );
+                    Ui::fit_text(
+                        200.0,
+                        86.0,
+                        0.48,
+                        360.0,
+                        current_theme().text_muted,
+                        tr(category.hint()),
+                    );
+                    Ui::draw_text_centered(
+                        200.0,
+                        130.0,
+                        0.44,
+                        current_theme().text_faint,
+                        tr("A opens or changes. B returns."),
+                    );
+                }
             }
             Screen::SettingsButton { action, .. } => {
                 Ui::fit_text(
@@ -5404,6 +5541,9 @@ fn main() {
                     current_theme().text_muted,
                     tr("Move down [X]"),
                 );
+            }
+            Screen::SettingsAnimations { selected, .. } => {
+                anim::draw_settings_preview(*selected, frame);
             }
             Screen::SettingsBackups {
                 selected,
@@ -5494,21 +5634,26 @@ fn main() {
                 top_max = top_layout.draw(text, 360.0, 200.0, 64.0, 7, card_scroll);
             }
             Screen::Empty { deck_name } => {
-                Ui::draw_text_centered(
-                    200.0,
-                    65.0,
-                    0.58,
-                    current_theme().text,
-                    tr("No cards available now"),
-                );
-                top_max = top_layout.draw(
-                    &i18n::format("Waiting for learning cards in {0}.", &[deck_name]),
-                    360.0,
-                    200.0,
-                    106.0,
-                    5,
-                    0,
-                );
+                if i18n::anim_active(i18n::AnimKind::DeckCelebration) {
+                    ui_anim.draw_deck_celebration(deck_name, &daily_studied);
+                    top_max = 0;
+                } else {
+                    Ui::draw_text_centered(
+                        200.0,
+                        65.0,
+                        0.58,
+                        current_theme().text,
+                        tr("No cards available now"),
+                    );
+                    top_max = top_layout.draw(
+                        &i18n::format("Waiting for learning cards in {0}.", &[deck_name]),
+                        360.0,
+                        200.0,
+                        106.0,
+                        5,
+                        0,
+                    );
+                }
             }
             Screen::Error(err) => {
                 Ui::draw_text_centered(200.0, 30.0, 0.60, current_theme().learn, tr("Error"));
@@ -5517,6 +5662,7 @@ fn main() {
         }
         draw_rating_badge(rating_feedback);
         draw_leech_notice(leech_notice.as_ref());
+        ui_anim.draw_top_overlay();
         Ui::target_bottom(current_theme().bg_bottom);
         match &screen {
             Screen::SyncWait => {
@@ -5973,6 +6119,55 @@ fn main() {
                 button(12.0, 194.0, 140.0, tr("Move up [Y]"), None, up_style);
                 button(168.0, 194.0, 140.0, tr("Move down [X]"), None, down_style);
             }
+            Screen::SettingsAnimations { selected, .. } => {
+                header(320.0, tr("Animations"));
+                let start = list_start(*selected, 5);
+                for index in start..(start + SETTINGS_VISIBLE_ROWS).min(5) {
+                    let (x, y) = settings_tile(index - start);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let text = if index == 0 {
+                        i18n::format(
+                            "Animations: {0}",
+                            &[tr(if i18n::animations_enabled() {
+                                "On"
+                            } else {
+                                "Off"
+                            })],
+                        )
+                    } else {
+                        let kind = i18n::AnimKind::ALL[index - 1];
+                        i18n::format(
+                            "{0}: {1}",
+                            &[
+                                tr(kind.label()),
+                                tr(if i18n::anim_active(kind) {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }),
+                            ],
+                        )
+                    };
+                    let label = Ui::ellipsize(&text, 0.50, SETTINGS_TILE_W - 12.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        SETTINGS_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
+                }
+                Ui::draw_text_centered(
+                    160.0,
+                    206.0,
+                    0.42,
+                    current_theme().text_muted,
+                    tr("A or LEFT/RIGHT toggles. B returns."),
+                );
+            }
             Screen::SettingsBackups {
                 selected, backups, ..
             } => {
@@ -6073,12 +6268,14 @@ fn main() {
                 | Screen::SettingsChoice { .. }
                 | Screen::SettingsButton { .. }
                 | Screen::SettingsToolbar { .. }
+                | Screen::SettingsAnimations { .. }
                 | Screen::SettingsBackups { .. }
                 | Screen::BackupConfirm { .. }
         );
         if !hide_footer {
             footer(&cached_footer);
         }
+        ui_anim.draw_bottom_overlay();
         Ui::frame_end();
     }
     if let Some(active) = &media_job {
