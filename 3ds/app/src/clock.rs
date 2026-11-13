@@ -291,3 +291,7 @@ pub fn configure(
 pub fn offset() -> i32 {
     OFFSET.load(Ordering::Relaxed)
 }
+
+pub fn local_time() -> i64 {
+    unsafe { anki_local_time() }
+}

@@ -287,5 +287,17 @@
     "Text spacing": "行と段落の間隔",
     "Scrolling speed": "スクロール速度",
     "Audio playback speed": "音声再生速度",
-    "Replay audio": "音声再再生"
+    "Replay audio": "音声再再生",
+    "Backups": "バックアップ",
+    "Create or restore collection backups.": "コレクションのバックアップ作成と復元。",
+    "Create backup now": "今すぐ作成",
+    "Create a backup or select one to restore.": "新規作成、または復元する項目を選択。",
+    "Backup: {0}": "バックアップ: {0}",
+    "No backups saved yet.": "バックアップはありません。",
+    "A creates or restores. B returns.": "Aで作成・復元。Bで戻る。",
+    "Backup created: {0}": "作成完了: {0}",
+    "Restore backup": "バックアップを復元",
+    "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.": "現在のコレクションを {0} で置換しますか？未同期の変更は失われます。",
+    "Backup restored": "復元完了",
+    "Restored collection from {0}.": "{0} から復元しました。"
 }

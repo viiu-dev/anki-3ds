@@ -287,5 +287,17 @@
     "Text spacing": "Интервал текста",
     "Scrolling speed": "Скорость прокр.",
     "Audio playback speed": "Скорость аудио",
-    "Replay audio": "Повтор аудио"
+    "Replay audio": "Повтор аудио",
+    "Backups": "Резервные копии",
+    "Create or restore collection backups.": "Создание и восстановление копий коллекции.",
+    "Create backup now": "Создать копию",
+    "Create a backup or select one to restore.": "Создайте копию или выберите для отката.",
+    "Backup: {0}": "Копия: {0}",
+    "No backups saved yet.": "Копий пока нет.",
+    "A creates or restores. B returns.": "A — создать/вернуть. B — назад.",
+    "Backup created: {0}": "Создана копия: {0}",
+    "Restore backup": "Восстановить",
+    "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.": "Заменить коллекцию копией {0}? Несинхронизированные правки пропадут.",
+    "Backup restored": "Восстановлено",
+    "Restored collection from {0}.": "Коллекция восстановлена из {0}."
 }

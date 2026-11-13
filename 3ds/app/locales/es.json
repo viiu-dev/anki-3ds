@@ -287,5 +287,17 @@
     "Text spacing": "Espaciado",
     "Scrolling speed": "Vel. de scroll",
     "Audio playback speed": "Vel. de audio",
-    "Replay audio": "Repetir audio"
+    "Replay audio": "Repetir audio",
+    "Backups": "Copias de seg.",
+    "Create or restore collection backups.": "Crea o restaura copias de la colección.",
+    "Create backup now": "Crear copia ahora",
+    "Create a backup or select one to restore.": "Crea una copia o elige una para restaurar.",
+    "Backup: {0}": "Copia: {0}",
+    "No backups saved yet.": "No hay copias guardadas.",
+    "A creates or restores. B returns.": "A crea o restaura. B vuelve.",
+    "Backup created: {0}": "Copia creada: {0}",
+    "Restore backup": "Restaurar copia",
+    "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.": "¿Reemplazar la colección con {0}? Los cambios sin sincronizar se perderán.",
+    "Backup restored": "Copia restaurada",
+    "Restored collection from {0}.": "Colección restaurada desde {0}."
 }

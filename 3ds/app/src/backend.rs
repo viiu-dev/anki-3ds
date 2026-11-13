@@ -1214,6 +1214,14 @@ impl Backend {
         Ok(())
     }
 
+    pub fn checkpoint(&self) -> Result<()> {
+        self.collection
+            .storage
+            .db()
+            .execute_batch("pragma wal_checkpoint(truncate)")?;
+        Ok(())
+    }
+
     pub fn close(self) -> Result<()> {
         self.collection.close(None)?;
         Ok(())

@@ -287,5 +287,17 @@
     "Text spacing": "Інтервал тексту",
     "Scrolling speed": "Швидк. прокр.",
     "Audio playback speed": "Швидкість аудіо",
-    "Replay audio": "Повтор аудіо"
+    "Replay audio": "Повтор аудіо",
+    "Backups": "Резервні копії",
+    "Create or restore collection backups.": "Створення та відновлення копій колекції.",
+    "Create backup now": "Створити копію",
+    "Create a backup or select one to restore.": "Створіть копію або оберіть для відновлення.",
+    "Backup: {0}": "Копія: {0}",
+    "No backups saved yet.": "Копій ще немає.",
+    "A creates or restores. B returns.": "A — створити/відновити. B — назад.",
+    "Backup created: {0}": "Створено копію: {0}",
+    "Restore backup": "Відновити",
+    "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.": "Замінити колекцію копією {0}? Несинхронізовані зміни буде втрачено.",
+    "Backup restored": "Відновлено",
+    "Restored collection from {0}.": "Колекцію відновлено з {0}."
 }

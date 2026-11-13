@@ -723,6 +723,30 @@ pub fn save_sync_stamp(value: i64) -> io::Result<()> {
     write_setting("sync_collection_modified", serde_json::json!(value))
 }
 
+fn read_i64_setting(key: &str) -> Option<i64> {
+    let text = fs::read_to_string(SETTINGS_PATH).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get(key)
+        .and_then(|v| v.as_i64())
+}
+
+pub fn backup_stamp() -> i64 {
+    read_i64_setting("backup_collection_modified").unwrap_or(0)
+}
+
+pub fn save_backup_stamp(value: i64) -> io::Result<()> {
+    write_setting("backup_collection_modified", serde_json::json!(value))
+}
+
+pub fn backup_day() -> Option<i64> {
+    read_i64_setting("backup_day")
+}
+
+pub fn save_backup_day(day: i64) -> io::Result<()> {
+    write_setting("backup_day", serde_json::json!(day))
+}
+
 const MAX_DOWNLOAD_CONNECTIONS: u8 = 4;
 static DOWNLOAD_CONNECTIONS: AtomicU8 = AtomicU8::new(1);
 

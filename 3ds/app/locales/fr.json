@@ -287,5 +287,17 @@
     "Text spacing": "Espacement",
     "Scrolling speed": "Vitesse défil.",
     "Audio playback speed": "Vitesse audio",
-    "Replay audio": "Rejouer audio"
+    "Replay audio": "Rejouer audio",
+    "Backups": "Sauvegardes",
+    "Create or restore collection backups.": "Créer ou restaurer une sauvegarde.",
+    "Create backup now": "Sauvegarder maintenant",
+    "Create a backup or select one to restore.": "Créez une sauvegarde ou restaurez-en une.",
+    "Backup: {0}": "Sauvegarde : {0}",
+    "No backups saved yet.": "Aucune sauvegarde enregistrée.",
+    "A creates or restores. B returns.": "A crée ou restaure. B revient.",
+    "Backup created: {0}": "Sauvegardée : {0}",
+    "Restore backup": "Restaurer",
+    "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.": "Remplacer la collection par {0} ? Les modifs non synchronisées seront perdues.",
+    "Backup restored": "Restaurée",
+    "Restored collection from {0}.": "Collection restaurée depuis {0}."
 }

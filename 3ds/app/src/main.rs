@@ -4,6 +4,7 @@
 mod assets;
 mod auth_store;
 mod backend;
+mod backup;
 mod clock;
 mod controls;
 mod event_log;
@@ -1352,6 +1353,16 @@ enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    SettingsBackups {
+        selected: usize,
+        backups: Vec<backup::Entry>,
+        status: Option<String>,
+        previous: Box<Screen>,
+    },
+    BackupConfirm {
+        entry: backup::Entry,
+        previous: Box<Screen>,
+    },
     CardChoice {
         card_id: i64,
         selected: usize,
@@ -1635,16 +1646,18 @@ enum SettingsCategory {
     Audio,
     Controls,
     Network,
+    Backups,
     System,
     Language,
 }
 
 impl SettingsCategory {
-    const ALL: [SettingsCategory; 6] = [
+    const ALL: [SettingsCategory; 7] = [
         SettingsCategory::Appearance,
         SettingsCategory::Audio,
         SettingsCategory::Controls,
         SettingsCategory::Network,
+        SettingsCategory::Backups,
         SettingsCategory::System,
         SettingsCategory::Language,
     ];
@@ -1655,6 +1668,7 @@ impl SettingsCategory {
             SettingsCategory::Audio => "Audio and review",
             SettingsCategory::Controls => "Controls and keybinds",
             SettingsCategory::Network => "Sync and network",
+            SettingsCategory::Backups => "Backups",
             SettingsCategory::System => "System and hardware",
             SettingsCategory::Language => "Language",
         }
@@ -1666,6 +1680,7 @@ impl SettingsCategory {
             SettingsCategory::Audio => "Audio playback and review options.",
             SettingsCategory::Controls => "Remap review buttons and reset defaults.",
             SettingsCategory::Network => "Account, clock and media downloads.",
+            SettingsCategory::Backups => "Create or restore collection backups.",
             SettingsCategory::System => "Hardware lights and help.",
             SettingsCategory::Language => "Choose the interface language.",
         }
@@ -1758,6 +1773,7 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
         SettingsCategory::Audio => &AUDIO_ITEMS,
         SettingsCategory::Controls => &CONTROLS_ITEMS,
         SettingsCategory::Network => &NETWORK_ITEMS,
+        SettingsCategory::Backups => &[],
         SettingsCategory::System => &SYSTEM_ITEMS,
         SettingsCategory::Language => &LANGUAGE_ITEMS,
     }
@@ -2250,6 +2266,21 @@ fn main() {
         .unwrap_or(0);
     if synced_ms == 0 {
         synced_ms = current_ms;
+    }
+    if let Some(b) = backend.as_mut() {
+        let today = clock::local_time().div_euclid(86_400);
+        let existing_empty = backup::list().is_empty();
+        let modified = current_ms > 0 && (current_ms != i18n::backup_stamp() || existing_empty);
+        let due_today = i18n::backup_day() != Some(today) || existing_empty;
+        if modified && due_today {
+            match backup::create_from_backend(b, current_ms, Some(today)) {
+                Ok(entry) => event(&format!("BACKUP_AUTO startup {}", entry.filename)),
+                Err(error) => event(&format!(
+                    "BACKUP_AUTO_ERROR startup {}",
+                    error_text(error.as_ref())
+                )),
+            }
+        }
     }
     let mut root = DeckTreeNode::default();
     let mut screen = if let Some(error) = startup_error {
@@ -2853,6 +2884,25 @@ fn main() {
                         Action::None
                     }
                 }
+                Screen::SettingsBackups {
+                    selected, backups, ..
+                } => {
+                    let length = backups.len() + 1;
+                    let start = list_start(*selected, length);
+                    if let Some(index) = list_hit(x, y, start, length) {
+                        *selected = index;
+                        Action::Primary
+                    } else {
+                        Action::None
+                    }
+                }
+                Screen::BackupConfirm { .. } if (194.0..222.0).contains(&y) => {
+                    if x < 160.0 {
+                        Action::Primary
+                    } else {
+                        Action::Back
+                    }
+                }
                 Screen::CardChoice { selected, .. } if (70.0..118.0).contains(&y) => {
                     *selected = if x < 160.0 { 0 } else { 1 };
                     Action::Primary
@@ -2868,6 +2918,8 @@ fn main() {
                     Screen::Question { .. }
                         | Screen::Answer { .. }
                         | Screen::SyncChoice { .. }
+                        | Screen::SettingsBackups { .. }
+                        | Screen::BackupConfirm { .. }
                         | Screen::CardChoice { .. }
                 )
             {
@@ -3003,6 +3055,12 @@ fn main() {
                     if let Screen::Settings { selected, previous } = old {
                         let settings = Screen::Settings { selected, previous };
                         screen = match category {
+                            SettingsCategory::Backups => Screen::SettingsBackups {
+                                selected: 0,
+                                backups: backup::list(),
+                                status: None,
+                                previous: Box::new(settings),
+                            },
                             SettingsCategory::Language => Screen::SettingsChoice {
                                 kind: ChoiceKind::Language,
                                 selected: i18n::language_index(),
@@ -3336,6 +3394,102 @@ fn main() {
                     _ => {}
                 }
             }
+            if let Screen::SettingsBackups {
+                selected,
+                backups,
+                status,
+                ..
+            } = &mut screen
+            {
+                match action {
+                    Action::Up | Action::Down => {
+                        *selected = list_step(
+                            *selected,
+                            backups.len() + 1,
+                            matches!(action, Action::Down),
+                        );
+                        *status = None;
+                        return Ok(());
+                    }
+                    Action::Primary => {
+                        if *selected == 0 {
+                            let b = backend.as_mut().ok_or("collection unavailable")?;
+                            let ms = b.collection_modified_ms().unwrap_or(current_ms);
+                            let entry = backup::create_from_backend(b, ms, None)?;
+                            *backups = backup::list();
+                            *status = Some(i18n::format("Backup created: {0}", &[&entry.label]));
+                            event(&format!("BACKUP_CREATED {}", entry.filename));
+                        } else if let Some(entry) = backups.get(*selected - 1).cloned() {
+                            let old = std::mem::replace(&mut screen, Screen::Decks);
+                            screen = Screen::BackupConfirm {
+                                entry,
+                                previous: Box::new(old),
+                            };
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            let restore_entry = match &screen {
+                Screen::BackupConfirm { entry, .. } if matches!(action, Action::Primary) => {
+                    Some(entry.clone())
+                }
+                _ => None,
+            };
+            if let Some(entry) = restore_entry {
+                if let Some(active) = media_job.take() {
+                    active.cancel();
+                }
+                prefetch.stop();
+                Ui::audio_stop();
+                top_card.invalidate();
+                if let Some(active) = backend.take() {
+                    active.close()?;
+                }
+                if let Err(error) = backup::restore_file(&entry.path, std::path::Path::new(backend::PATH)) {
+                    backend = Backend::open_with_progress(progress.clone()).ok();
+                    return Err(error.into());
+                }
+                let mut reopened = match Backend::open_with_progress(progress.clone()) {
+                    Ok(b) => b,
+                    Err(error) => {
+                        screen = Screen::Error(user_error(error.as_ref()));
+                        return Ok(());
+                    }
+                };
+                current_ms = reopened.collection_modified_ms().unwrap_or(0);
+                let _ = i18n::save_backup_stamp(current_ms);
+                root = reopened.deck_tree()?;
+                collapsed.clear();
+                decks.clear();
+                collect_deck_items(&root, &collapsed, &mut decks);
+                selected = 0;
+                scroll_pos = 0;
+                card_scroll = 0;
+                review_scroll = 0.0;
+                review_max_scroll = 0.0;
+                review = ReviewState::default();
+                last_autoplay_card = None;
+                last_review_card = None;
+                card_media_pending = false;
+                playing_audio = None;
+                audio_queue.clear();
+                audio_queue_pos = 0;
+                rating_feedback = None;
+                leech_notice = None;
+                last_answered = None;
+                daily_studied = reopened.studied_today_text().unwrap_or_default();
+                backend = Some(reopened);
+                Ui::media_refresh();
+                event(&format!("BACKUP_RESTORED {}", entry.filename));
+                screen = Screen::Info {
+                    title: tr("Backup restored").into(),
+                    text: i18n::format("Restored collection from {0}.", &[&entry.label]),
+                    previous: Box::new(Screen::Decks),
+                };
+                return Ok(());
+            }
             let mut bury = None;
             if let Screen::CardChoice {
                 card_id, selected, ..
@@ -3481,6 +3635,18 @@ fn main() {
                 }
                 media_result = None;
                 media_notice_until = Instant::now();
+                if full_mode.is_some() {
+                    if let Some(b) = backend.as_mut() {
+                        let ms = b.collection_modified_ms().unwrap_or(current_ms);
+                        match backup::create_from_backend(b, ms, None) {
+                            Ok(entry) => event(&format!("BACKUP_AUTO full_sync {}", entry.filename)),
+                            Err(error) => event(&format!(
+                                "BACKUP_AUTO_ERROR full_sync {}",
+                                error_text(error.as_ref())
+                            )),
+                        }
+                    }
+                }
                 let collection = backend.take().ok_or("collection unavailable")?;
                 match sync::Job::start(
                     collection,
@@ -3935,6 +4101,8 @@ fn main() {
                         | Screen::SettingsChoice { previous, .. }
                         | Screen::SettingsButton { previous, .. }
                         | Screen::SettingsToolbar { previous, .. }
+                        | Screen::SettingsBackups { previous, .. }
+                        | Screen::BackupConfirm { previous, .. }
                         | Screen::CardChoice { previous, .. } => *previous,
                         Screen::Editor {
                             return_query: Some(query),
@@ -4592,6 +4760,8 @@ fn main() {
             Screen::SettingsChoice { .. } => "SETTINGS_CHOICE",
             Screen::SettingsButton { .. } => "SETTINGS_BUTTON",
             Screen::SettingsToolbar { .. } => "SETTINGS_TOOLBAR",
+            Screen::SettingsBackups { .. } => "SETTINGS_BACKUPS",
+            Screen::BackupConfirm { .. } => "BACKUP_CONFIRM",
             Screen::CardChoice { .. } => "CARD_CHOICE",
             Screen::Info { .. } => "INFO",
             Screen::Error(_) => "ERROR",
@@ -5018,6 +5188,63 @@ fn main() {
                     0.46,
                     current_theme().text_muted,
                     tr("Move down [X]"),
+                );
+            }
+            Screen::SettingsBackups {
+                selected,
+                backups,
+                status,
+                ..
+            } => {
+                Ui::fit_text(
+                    200.0,
+                    34.0,
+                    0.62,
+                    360.0,
+                    current_theme().text,
+                    tr("Backups"),
+                );
+                let subtitle = if let Some(text) = status.as_deref() {
+                    text.to_owned()
+                } else if *selected == 0 {
+                    tr("Create a backup or select one to restore.").to_owned()
+                } else if let Some(entry) = backups.get(*selected - 1) {
+                    i18n::format("Backup: {0}", &[&entry.label])
+                } else {
+                    String::new()
+                };
+                Ui::fit_text(
+                    200.0,
+                    78.0,
+                    0.48,
+                    360.0,
+                    current_theme().text_muted,
+                    &subtitle,
+                );
+                Ui::draw_text_centered(
+                    200.0,
+                    128.0,
+                    0.44,
+                    current_theme().text_faint,
+                    if backups.is_empty() {
+                        tr("No backups saved yet.")
+                    } else {
+                        tr("A creates or restores. B returns.")
+                    },
+                );
+            }
+            Screen::BackupConfirm { entry, .. } => {
+                header(400.0, tr("Restore backup"));
+                top_layout.draw(
+                    &i18n::format(
+                        "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.",
+                        &[&entry.label],
+                    ),
+                    360.0,
+                    200.0,
+                    64.0,
+                    7,
+                    0,
                 );
             }
             Screen::CardChoice { .. } => {
@@ -5520,6 +5747,38 @@ fn main() {
                 button(12.0, 194.0, 140.0, tr("Move up [Y]"), None, up_style);
                 button(168.0, 194.0, 140.0, tr("Move down [X]"), None, down_style);
             }
+            Screen::SettingsBackups {
+                selected, backups, ..
+            } => {
+                header(320.0, tr("Backups"));
+                let length = backups.len() + 1;
+                let start = list_start(*selected, length);
+                for index in start..(start + SETTINGS_VISIBLE_ROWS).min(length) {
+                    let (x, y) = settings_tile(index - start);
+                    let style = if index == *selected { 0 } else { 6 };
+                    let text = if index == 0 {
+                        tr("Create backup now").to_owned()
+                    } else {
+                        backups[index - 1].row_label()
+                    };
+                    let label = Ui::ellipsize(&text, 0.50, SETTINGS_TILE_W - 12.0);
+                    Ui::draw_button(
+                        x,
+                        y,
+                        SETTINGS_TILE_W,
+                        SETTINGS_TILE_H,
+                        &label,
+                        None,
+                        style,
+                        false,
+                    );
+                }
+            }
+            Screen::BackupConfirm { .. } => {
+                header(320.0, tr("Confirm replacement"));
+                button(12.0, 194.0, 140.0, tr("Confirm [A]"), None, 0);
+                button(168.0, 194.0, 140.0, tr("Cancel [B]"), None, 6);
+            }
             Screen::CardChoice { selected, .. } => {
                 header(320.0, tr("Bury / Suspend"));
                 Ui::draw_button(
@@ -5578,6 +5837,8 @@ fn main() {
                 | Screen::SettingsChoice { .. }
                 | Screen::SettingsButton { .. }
                 | Screen::SettingsToolbar { .. }
+                | Screen::SettingsBackups { .. }
+                | Screen::BackupConfirm { .. }
         );
         if !hide_footer {
             footer(&cached_footer);

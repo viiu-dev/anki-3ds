@@ -287,5 +287,17 @@
     "Text spacing": "Text spacing",
     "Scrolling speed": "Scrolling speed",
     "Audio playback speed": "Audio playback speed",
-    "Replay audio": "Replay audio"
+    "Replay audio": "Replay audio",
+    "Backups": "Backups",
+    "Create or restore collection backups.": "Create or restore collection backups.",
+    "Create backup now": "Create backup now",
+    "Create a backup or select one to restore.": "Create a backup or select one to restore.",
+    "Backup: {0}": "Backup: {0}",
+    "No backups saved yet.": "No backups saved yet.",
+    "A creates or restores. B returns.": "A creates or restores. B returns.",
+    "Backup created: {0}": "Backup created: {0}",
+    "Restore backup": "Restore backup",
+    "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.": "Replace the current collection with backup {0}? Unsynced changes since this backup will be lost.",
+    "Backup restored": "Backup restored",
+    "Restored collection from {0}.": "Restored collection from {0}."
 }
