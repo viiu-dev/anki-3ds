@@ -52,14 +52,29 @@ jobs:
           assert not info['source_dirty']
           assert 'v' + info['version'] == os.environ['GITHUB_REF_NAME']
           PY
-      - name: Publish experimental release
+      - name: Generate FBI QR code for CIA asset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qrencode
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/anki-3ds.cia"
+          qrencode -o release/anki-3ds-cia-qr.png -s 10 -m 4 -l M "$url"
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo 'Release already published; preserving its existing assets and checksums.'
+            echo 'Release already exists; preserving its existing assets and checksums.'
             exit 0
           fi
+          extra_flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            extra_flags+=(--prerelease)
+          fi
+          if [[ "$GITHUB_REF_NAME" == "v1.0.0" ]]; then
+            extra_flags+=(--notes "")
+          else
+            extra_flags+=(--generate-notes)
+          fi
           gh release create "$GITHUB_REF_NAME" release/* \
-            --verify-tag --prerelease --title "Anki 3DS $GITHUB_REF_NAME" \
-            --generate-notes
+            --verify-tag --draft --title "Anki 3DS $GITHUB_REF_NAME" \
+            "${extra_flags[@]}"
