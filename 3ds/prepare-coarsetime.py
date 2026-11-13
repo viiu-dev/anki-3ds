@@ -18,9 +18,9 @@ from archive_utils import extract_sources
 root = Path(__file__).resolve().parents[1]
 lock = tomllib.loads((root / "Cargo.lock").read_text())
 package = next(p for p in lock["package"] if p["name"] == "coarsetime")
-assert package["version"] == "0.1.36"
+version = package["version"]
 cache = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")) / "registry"
-archives = list(cache.glob("cache/*/coarsetime-0.1.36.crate"))
+archives = list(cache.glob(f"cache/*/coarsetime-{version}.crate"))
 archive_path = next(
     (
         p
@@ -30,11 +30,11 @@ archive_path = next(
     None,
 )
 if archive_path is None:
-    archive_path = root / "out/3ds/sources/coarsetime-0.1.36.crate"
+    archive_path = root / f"out/3ds/sources/coarsetime-{version}.crate"
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     if not archive_path.exists():
         with urllib.request.urlopen(
-            "https://static.crates.io/crates/coarsetime/coarsetime-0.1.36.crate",
+            f"https://static.crates.io/crates/coarsetime/coarsetime-{version}.crate",
             timeout=120,
         ) as response:
             data = response.read()
@@ -50,10 +50,11 @@ if output.exists():
 with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
     with tarfile.open(archive_path) as archive:
         assert all(
-            Path(m.name).parts[0] == "coarsetime-0.1.36" for m in archive.getmembers()
+            Path(m.name).parts[0] == f"coarsetime-{version}"
+            for m in archive.getmembers()
         )
         extract_sources(archive, temporary)
-    shutil.copytree(Path(temporary) / "coarsetime-0.1.36", output)
+    shutil.copytree(Path(temporary) / f"coarsetime-{version}", output)
 subprocess.run(
     ["patch", "-p1", "-i", str(root / "3ds/coarsetime-horizon.patch")],
     cwd=output,

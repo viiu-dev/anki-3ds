@@ -1,4 +1,4 @@
-// Copyright: Ankitects Pty Ltd and contributors
+// Copyright: Anki Software, LLC and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 use std::collections::HashMap;
@@ -322,7 +322,7 @@ pub(crate) fn open_or_create<P: AsRef<Path>>(path: P) -> error::Result<Connectio
         db.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
             Some(trace),
-        );
+        )?;
     }
 
     // WAL needs either shared memory or exclusive locking. The SD VFS has no

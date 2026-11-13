@@ -44,7 +44,7 @@ docs = [
 # Local resolution guard; keep in sync with Dependabot cooldown.
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = { anki-mac-helper = false, anki-audio = false, briefcase = false }
+exclude-newer-package = { anki-mac-helper = false, anki-audio = false, briefcase = false, certifi = false, pip = false, virtualenv = false }
 required-version = ">=0.9.25"
 
 [tool.uv.workspace]
@@ -55,3 +55,8 @@ name = "testpypi"
 url = "https://test.pypi.org/simple/"
 publish-url = "https://test.pypi.org/legacy/"
 explicit = true
+
+[tool.pytest.ini_options]
+pythonpath = ["pylib", "out/pylib", "out/qt", "qt/tools"]
+addopts = "-p no:cacheprovider --import-mode=importlib"
+testpaths = ["pylib/tests", "qt/tests", "tools/tests"]

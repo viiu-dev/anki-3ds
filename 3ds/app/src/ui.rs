@@ -1114,37 +1114,6 @@ impl RichTextLayout {
         }
     }
 
-    /// Hint toggle at top-screen content coordinates, if any.
-    pub fn hint_at(&self, x: f32, y: f32, scroll: f32) -> Option<u16> {
-        let total = self.content_height + 2.0 * CARD_Y_PADDING;
-        let origin = if total <= TOP_HEIGHT {
-            CARD_Y_PADDING + (TOP_HEIGHT - total) / 2.0
-        } else {
-            CARD_Y_PADDING - scroll.max(0.0)
-        };
-        let content_left = (TOP_WIDTH - self.width).max(0.0) / 2.0;
-        for line in &self.lines {
-            let top = origin + line.top;
-            if y < top || y >= top + line.height {
-                continue;
-            }
-            let line_left = if line.indent > 0.01 {
-                content_left + line.indent
-            } else {
-                content_left + (self.width - line.width).max(0.0) / 2.0
-            };
-            for piece in &line.pieces {
-                if let Some(id) = piece.hint {
-                    let left = line_left + piece.x;
-                    if x >= left && x < left + piece.width {
-                        return Some(id);
-                    }
-                }
-            }
-        }
-        None
-    }
-
     pub fn max_scroll(&self) -> f32 {
         (self.content_height + 2.0 * CARD_Y_PADDING - TOP_HEIGHT).max(0.0)
     }
@@ -1530,10 +1499,6 @@ impl RichTextLayout {
             row_y,
             header,
         });
-    }
-
-    pub fn draw(&self, scroll: f32) {
-        self.draw_offset(scroll, 0.0, 0.0);
     }
 
     pub fn draw_offset(&self, scroll: f32, offset_x: f32, offset_y: f32) {

@@ -4584,6 +4584,7 @@ fn convert_mhchem(src: &str) -> String {
 /// Render a LaTeX math group to readable text. Super/subscripts whose
 /// characters all have Unicode forms are substituted inline; other markup is
 /// dropped or passed through by [`render_math_runs`].
+#[allow(dead_code)]
 pub fn render_math(src: &str) -> String {
     render_math_runs(src)
         .into_iter()
