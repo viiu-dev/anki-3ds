@@ -405,7 +405,7 @@ fn load_replay_mode() {
     load_bool_setting("replay_all_audio", &REPLAY_ALL_AUDIO);
 }
 
-pub const SCROLL_SPEEDS: [f32; 3] = [0.6, 1.0, 1.6];
+pub const SCROLL_SPEEDS: [f32; 5] = [0.6, 1.0, 1.6, 2.5, 4.0];
 static SCROLL_SPEED: AtomicU8 = AtomicU8::new(1);
 
 pub fn scroll_speed_index() -> usize {

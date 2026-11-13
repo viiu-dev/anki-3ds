@@ -1143,19 +1143,15 @@ impl Backend {
         Ok(())
     }
 
-    pub fn statistics(&mut self) -> Result<String> {
-        let mut counts = Vec::new();
-        for (label, query) in [
-            (tr("Total"), ""),
-            (tr("New"), "is:new"),
-            (tr("Learning"), "is:learn"),
-            (tr("Review"), "is:review"),
-            (tr("Suspended"), "is:suspended"),
-            (tr("Reviewed today"), "rated:1"),
-        ] {
-            counts.push(format!("{label}: {}", self.search(query)?.len()));
-        }
-        Ok(counts.join("\n"))
+    pub fn statistics(&mut self) -> Result<super::stats::Dashboard> {
+        let graphs = anki::services::StatsService::graphs(
+            &mut self.collection,
+            anki_proto::stats::GraphsRequest {
+                search: String::new(),
+                days: 0,
+            },
+        )?;
+        Ok(super::stats::Dashboard::from_graphs(graphs))
     }
 
     pub fn undo(&mut self) -> Result<()> {

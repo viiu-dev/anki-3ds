@@ -12,6 +12,7 @@ mod i18n;
 mod leds;
 mod media_sync;
 mod review_text;
+mod stats;
 mod sync;
 mod theme;
 mod time_correction;
@@ -1368,6 +1369,12 @@ enum Screen {
         selected: usize,
         previous: Box<Screen>,
     },
+    Stats {
+        data: Box<stats::Dashboard>,
+        page: stats::Page,
+        timeframe: stats::Timeframe,
+        previous: Box<Screen>,
+    },
     Info {
         title: String,
         text: String,
@@ -1676,9 +1683,9 @@ impl SettingsCategory {
 
     fn hint(self) -> &'static str {
         match self {
-            SettingsCategory::Appearance => "Theme, spacing, counts and scrolling.",
+            SettingsCategory::Appearance => "Theme, spacing and counts.",
             SettingsCategory::Audio => "Audio playback and review options.",
-            SettingsCategory::Controls => "Remap review buttons and reset defaults.",
+            SettingsCategory::Controls => "Scroll speed, review buttons and defaults.",
             SettingsCategory::Network => "Account, clock and media downloads.",
             SettingsCategory::Backups => "Create or restore collection backups.",
             SettingsCategory::System => "Hardware lights and help.",
@@ -1721,12 +1728,11 @@ enum SettingsItem {
     Toolbar,
 }
 
-const APPEARANCE_ITEMS: [SettingsItem; 9] = [
+const APPEARANCE_ITEMS: [SettingsItem; 8] = [
     SettingsItem::Choice(ChoiceKind::Theme),
     SettingsItem::Choice(ChoiceKind::Accent),
     SettingsItem::Choice(ChoiceKind::FontScale),
     SettingsItem::Choice(ChoiceKind::Spacing),
-    SettingsItem::Choice(ChoiceKind::ScrollSpeed),
     SettingsItem::Choice(ChoiceKind::Battery),
     SettingsItem::Toggle(ToggleKind::CardCounts),
     SettingsItem::Toggle(ToggleKind::RatingIntervals),
@@ -1739,7 +1745,8 @@ const AUDIO_ITEMS: [SettingsItem; 5] = [
     SettingsItem::Choice(ChoiceKind::ReplayMode),
     SettingsItem::Toggle(ToggleKind::RatingIcon),
 ];
-const CONTROLS_ITEMS: [SettingsItem; 12] = [
+const CONTROLS_ITEMS: [SettingsItem; 13] = [
+    SettingsItem::Choice(ChoiceKind::ScrollSpeed),
     SettingsItem::Binding(ReviewAction::ShowAnswer),
     SettingsItem::Binding(ReviewAction::Again),
     SettingsItem::Binding(ReviewAction::Hard),
@@ -1825,6 +1832,8 @@ fn choice_options(kind: ChoiceKind) -> Vec<String> {
             tr("Slow").to_owned(),
             tr("Normal").to_owned(),
             tr("Fast").to_owned(),
+            tr("Very fast").to_owned(),
+            tr("Extreme").to_owned(),
         ],
         ChoiceKind::Battery => {
             vec![
@@ -2602,6 +2611,10 @@ fn main() {
             Action::Left
         } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::X) {
             Action::Right
+        } else if matches!(screen, Screen::Stats { .. }) && down.contains(KeyPad::L) {
+            Action::Up
+        } else if matches!(screen, Screen::Stats { .. }) && down.contains(KeyPad::R) {
+            Action::Down
         } else if down.contains(KeyPad::A) {
             Action::Primary
         } else if repeat.intersects(KeyPad::DOWN | KeyPad::CPAD_DOWN | KeyPad::CSTICK_DOWN) {
@@ -2908,6 +2921,26 @@ fn main() {
                     Action::Primary
                 }
                 Screen::CardChoice { .. } if (150.0..192.0).contains(&y) => Action::Back,
+                Screen::Stats { page, timeframe, .. } => match stats::touch_hit(x, y) {
+                    stats::TouchAction::Page(next) => {
+                        *page = next;
+                        event(&format!(
+                            "STATS_PAGE {} range={}",
+                            *page as usize, *timeframe as usize
+                        ));
+                        Action::None
+                    }
+                    stats::TouchAction::Timeframe(next) => {
+                        *timeframe = next;
+                        event(&format!(
+                            "STATS_PAGE {} range={}",
+                            *page as usize, *timeframe as usize
+                        ));
+                        Action::None
+                    }
+                    stats::TouchAction::Back => Action::Back,
+                    stats::TouchAction::None => Action::None,
+                },
                 Screen::Info { .. } if (194.0..222.0).contains(&y) => Action::Back,
                 Screen::Empty { .. } if (110.0..144.0).contains(&y) => Action::Back,
                 _ => Action::None,
@@ -2921,6 +2954,7 @@ fn main() {
                         | Screen::SettingsBackups { .. }
                         | Screen::BackupConfirm { .. }
                         | Screen::CardChoice { .. }
+                        | Screen::Stats { .. }
                 )
             {
                 action = if x < 160.0 {
@@ -3130,6 +3164,7 @@ fn main() {
                             }
                             SettingsItem::ResetControls => {
                                 controls::reset()?;
+                                let _ = i18n::set_scroll_speed_index(1);
                                 event("CONTROLS_RESET");
                             }
                             SettingsItem::Toolbar => {
@@ -3769,16 +3804,25 @@ fn main() {
                     }
                     backend.as_mut().unwrap().set_clock_offset(offset)?;
                 }
-                Action::Help | Action::Stats => {
-                    let (title, text) = match action {
-                        Action::Help => (tr("Help"), tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: use the buttons assigned in Settings > Controls and keybinds.\nScroll the top screen with the assigned scroll buttons or the Circle Pad.\nSELECT opens Menu. B returns. START closes and exits.\nSettings also has appearance, audio, controls and account options.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into()),
-                        Action::Stats => (tr("Statistics"), backend.as_mut().ok_or("collection unavailable")?.statistics()?),
-                        _ => unreachable!(),
-                    };
+                Action::Help => {
                     let previous = std::mem::replace(&mut screen, Screen::Decks);
                     screen = Screen::Info {
-                        title: title.into(),
-                        text,
+                        title: tr("Help").into(),
+                        text: tr("Decks: UP/DOWN selects. A studies. LEFT/RIGHT expands or collapses.\nReview: use the buttons assigned in Settings > Controls and keybinds.\nScroll the top screen with the assigned scroll buttons or the Circle Pad.\nSELECT opens Menu. B returns. START closes and exits.\nSettings also has appearance, audio, controls and account options.\nAdd, Edit and Browse manage notes. Save confirms changes; Cancel discards them.").into(),
+                        previous: Box::new(previous),
+                    };
+                    card_scroll = 0;
+                }
+                Action::Stats => {
+                    let data = backend
+                        .as_mut()
+                        .ok_or("collection unavailable")?
+                        .statistics()?;
+                    let previous = std::mem::replace(&mut screen, Screen::Decks);
+                    screen = Screen::Stats {
+                        data: Box::new(data),
+                        page: stats::Page::Overview,
+                        timeframe: stats::Timeframe::OneMonth,
                         previous: Box::new(previous),
                     };
                     card_scroll = 0;
@@ -4103,7 +4147,8 @@ fn main() {
                         | Screen::SettingsToolbar { previous, .. }
                         | Screen::SettingsBackups { previous, .. }
                         | Screen::BackupConfirm { previous, .. }
-                        | Screen::CardChoice { previous, .. } => *previous,
+                        | Screen::CardChoice { previous, .. }
+                        | Screen::Stats { previous, .. } => *previous,
                         Screen::Editor {
                             return_query: Some(query),
                             ..
@@ -4458,6 +4503,13 @@ fn main() {
                                     matches!(action, Action::Down),
                                 );
                             }
+                            Screen::Stats { page, timeframe, .. } => {
+                                *page = page.step(matches!(action, Action::Down));
+                                event(&format!(
+                                    "STATS_PAGE {} range={}",
+                                    *page as usize, *timeframe as usize
+                                ));
+                            }
                             _ => {
                                 card_scroll = next(card_scroll, top_max + 1);
                             }
@@ -4505,6 +4557,12 @@ fn main() {
                         } else {
                             selected.saturating_sub(1)
                         };
+                    } else if let Screen::Stats { page, timeframe, .. } = &mut screen {
+                        *timeframe = timeframe.step(matches!(action, Action::Right));
+                        event(&format!(
+                            "STATS_PAGE {} range={}",
+                            *page as usize, *timeframe as usize
+                        ));
                     } else if matches!(
                         screen,
                         Screen::Info { .. } | Screen::Browser(_) | Screen::Editor { .. }
@@ -4763,6 +4821,7 @@ fn main() {
             Screen::SettingsBackups { .. } => "SETTINGS_BACKUPS",
             Screen::BackupConfirm { .. } => "BACKUP_CONFIRM",
             Screen::CardChoice { .. } => "CARD_CHOICE",
+            Screen::Stats { .. } => "STATS",
             Screen::Info { .. } => "INFO",
             Screen::Error(_) => "ERROR",
         };
@@ -5262,6 +5321,14 @@ fn main() {
                     current_theme().text_muted,
                     tr("Choose an action for the current card."),
                 );
+            }
+            Screen::Stats {
+                data,
+                page,
+                timeframe,
+                ..
+            } => {
+                stats::draw_top(data, *page, *timeframe);
             }
             Screen::Info { title, text, .. } => {
                 Ui::fit_text(200.0, 30.0, 0.60, 360.0, current_theme().text, title);
@@ -5803,6 +5870,11 @@ fn main() {
                 );
                 button(60.0, 160.0, 200.0, tr("Cancel [B]"), None, 6);
             }
+            Screen::Stats {
+                page, timeframe, ..
+            } => {
+                stats::draw_bottom(*page, *timeframe);
+            }
             Screen::Info { title, .. } => {
                 header(320.0, title);
                 button(60.0, 194.0, 200.0, tr("Back [B]"), None, 0);
@@ -5832,6 +5904,7 @@ fn main() {
                 | Screen::Answer { .. }
                 | Screen::SyncChoice { .. }
                 | Screen::CardChoice { .. }
+                | Screen::Stats { .. }
                 | Screen::Settings { .. }
                 | Screen::SettingsCategory { .. }
                 | Screen::SettingsChoice { .. }
