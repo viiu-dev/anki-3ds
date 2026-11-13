@@ -63,6 +63,7 @@ pub fn init() {
     load_scroll_speed();
     load_spacing();
     load_toolbar();
+    load_quickstart_done();
     let saved = fs::read_to_string(PATH)
         .ok()
         .and_then(|text| index_of(text.trim()));
@@ -777,6 +778,22 @@ fn load_download_connections() {
         .unwrap_or(1)
         .clamp(1, MAX_DOWNLOAD_CONNECTIONS);
     DOWNLOAD_CONNECTIONS.store(value, Ordering::Relaxed);
+}
+
+static QUICKSTART_DONE: AtomicBool = AtomicBool::new(false);
+
+pub fn quickstart_done() -> bool {
+    QUICKSTART_DONE.load(Ordering::Relaxed)
+}
+
+pub fn set_quickstart_done(value: bool) -> io::Result<()> {
+    write_setting("quickstart_done", serde_json::json!(value))?;
+    QUICKSTART_DONE.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+fn load_quickstart_done() {
+    load_bool_setting("quickstart_done", &QUICKSTART_DONE);
 }
 
 pub fn tr(message: &'static str) -> &'static str {

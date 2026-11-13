@@ -11,6 +11,7 @@ mod event_log;
 mod i18n;
 mod leds;
 mod media_sync;
+mod quickstart;
 mod review_text;
 mod stats;
 mod sync;
@@ -1375,6 +1376,11 @@ enum Screen {
         timeframe: stats::Timeframe,
         previous: Box<Screen>,
     },
+    Quickstart {
+        step: usize,
+        selected: usize,
+        previous: Box<Screen>,
+    },
     Info {
         title: String,
         text: String,
@@ -1406,6 +1412,7 @@ enum Action {
     Options,
     Menu,
     Settings,
+    Quickstart,
     Help,
     Stats,
     Sync,
@@ -1768,8 +1775,9 @@ const NETWORK_ITEMS: [SettingsItem; 6] = [
     SettingsItem::Choice(ChoiceKind::Connections),
     SettingsItem::Action(Action::MediaSync, "Media sync"),
 ];
-const SYSTEM_ITEMS: [SettingsItem; 2] = [
+const SYSTEM_ITEMS: [SettingsItem; 3] = [
     SettingsItem::Toggle(ToggleKind::ConsoleLeds),
+    SettingsItem::Action(Action::Quickstart, "Quickstart guide"),
     SettingsItem::Action(Action::Help, "Help"),
 ];
 const LANGUAGE_ITEMS: [SettingsItem; 1] = [SettingsItem::Choice(ChoiceKind::Language)];
@@ -2299,7 +2307,15 @@ fn main() {
             Some(b) => match b.deck_tree() {
                 Ok(tree) => {
                     root = tree;
-                    Screen::Decks
+                    if i18n::quickstart_done() {
+                        Screen::Decks
+                    } else {
+                        Screen::Quickstart {
+                            step: 0,
+                            selected: i18n::language_index(),
+                            previous: Box::new(Screen::Decks),
+                        }
+                    }
                 }
                 Err(e) => Screen::Error(error_text(e.as_ref())),
             },
@@ -2628,6 +2644,7 @@ fn main() {
         } else {
             Action::None
         };
+        let mut quickstart_touch = None;
         if down.contains(KeyPad::TOUCH) {
             let (x, y) = hid.touch_position();
             if trace_touch {
@@ -2941,6 +2958,10 @@ fn main() {
                     stats::TouchAction::Back => Action::Back,
                     stats::TouchAction::None => Action::None,
                 },
+                Screen::Quickstart { step, .. } => {
+                    quickstart_touch = Some(quickstart::touch_hit(*step, x, y));
+                    Action::None
+                }
                 Screen::Info { .. } if (194.0..222.0).contains(&y) => Action::Back,
                 Screen::Empty { .. } if (110.0..144.0).contains(&y) => Action::Back,
                 _ => Action::None,
@@ -2955,6 +2976,7 @@ fn main() {
                         | Screen::BackupConfirm { .. }
                         | Screen::CardChoice { .. }
                         | Screen::Stats { .. }
+                        | Screen::Quickstart { .. }
                 )
             {
                 action = if x < 160.0 {
@@ -2996,6 +3018,7 @@ fn main() {
                     "SAVE" => Action::Save,
                     "OPTIONS" => Action::Options,
                     "SETTINGS" => Action::Settings,
+                    "QUICKSTART" => Action::Quickstart,
                     "MENU" => Action::Menu,
                     "HELP" => Action::Help,
                     "STATS" => Action::Stats,
@@ -3240,13 +3263,12 @@ fn main() {
                             }
                             SettingsItem::Action(chosen, _) => {
                                 action = chosen;
-                                let old = std::mem::replace(&mut screen, Screen::Decks);
-                                if let Screen::SettingsCategory { previous, .. } = old {
-                                    screen = *previous;
-                                }
                             }
                         }
-                        return Ok(());
+                        if !matches!(item, SettingsItem::Action(chosen, _) if !matches!(chosen, Action::MediaSync))
+                        {
+                            return Ok(());
+                        }
                     }
                     Action::Left | Action::Right => {
                         let direction = if matches!(action, Action::Right) {
@@ -3524,6 +3546,130 @@ fn main() {
                     previous: Box::new(Screen::Decks),
                 };
                 return Ok(());
+            }
+            let mut quickstart_finish = None;
+            if let Screen::Quickstart { step, selected, .. } = &mut screen {
+                if let Some(hit) = quickstart_touch {
+                    match hit {
+                        quickstart::TouchAction::SelectLanguage(idx) => {
+                            *selected = idx;
+                            i18n::set_language(idx)?;
+                            if let Some(active) = backend.as_mut() {
+                                active.set_language(None)?;
+                            }
+                            event(&format!("LANGUAGE {}", i18n::language()));
+                            return Ok(());
+                        }
+                        quickstart::TouchAction::SelectRow(row) => {
+                            *selected = row;
+                            quickstart::apply_step_change(*step, row, true)?;
+                            event(&format!("QUICKSTART_OPTION step={} row={}", *step, row));
+                            return Ok(());
+                        }
+                        quickstart::TouchAction::Next => action = Action::Primary,
+                        quickstart::TouchAction::Back => action = Action::Back,
+                        quickstart::TouchAction::Skip => quickstart_finish = Some(0),
+                        quickstart::TouchAction::Finish => quickstart_finish = Some(1),
+                        quickstart::TouchAction::LoginSync => quickstart_finish = Some(2),
+                        quickstart::TouchAction::None => return Ok(()),
+                    }
+                }
+                if quickstart_finish.is_none() {
+                    match action {
+                        Action::Up | Action::Down | Action::Left | Action::Right => {
+                            match *step {
+                                0 => {
+                                    let len = i18n::LANGUAGES.len();
+                                    let next = match action {
+                                        Action::Left => selected.saturating_sub(1),
+                                        Action::Right => (*selected + 1).min(len - 1),
+                                        Action::Up => selected.saturating_sub(3),
+                                        Action::Down => (*selected + 3).min(len - 1),
+                                        _ => *selected,
+                                    };
+                                    if next != *selected {
+                                        *selected = next;
+                                        i18n::set_language(next)?;
+                                        if let Some(active) = backend.as_mut() {
+                                            active.set_language(None)?;
+                                        }
+                                        event(&format!("LANGUAGE {}", i18n::language()));
+                                    }
+                                }
+                                1 | 2 => match action {
+                                    Action::Up | Action::Down => {
+                                        *selected =
+                                            list_step(*selected, 3, matches!(action, Action::Down));
+                                    }
+                                    Action::Left | Action::Right => {
+                                        quickstart::apply_step_change(
+                                            *step,
+                                            *selected,
+                                            matches!(action, Action::Right),
+                                        )?;
+                                        event(&format!(
+                                            "QUICKSTART_OPTION step={} row={}",
+                                            *step, *selected
+                                        ));
+                                    }
+                                    _ => {}
+                                },
+                                _ => {
+                                    *selected = 1 - (*selected).min(1);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Action::Primary => {
+                            if *step + 1 < quickstart::STEPS {
+                                *step += 1;
+                                *selected = 0;
+                                event(&format!("QUICKSTART_STEP {}", *step));
+                                return Ok(());
+                            } else {
+                                quickstart_finish = Some(if *selected == 0 { 1 } else { 2 });
+                            }
+                        }
+                        Action::Back => {
+                            if *step > 0 {
+                                *step -= 1;
+                                *selected = if *step == 0 {
+                                    i18n::language_index()
+                                } else {
+                                    0
+                                };
+                                event(&format!("QUICKSTART_STEP {}", *step));
+                                return Ok(());
+                            } else {
+                                quickstart_finish = Some(0);
+                            }
+                        }
+                        _ => return Ok(()),
+                    }
+                }
+            }
+            if let Some(outcome) = quickstart_finish {
+                i18n::set_quickstart_done(true)?;
+                match outcome {
+                    0 => {
+                        event("QUICKSTART_SKIP");
+                        let old = std::mem::replace(&mut screen, Screen::Decks);
+                        if let Screen::Quickstart { previous, .. } = old {
+                            screen = *previous;
+                        }
+                        return Ok(());
+                    }
+                    1 => {
+                        event("QUICKSTART_FINISH");
+                        screen = Screen::Decks;
+                        return Ok(());
+                    }
+                    _ => {
+                        event("QUICKSTART_LOGIN_SYNC");
+                        screen = Screen::Decks;
+                        action = Action::Login;
+                    }
+                }
             }
             let mut bury = None;
             if let Screen::CardChoice {
@@ -3803,6 +3949,15 @@ fn main() {
                         screen = Screen::Decks;
                     }
                     backend.as_mut().unwrap().set_clock_offset(offset)?;
+                }
+                Action::Quickstart => {
+                    let previous = std::mem::replace(&mut screen, Screen::Decks);
+                    screen = Screen::Quickstart {
+                        step: 0,
+                        selected: i18n::language_index(),
+                        previous: Box::new(previous),
+                    };
+                    card_scroll = 0;
                 }
                 Action::Help => {
                     let previous = std::mem::replace(&mut screen, Screen::Decks);
@@ -4822,6 +4977,7 @@ fn main() {
             Screen::BackupConfirm { .. } => "BACKUP_CONFIRM",
             Screen::CardChoice { .. } => "CARD_CHOICE",
             Screen::Stats { .. } => "STATS",
+            Screen::Quickstart { .. } => "QUICKSTART",
             Screen::Info { .. } => "INFO",
             Screen::Error(_) => "ERROR",
         };
@@ -5329,6 +5485,9 @@ fn main() {
                 ..
             } => {
                 stats::draw_top(data, *page, *timeframe);
+            }
+            Screen::Quickstart { step, selected, .. } => {
+                quickstart::draw_top(*step, *selected);
             }
             Screen::Info { title, text, .. } => {
                 Ui::fit_text(200.0, 30.0, 0.60, 360.0, current_theme().text, title);
@@ -5875,6 +6034,9 @@ fn main() {
             } => {
                 stats::draw_bottom(*page, *timeframe);
             }
+            Screen::Quickstart { step, selected, .. } => {
+                quickstart::draw_bottom(*step, *selected);
+            }
             Screen::Info { title, .. } => {
                 header(320.0, title);
                 button(60.0, 194.0, 200.0, tr("Back [B]"), None, 0);
@@ -5905,6 +6067,7 @@ fn main() {
                 | Screen::SyncChoice { .. }
                 | Screen::CardChoice { .. }
                 | Screen::Stats { .. }
+                | Screen::Quickstart { .. }
                 | Screen::Settings { .. }
                 | Screen::SettingsCategory { .. }
                 | Screen::SettingsChoice { .. }
