@@ -1016,7 +1016,7 @@ impl RichTextLayout {
         let block_gap = CARD_BLOCK_GAP * font_scale * spacing;
         let section_gap = CARD_SECTION_GAP * font_scale * spacing;
         let list_gap = CARD_LIST_GAP * font_scale * spacing;
-        let rule_height = CARD_RULE_HEIGHT * font_scale;
+        let rule_height = CARD_RULE_HEIGHT * font_scale * spacing;
         let mut scratch = LayoutScratch {
             lines: Vec::new(),
             tables: Vec::new(),

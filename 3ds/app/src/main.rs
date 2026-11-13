@@ -336,12 +336,13 @@ fn card_audio(card: &backend::OfferedCard, answer: bool) -> Vec<backend::MediaRe
 }
 
 fn replay_audio(card: &backend::OfferedCard, answer: bool) -> Vec<backend::MediaRef> {
-    let mut audio = if answer && i18n::replay_all_audio() {
-        card_audio(card, false)
+    let mut audio = if i18n::replay_all_audio() {
+        let mut all = card_audio(card, false);
+        all.extend(card_audio(card, true));
+        all
     } else {
-        Vec::new()
+        card_audio(card, answer)
     };
-    audio.extend(card_audio(card, answer));
     let mut seen = HashSet::new();
     audio.retain(|item| seen.insert(item.filename.clone()));
     audio
@@ -1816,9 +1817,9 @@ fn choice_options(kind: ChoiceKind) -> Vec<String> {
             ]
         }
         ChoiceKind::Connections => (1..=4).map(|value| value.to_string()).collect(),
-        ChoiceKind::AudioSpeed => i18n::AUDIO_SPEEDS
+        ChoiceKind::AudioSpeed => i18n::AUDIO_SPEED_LABELS
             .iter()
-            .map(|value| format!("{value}x"))
+            .map(|value| (*value).to_owned())
             .collect(),
         ChoiceKind::ReplayMode => vec![
             tr("Current side").to_owned(),
@@ -2908,6 +2909,7 @@ fn main() {
                     "BROWSE" => Action::Browse,
                     "SAVE" => Action::Save,
                     "OPTIONS" => Action::Options,
+                    "SETTINGS" => Action::Settings,
                     "MENU" => Action::Menu,
                     "HELP" => Action::Help,
                     "STATS" => Action::Stats,
@@ -3793,11 +3795,16 @@ fn main() {
                             }
                         }
                     };
-                    audio_index = chosen;
-                    audio_page = chosen / AUDIO_VISIBLE;
                     audio_queue = queue;
                     audio_queue_pos = chosen;
                     let (filename, resolved) = audio_queue[chosen].clone();
+                    if let Some(side_pos) = card_audio(card, answer)
+                        .iter()
+                        .position(|item| item.filename == filename)
+                    {
+                        audio_index = side_pos;
+                        audio_page = side_pos / AUDIO_VISIBLE;
+                    }
                     match Ui::audio_play(&resolved) {
                         AudioAttempt::Done(true) => {
                             playing_audio = Some(filename.clone());
@@ -4194,7 +4201,7 @@ fn main() {
                         }
                     };
                     if matches!(screen, Screen::Question { .. } | Screen::Answer { .. }) {
-                        let step = 19.0 * i18n::font_scale_factor();
+                        let step = 19.0 * i18n::font_scale_factor() * i18n::scroll_speed_factor();
                         let delta = if matches!(action, Action::Down) {
                             step
                         } else {
@@ -4341,9 +4348,18 @@ fn main() {
                         };
                     }
                 }
+                Action::Settings => {
+                    if !matches!(screen, Screen::Settings { .. }) {
+                        let previous = std::mem::replace(&mut screen, Screen::Decks);
+                        screen = Screen::Settings {
+                            selected: 0,
+                            previous: Box::new(previous),
+                        };
+                        card_scroll = 0;
+                    }
+                }
                 Action::None
                 | Action::Menu
-                | Action::Settings
                 | Action::MediaSync
                 | Action::Exit => {}
             }
@@ -4417,6 +4433,19 @@ fn main() {
                 match Ui::audio_play(&resolved) {
                     AudioAttempt::Done(true) => {
                         playing_audio = Some(filename.clone());
+                        if let Some((card, answer)) = match &screen {
+                            Screen::Question { card, .. } => Some((card, false)),
+                            Screen::Answer { card, .. } => Some((card, true)),
+                            _ => None,
+                        } {
+                            if let Some(side_pos) = card_audio(card, answer)
+                                .iter()
+                                .position(|item| item.filename == filename)
+                            {
+                                audio_index = side_pos;
+                                audio_page = side_pos / AUDIO_VISIBLE;
+                            }
+                        }
                         event(&format!(
                             "AUDIO queue index={audio_queue_pos} ok=true file={filename}"
                         ));

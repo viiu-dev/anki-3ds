@@ -334,15 +334,32 @@ impl AccentKind {
     }
 }
 
+fn blend_rgb(base: u32, r: u8, g: u8, b: u8, alpha: u8) -> u32 {
+    let br = (base & 0xff) as u16;
+    let bg = ((base >> 8) & 0xff) as u16;
+    let bb = ((base >> 16) & 0xff) as u16;
+    let a = u16::from(alpha);
+    let inv = 255 - a;
+    c(
+        ((u16::from(r) * a + br * inv) / 255) as u8,
+        ((u16::from(g) * a + bg * inv) / 255) as u8,
+        ((u16::from(b) * a + bb * inv) / 255) as u8,
+    )
+}
+
 pub fn current() -> Theme {
     let mut theme = THEMES[INDEX.load(Ordering::Relaxed)];
     let accent = AccentKind::from_index(ACCENT_INDEX.load(Ordering::Relaxed));
     if let Some((r, g, b)) = accent.rgb() {
         let color = c(r, g, b);
         let luminance = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+        let dark = is_dark();
         theme.accent = color;
         theme.new = color;
         theme.tab_active_fg = color;
+        theme.tab_active_bg = blend_rgb(theme.surface, r, g, b, if dark { 68 } else { 42 });
+        theme.row_selected = blend_rgb(theme.surface, r, g, b, if dark { 52 } else { 34 });
+        theme.cloze_bg = blend_rgb(theme.surface, r, g, b, if dark { 68 } else { 46 });
         theme.on_accent = if luminance > 150.0 {
             c(0, 0, 0)
         } else {

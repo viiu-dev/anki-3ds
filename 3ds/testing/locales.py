@@ -8,17 +8,24 @@ import re
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1] / "app"
-en = json.loads((root / "locales/en.json").read_text())
-es = json.loads((root / "locales/es.json").read_text())
-assert en.keys() == es.keys(), "language catalogs differ"
-for key in en:
-    assert re.findall(r"\{\d+\}", en[key]) == re.findall(r"\{\d+\}", es[key]), key
-    assert en[key] and es[key], key
+locales = {
+    path.stem: json.loads(path.read_text(encoding="utf-8"))
+    for path in sorted((root / "locales").glob("*.json"))
+}
+assert "en" in locales, "missing English catalog"
+en = locales["en"]
+for lang, catalog in locales.items():
+    assert en.keys() == catalog.keys(), f"language catalogs differ: {lang}"
+    for key in en:
+        assert re.findall(r"\{\d+\}", en[key]) == re.findall(
+            r"\{\d+\}", catalog[key]
+        ), (lang, key)
+        assert en[key] and catalog[key], (lang, key)
 for path in (root / "src").glob("*.rs"):
     for literal in re.findall(
         r'(?:tr|i18n::format)\(\s*("(?:[^"\\]|\\.)*")', path.read_text()
     ):
         assert json.loads(literal) in en, (path, literal)
 print(
-    f"PASS: {len(en)} messages, two catalogs, all formatting placeholders and source references"
+    f"PASS: {len(en)} messages, {len(locales)} catalogs, all formatting placeholders and source references"
 )

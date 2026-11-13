@@ -359,6 +359,7 @@ fn load_rating_intervals() {
 }
 
 pub const AUDIO_SPEEDS: [f32; 4] = [0.75, 1.0, 1.25, 1.5];
+pub const AUDIO_SPEED_LABELS: [&str; 4] = ["0.75x", "1.0x", "1.25x", "1.5x"];
 static AUDIO_SPEED: AtomicU8 = AtomicU8::new(1);
 
 pub fn audio_speed_index() -> usize {

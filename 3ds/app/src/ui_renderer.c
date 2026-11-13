@@ -1442,6 +1442,7 @@ static char s_prefetch_audio_path[MEDIA_PATH_MAX];
 static ndspWaveBuf s_audio_wave;
 static bool s_audio_ready = false;
 static float s_audio_speed = 1.0f;
+static float s_applied_speed = 1.0f;
 static float s_audio_rate = 44100.0f;
 
 static uint16_t audio_le16(const uint8_t* data) {
@@ -1530,17 +1531,66 @@ void ui_audio_stop(void) {
     ndspChnSetPaused(AUDIO_CHANNEL, true);
 }
 
+static float audio_apply_speed(int channels, size_t* inout_samples) {
+    if (fabsf(s_audio_speed - 1.0f) < 0.01f || !s_audio_pcm || !inout_samples || channels < 1) {
+        return 1.0f;
+    }
+    size_t in_frames = *inout_samples / (size_t)channels;
+    if (in_frames < 2) {
+        return 1.0f;
+    }
+    size_t max_frames = s_audio_capacity / (sizeof(int16_t) * (size_t)channels);
+    double out_calc = floor(((double)(in_frames - 1)) / (double)s_audio_speed) + 1.0;
+    size_t out_frames = out_calc < 1.0 ? 1 : (size_t)out_calc;
+    if (out_frames > max_frames) {
+        return 1.0f;
+    }
+    if (s_audio_speed > 1.0f) {
+        for (size_t i = 0; i < out_frames; i++) {
+            double pos = (double)i * (double)s_audio_speed;
+            size_t idx0 = (size_t)pos;
+            if (idx0 >= in_frames) idx0 = in_frames - 1;
+            size_t idx1 = idx0 + 1 < in_frames ? idx0 + 1 : idx0;
+            double frac = pos - (double)idx0;
+            for (int ch = 0; ch < channels; ch++) {
+                double a = (double)s_audio_pcm[idx0 * (size_t)channels + (size_t)ch];
+                double b = (double)s_audio_pcm[idx1 * (size_t)channels + (size_t)ch];
+                s_audio_pcm[i * (size_t)channels + (size_t)ch] =
+                    audio_clamp16((int32_t)llround(a + (b - a) * frac));
+            }
+        }
+    } else {
+        for (size_t i = out_frames; i-- > 0;) {
+            double pos = (double)i * (double)s_audio_speed;
+            size_t idx0 = (size_t)pos;
+            if (idx0 >= in_frames) idx0 = in_frames - 1;
+            size_t idx1 = (idx0 + 1 < in_frames && pos > (double)idx0) ? idx0 + 1 : idx0;
+            double frac = pos - (double)idx0;
+            for (int ch = 0; ch < channels; ch++) {
+                double a = (double)s_audio_pcm[idx0 * (size_t)channels + (size_t)ch];
+                double b = (double)s_audio_pcm[idx1 * (size_t)channels + (size_t)ch];
+                s_audio_pcm[i * (size_t)channels + (size_t)ch] =
+                    audio_clamp16((int32_t)llround(a + (b - a) * frac));
+            }
+        }
+    }
+    *inout_samples = out_frames * (size_t)channels;
+    return s_audio_speed;
+}
+
 static bool audio_start(int channels, int rate, size_t samples) {
     if (channels < 1 || channels > 2 || rate < 4000 || rate > 192000 || samples == 0) {
         return false;
     }
     if (samples % (size_t)channels != 0) return false;
+    if (samples / (size_t)channels == 0) return false;
+    ui_audio_stop();
+    s_applied_speed = audio_apply_speed(channels, &samples);
     size_t frames = samples / (size_t)channels;
     if (frames == 0) return false;
-    float playback_rate = (float)rate * s_audio_speed;
+    float playback_rate = (float)rate * (s_audio_speed / s_applied_speed);
     if (playback_rate < 4000.0f) playback_rate = 4000.0f;
     if (playback_rate > 192000.0f) playback_rate = 192000.0f;
-    ui_audio_stop();
     memset(&s_audio_wave, 0, sizeof(s_audio_wave));
     s_audio_wave.data_vaddr = s_audio_pcm;
     s_audio_wave.nsamples = (u32)frames;
@@ -1562,7 +1612,8 @@ void ui_audio_set_speed(float speed) {
     if (speed > 2.0f) speed = 2.0f;
     s_audio_speed = speed;
     if (s_audio_ready && ndspChnIsPlaying(AUDIO_CHANNEL)) {
-        float playback_rate = s_audio_rate * s_audio_speed;
+        float denom = s_applied_speed > 0.0f ? s_applied_speed : 1.0f;
+        float playback_rate = s_audio_rate * (s_audio_speed / denom);
         if (playback_rate < 4000.0f) playback_rate = 4000.0f;
         if (playback_rate > 192000.0f) playback_rate = 192000.0f;
         ndspChnSetRate(AUDIO_CHANNEL, playback_rate);
@@ -2757,7 +2808,7 @@ static void icon_card(float x, float y, float scale, uint32_t color) {
 
 void ui_draw_icon_help(float x, float y, float size) {
     float scale = size / 24.0f;
-    uint32_t color = C2D_RGBA(37, 99, 235, 255);
+    uint32_t color = g_theme.accent;
     icon_arc(x, y, scale, 12, 12, 9, 0, 360, color);
     icon_arc(x, y, scale, 12, 10, 3, 200, 250, color);
     icon_line(x, y, scale, 12, 13, 12, 14, color);
@@ -2766,7 +2817,7 @@ void ui_draw_icon_help(float x, float y, float size) {
 
 void ui_draw_icon_stats(float x, float y, float size) {
     float scale = size / 24.0f;
-    uint32_t color = C2D_RGBA(37, 99, 235, 255);
+    uint32_t color = g_theme.accent;
     icon_line(x, y, scale, 4, 20, 20, 20, color);
     icon_line(x, y, scale, 6, 15, 6, 17, color);
     icon_line(x, y, scale, 12, 10, 12, 17, color);
@@ -2775,7 +2826,7 @@ void ui_draw_icon_stats(float x, float y, float size) {
 
 void ui_draw_icon_gear(float x, float y, float size) {
     float scale = size / 24.0f;
-    uint32_t color = C2D_RGBA(37, 99, 235, 255);
+    uint32_t color = g_theme.accent;
     icon_arc(x, y, scale, 12, 12, 6, 0, 360, color);
     icon_arc(x, y, scale, 12, 12, 2, 0, 360, color);
     for (int i = 0; i < 8; i++) {
