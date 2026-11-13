@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "anki-3ds"
-version = "0.3.2"
+version = "1.0.0"
 dependencies = [
  "ammonia",
  "anki",
