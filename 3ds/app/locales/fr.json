@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Animation festive à la fin d'un paquet.",
     "All animations": "Toutes les animations",
     "A or LEFT/RIGHT toggles. B returns.": "A ou GAUCHE/DROITE active. B revient.",
-    "Deck complete!": "Paquet terminé !"
+    "Deck complete!": "Paquet terminé !",
+    "UI Sound Effects": "Effets sonores",
+    "UI Sound Effects: {0}": "Effets sonores : {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "Sons discrets pour les réponses, notes et fins de paquet.",
+    "Sound effects volume": "Volume des effets"
 }

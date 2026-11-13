@@ -65,6 +65,8 @@ pub fn init() {
     load_toolbar();
     load_quickstart_done();
     load_animations();
+    load_ui_sfx();
+    load_sfx_volume();
     let saved = fs::read_to_string(PATH)
         .ok()
         .and_then(|text| index_of(text.trim()));
@@ -944,6 +946,52 @@ fn load_animations() {
         }
     }
     ANIM_STATE.store(state, Ordering::Relaxed);
+}
+
+static UI_SFX: AtomicBool = AtomicBool::new(false);
+pub const SFX_VOLUMES: [u8; 4] = [25, 50, 75, 100];
+static SFX_VOLUME: AtomicU8 = AtomicU8::new(2);
+
+pub fn ui_sfx() -> bool {
+    UI_SFX.load(Ordering::Relaxed)
+}
+
+pub fn toggle_ui_sfx() -> io::Result<bool> {
+    let value = !ui_sfx();
+    write_setting("ui_sfx", serde_json::json!(value))?;
+    UI_SFX.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_ui_sfx() {
+    load_bool_setting("ui_sfx", &UI_SFX);
+}
+
+pub fn sfx_volume_index() -> usize {
+    usize::from(SFX_VOLUME.load(Ordering::Relaxed)).min(SFX_VOLUMES.len() - 1)
+}
+
+pub fn sfx_volume() -> f32 {
+    f32::from(SFX_VOLUMES[sfx_volume_index()]) / 100.0
+}
+
+pub fn set_sfx_volume_index(index: usize) -> io::Result<u8> {
+    let index = index.min(SFX_VOLUMES.len() - 1);
+    write_setting("ui_sfx_volume", serde_json::json!(index))?;
+    SFX_VOLUME.store(index as u8, Ordering::Relaxed);
+    Ok(SFX_VOLUMES[index])
+}
+
+fn load_sfx_volume() {
+    let Ok(text) = fs::read_to_string(SETTINGS_PATH) else {
+        return;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("ui_sfx_volume").and_then(|v| v.as_u64()))
+        .unwrap_or(2)
+        .min(SFX_VOLUMES.len() as u64 - 1);
+    SFX_VOLUME.store(value as u8, Ordering::Relaxed);
 }
 
 pub fn tr(message: &'static str) -> &'static str {

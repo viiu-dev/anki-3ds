@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Animazione celebrativa al termine del mazzo.",
     "All animations": "Tutte le animazioni",
     "A or LEFT/RIGHT toggles. B returns.": "A o SIN/DES attiva. B indietro.",
-    "Deck complete!": "Mazzo completato!"
+    "Deck complete!": "Mazzo completato!",
+    "UI Sound Effects": "Effetti sonori",
+    "UI Sound Effects: {0}": "Effetti sonori: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "Suoni delicati per risposte, valutazioni e fine mazzo.",
+    "Sound effects volume": "Volume effetti"
 }

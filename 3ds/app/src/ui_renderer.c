@@ -45,6 +45,8 @@
 
 #define AUDIO_PCM_BYTES (1024 * 1024)
 #define AUDIO_CHANNEL 0
+#define SFX_PCM_BYTES (64 * 1024)
+#define SFX_CHANNEL 1
 
 // Glyphs are rasterized at their on-screen size. This atlas replaces the
 // console's low-resolution system glyph sheet and can be refreshed without
@@ -1437,6 +1439,9 @@ bool ui_anim_finished(int id) {
 
 static int16_t* s_audio_pcm = NULL;
 static size_t s_audio_capacity = 0;
+static int16_t* s_sfx_pcm = NULL;
+static size_t s_sfx_capacity = 0;
+static ndspWaveBuf s_sfx_wave;
 static int16_t* s_prefetch_pcm = NULL;
 static char s_prefetch_audio_path[MEDIA_PATH_MAX];
 static ndspWaveBuf s_audio_wave;
@@ -1487,6 +1492,18 @@ static bool audio_buffer_ensure(void) {
     return true;
 }
 
+static bool sfx_buffer_ensure(void) {
+    if (s_sfx_pcm) return true;
+    s_sfx_pcm = (int16_t*)linearAlloc(SFX_PCM_BYTES);
+    if (!s_sfx_pcm) {
+        s_sfx_capacity = 0;
+        return false;
+    }
+    s_sfx_capacity = SFX_PCM_BYTES;
+    memset(s_sfx_pcm, 0, s_sfx_capacity);
+    return true;
+}
+
 static bool audio_ndsp_ensure(void) {
     if (s_audio_ready) return true;
     if (R_FAILED(ndspInit())) {
@@ -1498,6 +1515,14 @@ static bool audio_ndsp_ensure(void) {
     ndspChnSetFormat(AUDIO_CHANNEL, NDSP_FORMAT_STEREO_PCM16);
     ndspChnSetRate(AUDIO_CHANNEL, 44100.0f);
     audio_set_mix(2);
+    ndspChnReset(SFX_CHANNEL);
+    ndspChnSetInterp(SFX_CHANNEL, NDSP_INTERP_LINEAR);
+    ndspChnSetFormat(SFX_CHANNEL, NDSP_FORMAT_MONO_PCM16);
+    ndspChnSetRate(SFX_CHANNEL, 22050.0f);
+    float sfx_mix[12] = {0.0f};
+    sfx_mix[0] = 1.0f;
+    sfx_mix[1] = 1.0f;
+    ndspChnSetMix(SFX_CHANNEL, sfx_mix);
     s_audio_ready = true;
     return true;
 }
@@ -1511,12 +1536,21 @@ void ui_audio_init(void) {
 }
 
 void ui_audio_fini(void) {
-    if (s_audio_pcm) {
+    if (s_audio_ready) {
         ndspChnWaveBufClear(AUDIO_CHANNEL);
         ndspChnSetPaused(AUDIO_CHANNEL, true);
+        ndspChnWaveBufClear(SFX_CHANNEL);
+        ndspChnSetPaused(SFX_CHANNEL, true);
+    }
+    if (s_audio_pcm) {
         linearFree(s_audio_pcm);
         s_audio_pcm = NULL;
         s_audio_capacity = 0;
+    }
+    if (s_sfx_pcm) {
+        linearFree(s_sfx_pcm);
+        s_sfx_pcm = NULL;
+        s_sfx_capacity = 0;
     }
     free(s_prefetch_pcm);
     s_prefetch_pcm = NULL;
@@ -1529,6 +1563,34 @@ void ui_audio_stop(void) {
     if (!s_audio_ready) return;
     ndspChnWaveBufClear(AUDIO_CHANNEL);
     ndspChnSetPaused(AUDIO_CHANNEL, true);
+}
+
+bool ui_sfx_play_pcm(const int16_t* samples, size_t count, int rate, float volume) {
+    if (!samples || count == 0 || rate < 4000 || rate > 96000) return false;
+    if (!sfx_buffer_ensure() || !audio_ndsp_ensure()) return false;
+    size_t max_samples = s_sfx_capacity / sizeof(int16_t);
+    if (count > max_samples) count = max_samples;
+    if (count == 0) return false;
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    ndspChnWaveBufClear(SFX_CHANNEL);
+    ndspChnSetPaused(SFX_CHANNEL, true);
+    memcpy(s_sfx_pcm, samples, count * sizeof(int16_t));
+    memset(&s_sfx_wave, 0, sizeof(s_sfx_wave));
+    s_sfx_wave.data_vaddr = s_sfx_pcm;
+    s_sfx_wave.nsamples = (u32)count;
+    s_sfx_wave.looping = false;
+    ndspChnSetFormat(SFX_CHANNEL, NDSP_FORMAT_MONO_PCM16);
+    ndspChnSetRate(SFX_CHANNEL, (float)rate);
+    float gain = volume * (ndspChnIsPlaying(AUDIO_CHANNEL) ? 0.65f : 0.90f);
+    float mix[12] = {0.0f};
+    mix[0] = gain;
+    mix[1] = gain;
+    ndspChnSetMix(SFX_CHANNEL, mix);
+    DSP_FlushDataCache(s_sfx_pcm, (u32)(count * sizeof(int16_t)));
+    ndspChnWaveBufAdd(SFX_CHANNEL, &s_sfx_wave);
+    ndspChnSetPaused(SFX_CHANNEL, false);
+    return true;
 }
 
 static float audio_apply_speed(int channels, size_t* inout_samples) {

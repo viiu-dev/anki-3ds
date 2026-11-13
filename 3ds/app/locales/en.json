@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Celebratory animation when finishing a deck.",
     "All animations": "All animations",
     "A or LEFT/RIGHT toggles. B returns.": "A or LEFT/RIGHT toggles. B returns.",
-    "Deck complete!": "Deck complete!"
+    "Deck complete!": "Deck complete!",
+    "UI Sound Effects": "UI Sound Effects",
+    "UI Sound Effects: {0}": "UI Sound Effects: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "Subtle chimes for reveal, ratings, and deck completion.",
+    "Sound effects volume": "Sound effects volume"
 }

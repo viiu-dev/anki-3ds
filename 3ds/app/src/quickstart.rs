@@ -172,38 +172,43 @@ fn draw_top_preferences(selected: usize) {
             }),
             tr("Smooth transitions and button feedback."),
         ),
+        (
+            tr("UI Sound Effects"),
+            tr(if i18n::ui_sfx() { "On" } else { "Off" }),
+            tr("Subtle chimes for reveal, ratings, and deck completion."),
+        ),
     ];
     for (i, &(title, value, desc)) in cards.iter().enumerate() {
-        let cy = 34.0 + i as f32 * 48.0;
+        let cy = 31.0 + i as f32 * 40.0;
         let active = i == selected;
         draw_card(
             10.0,
             cy,
             380.0,
-            44.0,
+            37.0,
             if active { th.accent } else { th.border },
             if active { th.row_selected } else { th.surface },
         );
         Ui::draw_text(
             20.0,
-            cy + 5.0,
-            0.45,
+            cy + 4.0,
+            0.43,
             th.text,
-            &Ui::ellipsize(title, 0.45, 220.0),
+            &Ui::ellipsize(title, 0.43, 220.0),
         );
         Ui::draw_text_right(
             380.0,
-            cy + 6.0,
-            0.42,
+            cy + 4.0,
+            0.41,
             if active { th.accent } else { th.text_muted },
-            &Ui::ellipsize(value, 0.42, 130.0),
+            &Ui::ellipsize(value, 0.41, 130.0),
         );
         Ui::draw_text(
             20.0,
-            cy + 24.0,
-            0.38,
+            cy + 19.0,
+            0.36,
             th.text_muted,
-            &Ui::ellipsize(desc, 0.38, 360.0),
+            &Ui::ellipsize(desc, 0.36, 360.0),
         );
     }
 }
@@ -349,16 +354,20 @@ pub fn draw_bottom(step: usize, selected: usize) {
                         "Off"
                     })],
                 ),
+                i18n::format(
+                    "UI Sound Effects: {0}",
+                    &[tr(if i18n::ui_sfx() { "On" } else { "Off" })],
+                ),
             ];
             for (i, label) in rows.iter().enumerate() {
-                let y = 46.0 + i as f32 * 31.0;
+                let y = 45.0 + i as f32 * 26.0;
                 let style = if i == selected { 0 } else { 6 };
-                Ui::draw_button(12.0, y, 296.0, 27.0, label, None, style, false);
+                Ui::draw_button(12.0, y, 296.0, 23.0, label, None, style, false);
             }
             Ui::fit_text(
                 160.0,
-                175.0,
-                0.38,
+                176.0,
+                0.37,
                 296.0,
                 th.text_muted,
                 tr("Tap or LEFT/RIGHT toggles."),
@@ -436,7 +445,7 @@ pub fn touch_hit(step: usize, x: f32, y: f32) -> TouchAction {
             let (rows, y0, step_h, h) = if step == 1 {
                 (3, 50.0, 40.0, 32.0)
             } else {
-                (4, 46.0, 31.0, 27.0)
+                (5, 45.0, 26.0, 23.0)
             };
             for i in 0..rows {
                 let by = y0 + i as f32 * step_h;
@@ -520,6 +529,11 @@ pub fn apply_step_change(step: usize, row: usize, forward: bool) -> std::io::Res
         }
         (2, 3) => {
             i18n::toggle_animations()?;
+        }
+        (2, 4) => {
+            if i18n::toggle_ui_sfx()? {
+                super::sfx::play_preview();
+            }
         }
         _ => {}
     }

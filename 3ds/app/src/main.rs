@@ -2,6 +2,7 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 mod anim;
+mod sfx;
 mod assets;
 mod auth_store;
 mod backend;
@@ -1718,6 +1719,7 @@ enum ChoiceKind {
     Connections,
     AudioSpeed,
     ReplayMode,
+    SfxVolume,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1728,6 +1730,7 @@ enum ToggleKind {
     RatingIcon,
     CardCounts,
     RatingIntervals,
+    UiSfx,
 }
 
 #[derive(Clone, Copy)]
@@ -1752,12 +1755,14 @@ const APPEARANCE_ITEMS: [SettingsItem; 9] = [
     SettingsItem::Toolbar,
     SettingsItem::Animations,
 ];
-const AUDIO_ITEMS: [SettingsItem; 5] = [
+const AUDIO_ITEMS: [SettingsItem; 7] = [
     SettingsItem::Toggle(ToggleKind::Autoplay),
     SettingsItem::Toggle(ToggleKind::AutoplayVideo),
     SettingsItem::Choice(ChoiceKind::AudioSpeed),
     SettingsItem::Choice(ChoiceKind::ReplayMode),
     SettingsItem::Toggle(ToggleKind::RatingIcon),
+    SettingsItem::Toggle(ToggleKind::UiSfx),
+    SettingsItem::Choice(ChoiceKind::SfxVolume),
 ];
 const CONTROLS_ITEMS: [SettingsItem; 13] = [
     SettingsItem::Choice(ChoiceKind::ScrollSpeed),
@@ -1817,6 +1822,7 @@ fn choice_title(kind: ChoiceKind) -> &'static str {
         ChoiceKind::Connections => "Download connections",
         ChoiceKind::AudioSpeed => "Audio playback speed",
         ChoiceKind::ReplayMode => "Replay audio",
+        ChoiceKind::SfxVolume => "Sound effects volume",
     }
 }
 
@@ -1865,6 +1871,7 @@ fn choice_options(kind: ChoiceKind) -> Vec<String> {
             tr("Current side").to_owned(),
             tr("All card audio").to_owned(),
         ],
+        ChoiceKind::SfxVolume => i18n::SFX_VOLUMES.iter().map(|v| format!("{v}%")).collect(),
     }
 }
 
@@ -1889,6 +1896,7 @@ fn choice_selected(kind: ChoiceKind) -> usize {
         ChoiceKind::Connections => i18n::download_connections().saturating_sub(1),
         ChoiceKind::AudioSpeed => i18n::audio_speed_index(),
         ChoiceKind::ReplayMode => usize::from(i18n::replay_all_audio()),
+        ChoiceKind::SfxVolume => i18n::sfx_volume_index(),
     }
 }
 
@@ -1954,6 +1962,11 @@ fn apply_choice(kind: ChoiceKind, index: usize) -> std::io::Result<()> {
                 if value { "all" } else { "side" }
             ));
         }
+        ChoiceKind::SfxVolume => {
+            let percent = i18n::set_sfx_volume_index(index)?;
+            sfx::play_preview();
+            event(&format!("SFX_VOLUME {percent}%"));
+        }
     }
     Ok(())
 }
@@ -1994,6 +2007,13 @@ fn apply_toggle(kind: ToggleKind) -> std::io::Result<()> {
                 if value { "on" } else { "off" }
             ));
         }
+        ToggleKind::UiSfx => {
+            let value = i18n::toggle_ui_sfx()?;
+            if value {
+                sfx::play_preview();
+            }
+            event(&format!("UI_SFX {}", if value { "on" } else { "off" }));
+        }
     }
     Ok(())
 }
@@ -2033,6 +2053,10 @@ fn settings_item_label(
             } else {
                 "Off"
             })],
+        ),
+        SettingsItem::Toggle(ToggleKind::UiSfx) => i18n::format(
+            "UI Sound Effects: {0}",
+            &[tr(if i18n::ui_sfx() { "On" } else { "Off" })],
         ),
         SettingsItem::Binding(action) => i18n::format(
             "{0}: {1}",
@@ -3694,7 +3718,7 @@ fn main() {
                                 }
                                 1 | 2 => match action {
                                     Action::Up | Action::Down => {
-                                        let rows = if *step == 2 { 4 } else { 3 };
+                                        let rows = if *step == 2 { 5 } else { 3 };
                                         *selected =
                                             list_step(*selected, rows, matches!(action, Action::Down));
                                     }
@@ -4501,6 +4525,7 @@ fn main() {
                                 }
                                 screen = Screen::Answer { card, deck_name };
                                 ui_anim.trigger_card_reveal();
+                                sfx::play(sfx::SfxKind::Reveal);
                             }
                             card_scroll = 0;
                             event("QUESTION -> ANSWER");
@@ -4527,6 +4552,7 @@ fn main() {
                                 ));
                                 screen = match b.next()? {
                                     Some(card) => {
+                                        sfx::play_rating(rating);
                                         ui_anim.trigger_next_card();
                                         Screen::Question { card, deck_name }
                                     }
@@ -5110,6 +5136,7 @@ fn main() {
             }
             if state == "EMPTY" {
                 ui_anim.trigger_celebration();
+                sfx::play(sfx::SfxKind::DeckComplete);
             }
             if state == "DECKS" {
                 if let Some(b) = backend.as_mut() {

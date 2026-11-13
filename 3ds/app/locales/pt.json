@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Animação comemorativa ao concluir um baralho.",
     "All animations": "Todas as animações",
     "A or LEFT/RIGHT toggles. B returns.": "A ou ESQ/DIR alterna. B volta.",
-    "Deck complete!": "Baralho concluído!"
+    "Deck complete!": "Baralho concluído!",
+    "UI Sound Effects": "Efeitos sonoros",
+    "UI Sound Effects: {0}": "Efeitos sonoros: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "Sons suaves ao revelar, avaliar e concluir um baralho.",
+    "Sound effects volume": "Volume dos efeitos"
 }

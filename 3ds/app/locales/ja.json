@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "デッキの復習を終えたときにお祝い演出を表示します。",
     "All animations": "すべてのアニメーション",
     "A or LEFT/RIGHT toggles. B returns.": "A または左右で切替・B で戻る",
-    "Deck complete!": "デッキ完了！"
+    "Deck complete!": "デッキ完了！",
+    "UI Sound Effects": "UI効果音",
+    "UI Sound Effects: {0}": "UI効果音: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "解答表示・評価・デッキ完了時に心地よい効果音を鳴らします。",
+    "Sound effects volume": "効果音の音量"
 }

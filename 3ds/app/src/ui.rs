@@ -130,6 +130,7 @@ extern "C" {
     fn ui_media_prefetch(path: *const c_char) -> bool;
     fn ui_media_prefetch_clear();
     fn ui_audio_play(path: *const c_char) -> bool;
+    fn ui_sfx_play_pcm(samples: *const i16, count: usize, rate: c_int, volume: f32) -> bool;
     fn ui_audio_decode(path: *const c_char) -> bool;
     fn ui_audio_prefetch(path: *const c_char) -> bool;
     fn ui_audio_prefetch_clear();
@@ -583,6 +584,13 @@ impl Ui {
 
     pub fn audio_set_speed(speed: f32) {
         unsafe { ui_audio_set_speed(speed) }
+    }
+
+    pub fn sfx_play_pcm(samples: &[i16], rate: i32, volume: f32) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        unsafe { ui_sfx_play_pcm(samples.as_ptr(), samples.len(), rate, volume) }
     }
 
     pub fn draw_status_compact(

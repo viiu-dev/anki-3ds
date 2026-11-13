@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Святкова анімація після завершення колоди.",
     "All animations": "Усі анімації",
     "A or LEFT/RIGHT toggles. B returns.": "A або ВЛІВО/ВПРАВО: увімк/вимк. B: назад.",
-    "Deck complete!": "Колоду завершено!"
+    "Deck complete!": "Колоду завершено!",
+    "UI Sound Effects": "Звукові ефекти",
+    "UI Sound Effects: {0}": "Звукові ефекти: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "М'які звуки під час відповіді, оцінки й завершення колоди.",
+    "Sound effects volume": "Гучність ефектів"
 }

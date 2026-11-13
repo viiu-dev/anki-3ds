@@ -136,6 +136,7 @@ bool ui_anim_finished(int id);
 void ui_anim_close_all(void);
 
 bool ui_audio_play(const char* path);
+bool ui_sfx_play_pcm(const int16_t* samples, size_t count, int rate, float volume);
 bool ui_audio_decode(const char* path);
 bool ui_audio_prefetch(const char* path);
 void ui_audio_prefetch_clear(void);

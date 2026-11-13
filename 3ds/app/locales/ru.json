@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Праздничная анимация по завершении колоды.",
     "All animations": "Все анимации",
     "A or LEFT/RIGHT toggles. B returns.": "A или ВЛЕВО/ВПРАВО: вкл/выкл. B: назад.",
-    "Deck complete!": "Колода завершена!"
+    "Deck complete!": "Колода завершена!",
+    "UI Sound Effects": "Звуковые эффекты",
+    "UI Sound Effects: {0}": "Звуковые эффекты: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "Мягкие звуки при ответе, оценке карт и завершении колоды.",
+    "Sound effects volume": "Громкость эффектов"
 }

@@ -375,5 +375,9 @@
     "Celebratory animation when finishing a deck.": "Feierliche Animation nach Abschluss eines Stapels.",
     "All animations": "Alle Animationen",
     "A or LEFT/RIGHT toggles. B returns.": "A oder LINKS/RECHTS schaltet um. B zurück.",
-    "Deck complete!": "Stapel fertig!"
+    "Deck complete!": "Stapel fertig!",
+    "UI Sound Effects": "Soundeffekte",
+    "UI Sound Effects: {0}": "Soundeffekte: {0}",
+    "Subtle chimes for reveal, ratings, and deck completion.": "Dezente Klänge beim Aufdecken, Bewerten und Abschließen.",
+    "Sound effects volume": "Effektlautstärke"
 }
