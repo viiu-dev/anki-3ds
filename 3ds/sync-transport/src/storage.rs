@@ -2,13 +2,9 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 use std::fs::File;
-use std::fs::{
-    self,
-};
+use std::fs::{self};
 use std::io::Write;
-use std::io::{
-    self,
-};
+use std::io::{self};
 use std::path::Path;
 
 /// Make a device-qualified path relative to the current directory.

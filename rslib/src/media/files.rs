@@ -571,7 +571,7 @@ where
         // no file with that name that's also in lowercase exists yet
         let target_path = sharded_path(folder.as_ref(), normalized_name.as_ref());
         if let Some(parent) = target_path.parent() {
-            create_dir_all(parent)?;
+            ensure_dir(parent)?;
         }
         write_file(&target_path, data)?;
         remove_superseded_root_copy(folder.as_ref(), normalized_name.as_ref());
@@ -582,7 +582,7 @@ where
     let hashed_name = add_hash_suffix_to_file_stem(normalized_name.as_ref(), &sha1);
     let target_path = sharded_path(folder.as_ref(), &hashed_name);
     if let Some(parent) = target_path.parent() {
-        create_dir_all(parent)?;
+        ensure_dir(parent)?;
     }
     write_file(&target_path, data)?;
     remove_superseded_root_copy(folder.as_ref(), &hashed_name);
@@ -803,6 +803,13 @@ pub struct AddedFile {
 /// bytes it actually writes.
 pub(crate) const MAX_DOWNLOADED_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
+fn ensure_dir(path: &Path) -> std::result::Result<(), anki_io::FileIoError> {
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    create_dir_all(path)
+}
+
 /// Add a file received from AnkiWeb into the media folder.
 ///
 /// Because AnkiWeb did not previously enforce file name limits and invalid
@@ -819,7 +826,7 @@ pub(crate) fn add_file_from_ankiweb(
     let (renamed_from, path) = if let Cow::Borrowed(_) = normalized {
         let path = sharded_path(media_folder, normalized.as_ref());
         if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
+            ensure_dir(parent)?;
         }
         debug!(fname = normalized.as_ref(), "write");
         write_file(&path, data)?;
@@ -878,7 +885,7 @@ pub(crate) fn add_file_from_ankiweb_streaming(
     if let Cow::Borrowed(_) = normalized {
         let path = sharded_path(media_folder, normalized.as_ref());
         if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
+            ensure_dir(parent)?;
         }
         let (sha1, mtime) = write_file_hashing(&path, reader, cancelled)?;
         remove_superseded_root_copy(media_folder, normalized.as_ref());
@@ -910,12 +917,17 @@ fn write_file_hashing(
     reader: &mut impl Read,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(Sha1Hash, i64)> {
+    const STREAM_BUF_SIZE: usize = if cfg!(target_os = "horizon") {
+        16 * 1024
+    } else {
+        64 * 1024
+    };
     let file = fs::File::create(path)?;
     let mut writer = HashingWriter {
-        inner: io::BufWriter::with_capacity(64 * 1024, file),
+        inner: io::BufWriter::with_capacity(STREAM_BUF_SIZE, file),
         hasher: Sha1::new(),
     };
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; STREAM_BUF_SIZE];
     let mut interrupted = false;
     let mut total: u64 = 0;
     // the .take() is because we don't trust the zip header to be correct

@@ -30,11 +30,7 @@ pub fn begin_session() {
 }
 
 pub fn append(text: &str) {
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(PATH)
-    else {
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(PATH) else {
         return;
     };
     let mut line = text.to_owned();
@@ -47,10 +43,7 @@ pub fn append(text: &str) {
 
 pub fn trace_writer() -> Box<dyn Write + Send> {
     match OpenOptions::new().create(true).append(true).open(PATH) {
-        Ok(file) => Box::new(TraceWriter {
-            file,
-            pending: 0,
-        }),
+        Ok(file) => Box::new(TraceWriter { file, pending: 0 }),
         Err(_) => Box::new(io::sink()),
     }
 }

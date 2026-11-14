@@ -342,11 +342,12 @@ fn run_with_resume(
         match block_on(mgr.sync_media_with_config(handler, client.clone(), None, config())) {
             Ok(()) => return Ok(()),
             Err(e) if is_interrupted(&e) => return Err(e),
-            Err(e)
-                if is_network(&e) && attempts < 5 && !cancel.load(Ordering::Acquire) =>
-            {
+            Err(e) if is_network(&e) && attempts < 5 && !cancel.load(Ordering::Acquire) => {
                 attempts += 1;
-                super::event(&format!("MEDIA_SYNC_RETRY attempt={attempts} {}", super::error_text(&e)));
+                super::event(&format!(
+                    "MEDIA_SYNC_RETRY attempt={attempts} {}",
+                    super::error_text(&e)
+                ));
                 anki_3ds_sync_transport::cleanup_https_session();
                 anki_3ds_sync_transport::init_https_session();
                 for _ in 0..(20 * attempts) {

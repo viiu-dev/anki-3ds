@@ -1,12 +1,11 @@
 // Copyright: Anki 3DS contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+#[cfg(target_os = "horizon")]
+use std::ffi::c_void;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
-
-#[cfg(target_os = "horizon")]
-use std::ffi::c_void;
 
 #[cfg(target_os = "horizon")]
 const LED_REGISTER: u8 = 0x28;

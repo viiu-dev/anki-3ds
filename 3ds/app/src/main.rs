@@ -2209,6 +2209,9 @@ fn menu_label(index: usize) -> String {
 
 fn main() {
     event_log::begin_session();
+    std::panic::set_hook(Box::new(|info| {
+        event(&format!("PANIC {info}"));
+    }));
     let apt = match Apt::new() {
         Ok(apt) => apt,
         Err(error) => {
@@ -4095,10 +4098,20 @@ fn main() {
                     card_scroll = 0;
                 }
                 Action::Stats => {
-                    let data = backend
-                        .as_mut()
-                        .ok_or("collection unavailable")?
-                        .statistics()?;
+                    if let Some(active) = &media_job {
+                        active.set_paused(true);
+                    }
+                    let stats_result = match backend.as_mut() {
+                        Some(b) => b.statistics(),
+                        None => Err("collection unavailable".into()),
+                    };
+                    if let Some(active) = &media_job {
+                        active.set_paused(matches!(
+                            screen,
+                            Screen::Question { .. } | Screen::Answer { .. }
+                        ));
+                    }
+                    let data = stats_result?;
                     let previous = std::mem::replace(&mut screen, Screen::Decks);
                     screen = Screen::Stats {
                         data: Box::new(data),

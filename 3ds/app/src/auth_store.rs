@@ -8,9 +8,7 @@
 use std::fs;
 use std::io::Read;
 use std::io::Write;
-use std::io::{
-    self,
-};
+use std::io::{self};
 use std::path::Path;
 
 use anki::sync::login::SyncAuth;

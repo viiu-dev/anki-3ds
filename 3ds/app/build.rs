@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../out/3ds/https-sources/cacert.pem");
     println!("cargo:rerun-if-changed=src/ui_renderer.c");
     println!("cargo:rerun-if-changed=src/clock.c");
+    println!("cargo:rerun-if-changed=src/fs_guard.c");
     println!("cargo:rerun-if-changed=src/ui_renderer.h");
     println!("cargo:rerun-if-changed=src/stb_truetype.h");
     println!("cargo:rerun-if-changed=src/stb_image.h");
@@ -73,6 +74,7 @@ fn main() {
         .include("../third_party/nanosvg")
         .file("src/ui_renderer.c")
         .file("src/clock.c")
+        .file("src/fs_guard.c")
         .files(&webp_sources)
         .file("../third_party/nanosvg/nanosvg_impl.c")
         .define("ARM11", None)
@@ -87,7 +89,7 @@ fn main() {
         .flag("-ffunction-sections")
         .compile("ui_renderer");
 
-    println!("cargo:rustc-link-arg=-Wl,--wrap=clock_gettime,--wrap=time");
+    println!("cargo:rustc-link-arg=-Wl,--wrap=clock_gettime,--wrap=time,--wrap=mkdir");
     println!(
         "cargo:rustc-link-search=native={}",
         portlibs.join("lib").display()

@@ -1144,13 +1144,7 @@ impl Backend {
     }
 
     pub fn statistics(&mut self) -> Result<super::stats::Dashboard> {
-        let graphs = anki::services::StatsService::graphs(
-            &mut self.collection,
-            anki_proto::stats::GraphsRequest {
-                search: String::new(),
-                days: 0,
-            },
-        )?;
+        let graphs = self.collection.dashboard_graphs()?;
         Ok(super::stats::Dashboard::from_graphs(graphs))
     }
 
