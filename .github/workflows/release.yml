@@ -75,6 +75,24 @@ jobs:
           else
             extra_flags+=(--generate-notes)
           fi
-          gh release create "$GITHUB_REF_NAME" release/* \
+          gh release create "$GITHUB_REF_NAME" \
+            release/anki-3ds.cia \
+            release/anki-3ds.3dsx \
+            release/anki-3ds-cia-qr.png \
             --verify-tag --draft --title "Anki 3DS $GITHUB_REF_NAME" \
             "${extra_flags[@]}"
+      - name: Update README install QR on main
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          cp release/anki-3ds-cia-qr.png 3ds/docs/images/install-qr.png
+          if ! git diff --quiet -- 3ds/docs/images/install-qr.png; then
+            git add 3ds/docs/images/install-qr.png
+            git commit -m "docs(3ds): update install QR for $GITHUB_REF_NAME [skip ci]"
+            git push origin HEAD:main
+          fi
