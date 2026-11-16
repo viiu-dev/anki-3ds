@@ -1,33 +1,27 @@
-# Anki
+# <img width="100%" alt="preview-banner-3d" src="https://github.com/user-attachments/assets/3626c80e-59b9-4296-bea3-ec64e99b8bb9" />
 
-[![Build Status](https://github.com/ankitects/anki/actions/workflows/ci.yml/badge.svg)](https://github.com/ankitects/anki/actions/workflows/ci.yml)
-[![Documentation](https://img.shields.io/badge/docs-dev--docs.ankiweb.net-blue)](https://dev-docs.ankiweb.net/en/latest/)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=ankitects_anki&metric=coverage)](https://sonarcloud.io/summary/new_code?id=ankitects_anki)
-
-This repo contains the source code for the computer version of
-[Anki](https://apps.ankiweb.net).
+A port of [Anki](https://apps.ankiweb.net) to the Nintendo 3DS.
 
 ## About
 
-Anki is a spaced repetition program. Please see the [website](https://apps.ankiweb.net) to learn more.
+Anki is a spaced repetition program. This project brings it to the Nintendo 3DS. See the official [Anki website](https://apps.ankiweb.net) to learn more about Anki itself.
 
-## Getting Started
+See instructions below to see how to install Anki-3DS on your device.
 
-### Contributing
+## Preview
 
-Want to contribute to Anki? Check out the [Contribution Guidelines](./docs/contributing.md).
+<img width="400" alt="anki-3ds-preview-small" src="https://github.com/user-attachments/assets/e2ffbaf6-e796-4cae-9865-aa1321c603ee" />
 
-For more information on building and developing, please see [Development](./docs/development.md).
+## Install
 
-#### Contributors
+You can install Anki-3DS using FBI (from SD card or by scanning QR code below) and then launch from the HOME Menu.
 
-The following people have contributed to Anki: [CONTRIBUTORS](./CONTRIBUTORS)
+<img width="200" alt="Install QR code" src="3ds/docs/images/install-qr.png" />
 
-### Anki Betas
+## Credits
 
-If you'd like to try development builds of Anki but don't feel comfortable
-building the code, please see [Anki betas](https://docs.ankiweb.net/releases/betas/intro).
+Based on [Anki](https://github.com/ankitects/anki) by Damien Elmes and the Anki contributors.
 
 ## License
 
-Anki's license: [LICENSE](./LICENSE)
+Anki-3DS is licensed under the same terms as Anki. See [LICENSE](./LICENSE).
