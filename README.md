@@ -21,6 +21,7 @@ You can install Anki-3DS using FBI (from SD card or by scanning QR code below) a
 ## Credits
 
 Based on [Anki](https://github.com/ankitects/anki) by Damien Elmes and the Anki contributors.
+Some code is based on [anki-3ds](https://github.com/AlexMolina08/anki-3ds) by Alexmolina.
 
 ## License
 
