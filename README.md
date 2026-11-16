@@ -2,11 +2,12 @@
 
 A port of [Anki](https://apps.ankiweb.net) to the Nintendo 3DS.
 
+> [!NOTE]
+> Developed and tested primarily on **New Nintendo 3DS** hardware. It may run on Old 3DS / 2DS models, but performance, memory stability, and full compatibility on Old 3DS are not guaranteed.
+
 ## About
 
-Anki is a spaced repetition program. This project brings it to the Nintendo 3DS. See the official [Anki website](https://apps.ankiweb.net) to learn more about Anki itself.
-
-See instructions below to see how to install Anki-3DS on your device.
+Anki is a spaced repetition program. This project brings it to the Nintendo 3DS with AnkiWeb synchronization, card images, and audio playback. See the official [Anki website](https://apps.ankiweb.net) to learn more about Anki itself.
 
 ## Preview
 
@@ -14,14 +15,23 @@ See instructions below to see how to install Anki-3DS on your device.
 
 ## Install
 
-You can install Anki-3DS using FBI (from SD card or by scanning QR code below) and then launch from the HOME Menu.
+Download the latest `.cia` or `.3dsx` from [Releases](https://github.com/viiu-dev/anki-3ds/releases), or install directly via **FBI** by scanning the QR code below:
 
 <img width="200" alt="Install QR code" src="3ds/docs/images/install-qr.png" />
+
+- **CIA:** Install with FBI and launch from the HOME Menu.
+- **3DSX:** Copy to `SD:/3ds/anki-3ds/anki-3ds.3dsx` and launch via Homebrew Launcher.
+
+## Usage
+
+- Press **SELECT** at any time to open the menu (**Log in**, **Sync**, **Settings**, **Browse**, etc.).
+- Collection data, saved session tokens, and settings are stored in `SD:/3ds/anki-3ds/`.
+- **Audio:** Card audio requires `SD:/3ds/dspfirm.cdc` on real hardware (dump it once in Luma3DS via Rosalina menu: `L + Down + Select` → *Miscellaneous options* → *Dump DSP firmware*).
 
 ## Credits
 
 Based on [Anki](https://github.com/ankitects/anki) by Damien Elmes and the Anki contributors.
-Some code is based on [anki-3ds](https://github.com/AlexMolina08/anki-3ds) by Alexmolina.
+Some code is based on [anki-3ds](https://github.com/AlexMolina08/anki-3ds) by AlexMolina08.
 
 ## License
 
