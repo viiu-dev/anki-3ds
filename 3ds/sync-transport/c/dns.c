@@ -17,7 +17,6 @@
 #endif
 
 static unsigned word(const uint8_t *p) { return (unsigned)p[0] * 256 + p[1]; }
-/* Follow compression only within this packet; a jump budget rejects cycles. */
 static int name(const uint8_t *p, size_t n, size_t *offset, char out[254]) {
     size_t at = *offset, end = 0, used = 0;
     unsigned steps = 0;
@@ -30,15 +29,17 @@ static int name(const uint8_t *p, size_t n, size_t *offset, char out[254]) {
         }
         if ((len & 0xc0) == 0xc0) {
             if (at >= n) return -1;
+            size_t ptr = ((len & 63) << 8) | p[at];
+            if (ptr < 12 || ptr >= n) return -1;
             if (!end) end = at + 1;
-            at = ((len & 63) << 8) | p[at];
+            at = ptr;
             continue;
         }
-        if (len > 63 || at + len > n || used + len + (used != 0) > 253) return -1;
+        if (len > 63 || len > n - at || used + len + (used != 0) > 253) return -1;
         if (used) out[used++] = '.';
         for (unsigned i = 0; i < len; i++) {
             unsigned ch = p[at++];
-            if (!ch || ch == '.') return -1;
+            if (ch < 0x21 || ch >= 0x7f || ch == '.') return -1;
             out[used++] = (char)tolower(ch);
         }
     }
@@ -47,7 +48,9 @@ static int name(const uint8_t *p, size_t n, size_t *offset, char out[254]) {
 
 static int parse(const uint8_t *p, size_t n, unsigned id, const char *host,
                  char ip[16], char error[160]) {
-    if (n < 12 || word(p) != id) return 1; /* unrelated datagram */
+    if (!p || !host || n < 12 || word(p) != id) return 1;
+    size_t host_len = strlen(host);
+    if (!host_len || host_len >= 254) goto malformed;
     unsigned flags = word(p + 2);
     if (!(flags & 0x8000) || (flags & 0x7800)) goto malformed;
     if (flags & 0x0200) { snprintf(error, 160, "DNS truncated; TCP required (unsupported)"); return -1; }
@@ -55,25 +58,24 @@ static int parse(const uint8_t *p, size_t n, unsigned id, const char *host,
     if (word(p + 4) != 1) goto malformed;
     size_t offset = 12;
     char question[254];
-    if (name(p, n, &offset, question) || strcmp(question, host) || offset + 4 > n ||
+    if (name(p, n, &offset, question) || strcmp(question, host) || offset > n || n - offset < 4 ||
         word(p + offset) != 1 || word(p + offset + 2) != 1) goto malformed;
     offset += 4;
     size_t answer_start = offset;
     unsigned answers = word(p + 6);
     if (answers > 64) goto malformed;
     char wanted[254];
-    strcpy(wanted, host);
-    /* Rescan bounded answer list for each CNAME, independent of record order. */
+    memcpy(wanted, host, host_len + 1);
     for (unsigned chain = 0; chain < 16; chain++) {
         offset = answer_start;
         bool followed = false;
         for (unsigned i = 0; i < answers; i++) {
             char owner[254];
-            if (name(p, n, &offset, owner) || offset + 10 > n) goto malformed;
+            if (name(p, n, &offset, owner) || offset > n || n - offset < 10) goto malformed;
             unsigned type = word(p + offset), cls = word(p + offset + 2);
             unsigned len = word(p + offset + 8);
             offset += 10;
-            if (offset + len > n) goto malformed;
+            if (len > n - offset) goto malformed;
             if (cls == 1 && !strcmp(owner, wanted)) {
                 if (type == 1 && len == 4) {
                     snprintf(ip, 16, "%u.%u.%u.%u", p[offset], p[offset+1], p[offset+2], p[offset+3]);
@@ -83,7 +85,9 @@ static int parse(const uint8_t *p, size_t n, unsigned id, const char *host,
                     size_t cname_offset = offset;
                     char target[254];
                     if (name(p, n, &cname_offset, target) || cname_offset != offset + len) goto malformed;
-                    strcpy(wanted, target);
+                    size_t target_len = strlen(target);
+                    if (!target_len || target_len >= sizeof(wanted)) goto malformed;
+                    memcpy(wanted, target, target_len + 1);
                     followed = true;
                     break;
                 }
@@ -126,8 +130,8 @@ int probe_dns_with_context(const char *host, char ip[16], char error[160],
     while (*label) {
         const char *dot = strchr(label, '.');
         size_t size = dot ? (size_t)(dot - label) : strlen(label);
-        if (!size || size > 63) { snprintf(error, 160, "Invalid DNS hostname label"); return -1; }
-        query[qlen++] = size;
+        if (!size || size > 63 || qlen + size + 6 > sizeof(query)) { snprintf(error, 160, "Invalid DNS hostname label"); return -1; }
+        query[qlen++] = (uint8_t)size;
         memcpy(query + qlen, label, size); qlen += size;
         if (!dot) break;
         label = dot + 1;
@@ -191,6 +195,7 @@ int probe_dns_with_context(const char *host, char ip[16], char error[160],
         configured = true;
         int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) { snprintf(error, 160, "DNS socket failed: errno=%d", errno); continue; }
+        if (fd >= FD_SETSIZE) { snprintf(error, 160, "DNS socket fd out of range"); close(fd); continue; }
         if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
             snprintf(error, 160, "DNS nonblocking mode failed: errno=%d", errno); close(fd); continue;
         }
@@ -237,6 +242,15 @@ int probe_dns_with_context(const char *host, char ip[16], char error[160],
                               count, (unsigned long)servers[0].family, (unsigned long)servers[1].family);
     return -1;
 }
+struct LegacyCancel { bool (*function)(void); };
+static bool legacy_cancel(void *context) {
+    struct LegacyCancel *legacy = context;
+    return legacy->function && legacy->function();
+}
+int probe_dns(const char *host, char ip[16], char error[160], bool (*cancelled)(void)) {
+    struct LegacyCancel legacy = {cancelled};
+    return probe_dns_with_context(host, ip, error, legacy_cancel, &legacy, true);
+}
 #else
 #include <assert.h>
 int main(void) {
@@ -261,15 +275,11 @@ int main(void) {
     packet[2] &= ~2;
     packet[12] = 0xc0; packet[13] = 12;
     assert(parse(packet, sizeof(packet), 0x1234, "a", ip, error) == -1);
+    packet[12] = 0xc0; packet[13] = 4;
+    assert(parse(packet, sizeof(packet), 0x1234, "a", ip, error) == -1);
+    uint8_t ctrl[] = {0x12,0x34,0x81,0x80,0,1,0,1,0,0,0,0,
+        1,'\n',0,0,1,0,1,0xc0,0x0c,0,1,0,1,0,0,0,1,0,4,1,2,3,4};
+    assert(parse(ctrl, sizeof(ctrl), 0x1234, "\n", ip, error) == -1);
     puts("DNS parser tests passed");
 }
 #endif
-struct LegacyCancel { bool (*function)(void); };
-static bool legacy_cancel(void *context) {
-    struct LegacyCancel *legacy = context;
-    return legacy->function && legacy->function();
-}
-int probe_dns(const char *host, char ip[16], char error[160], bool (*cancelled)(void)) {
-    struct LegacyCancel legacy = {cancelled};
-    return probe_dns_with_context(host, ip, error, legacy_cancel, &legacy, true);
-}

@@ -3,7 +3,9 @@
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -54,12 +56,10 @@ pub enum MediaDownloadEvent {
     Failed { error: String, files: Vec<String> },
 }
 
-/// Shared, ordered set of media filenames that should be downloaded before
-/// the rest of the queue. The app pushes the files referenced by today's
-/// cards, and by the card the user is currently looking at.
 #[derive(Default)]
 pub struct MediaPriority {
     inner: Mutex<MediaPriorityInner>,
+    version: AtomicU32,
 }
 
 #[derive(Default)]
@@ -73,14 +73,28 @@ impl MediaPriority {
         Arc::new(Self::default())
     }
 
-    /// Add filenames, either behind everything already queued (the day's
-    /// cards) or at the very front (the card currently on screen).
+    pub fn version(&self) -> u32 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .order
+            .is_empty()
+    }
+
     pub fn add(&self, files: impl IntoIterator<Item = String>, front: bool) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let files: Vec<String> = files.into_iter().filter(|file| !file.is_empty()).collect();
+        if files.is_empty() {
+            return;
+        }
+        let mut changed = false;
         if front {
             for file in files.into_iter().rev() {
                 if !inner.queued.insert(file.clone()) {
@@ -89,13 +103,18 @@ impl MediaPriority {
                     }
                 }
                 inner.order.push_front(file);
+                changed = true;
             }
         } else {
             for file in files {
                 if inner.queued.insert(file.clone()) {
                     inner.order.push_back(file);
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.version.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -114,6 +133,15 @@ impl MediaPriority {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let same = inner.order.len() == files.iter().filter(|f| !f.is_empty()).count()
+            && inner
+                .order
+                .iter()
+                .zip(files.iter().filter(|f| !f.is_empty()))
+                .all(|(a, b)| a == b);
+        if same {
+            return;
+        }
         inner.order.clear();
         inner.queued.clear();
         for file in files {
@@ -121,6 +149,7 @@ impl MediaPriority {
                 inner.order.push_back(file.clone());
             }
         }
+        self.version.fetch_add(1, Ordering::Release);
     }
 
     pub fn remove(&self, files: &[String]) {
@@ -128,12 +157,17 @@ impl MediaPriority {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut changed = false;
         for file in files {
             if inner.queued.remove(file) {
                 if let Some(index) = inner.order.iter().position(|queued| queued == file) {
                     inner.order.remove(index);
                 }
+                changed = true;
             }
+        }
+        if changed {
+            self.version.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -212,6 +246,13 @@ pub trait MediaSyncProtocol: Send + Sync + 'static {
         &self,
         req: SyncRequest<DownloadFilesRequest>,
     ) -> HttpResult<SyncResponse<Vec<u8>>>;
+    async fn download_files_to_file(
+        &self,
+        _req: SyncRequest<DownloadFilesRequest>,
+        _path: &Path,
+    ) -> Option<HttpResult<u64>> {
+        None
+    }
     async fn media_sanity_check(
         &self,
         req: SyncRequest<SanityCheckRequest>,

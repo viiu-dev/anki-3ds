@@ -44,6 +44,7 @@
 #include "dr_mp3.h"
 
 #define AUDIO_PCM_BYTES (1024 * 1024)
+#define AUDIO_PREFETCH_PCM_BYTES (256 * 1024)
 #define AUDIO_CHANNEL 0
 #define SFX_PCM_BYTES (64 * 1024)
 #define SFX_CHANNEL 1
@@ -222,10 +223,11 @@ static void media_mark_missing(const char* path) {
 void ui_media_prefetch_clear(void);
 void ui_anim_close_all(void);
 
-static bool s_capture_pixels_active = false;
-static uint8_t* s_captured_pixels = NULL;
-static int s_captured_w = 0;
-static int s_captured_h = 0;
+typedef struct {
+    uint8_t* pixels;
+    int width;
+    int height;
+} PixelCapture;
 
 void ui_media_reset(void) {
     for (int i = 0; i < MEDIA_IMAGE_SLOTS; i++) {
@@ -237,8 +239,6 @@ void ui_media_reset(void) {
     }
     ui_media_prefetch_clear();
     ui_anim_close_all();
-    free(s_captured_pixels);
-    s_captured_pixels = NULL;
     for (int i = 0; i < MEDIA_MISSING_SLOTS; i++) s_media_missing[i][0] = '\0';
     s_media_missing_next = 0;
 }
@@ -358,6 +358,7 @@ static void resample_rgba(
 
 static bool upload_media_pixels(
     MediaImage* image,
+    PixelCapture* capture,
     const uint8_t* pixels,
     int src_w,
     int src_h,
@@ -369,15 +370,15 @@ static bool upload_media_pixels(
     if (dst_w > 1024 || dst_h > 1024) return false;
     if ((size_t)dst_w > SIZE_MAX / 4 / (size_t)dst_h) return false;
     if (stride != 0 && (size_t)src_h > SIZE_MAX / stride) return false;
-    if (s_capture_pixels_active) {
+    if (capture) {
         size_t bytes = (size_t)dst_w * (size_t)dst_h * 4;
         uint8_t* tight = (uint8_t*)malloc(bytes ? bytes : 1);
         if (!tight) return false;
         resample_rgba(pixels, src_w, src_h, stride, tight, dst_w, dst_h);
-        free(s_captured_pixels);
-        s_captured_pixels = tight;
-        s_captured_w = dst_w;
-        s_captured_h = dst_h;
+        free(capture->pixels);
+        capture->pixels = tight;
+        capture->width = dst_w;
+        capture->height = dst_h;
         return true;
     }
     if (!image) return false;
@@ -414,6 +415,7 @@ static bool upload_media_pixels(
 
 static bool decode_webp_image(
     MediaImage* image,
+    PixelCapture* capture,
     const uint8_t* data,
     size_t size,
     int* out_w,
@@ -458,6 +460,7 @@ static bool decode_webp_image(
     if (ok) {
         ok = upload_media_pixels(
             image,
+            capture,
             config.output.u.RGBA.rgba,
             config.output.width,
             config.output.height,
@@ -477,6 +480,7 @@ static bool decode_webp_image(
 
 static bool decode_svg_image(
     MediaImage* image,
+    PixelCapture* capture,
     char* text,
     size_t size,
     int* out_w,
@@ -524,7 +528,7 @@ static bool decode_svg_image(
     if (pixels) {
         memset(pixels, 0, bytes);
         nsvgRasterize(rasterizer, svg, 0.0f, 0.0f, scale, pixels, dst_w, dst_h, dst_w * 4);
-        ok = upload_media_pixels(image, pixels, dst_w, dst_h, (size_t)dst_w * 4, dst_w, dst_h);
+        ok = upload_media_pixels(image, capture, pixels, dst_w, dst_h, (size_t)dst_w * 4, dst_w, dst_h);
         free(pixels);
     }
     nsvgDeleteRasterizer(rasterizer);
@@ -538,6 +542,7 @@ static bool decode_svg_image(
 
 static bool decode_raster_image(
     MediaImage* image,
+    PixelCapture* capture,
     const uint8_t* data,
     size_t size,
     int* out_w,
@@ -553,6 +558,7 @@ static bool decode_raster_image(
     if (!pixels) return false;
     bool ok = upload_media_pixels(
         image,
+        capture,
         pixels,
         src_w,
         src_h,
@@ -569,21 +575,22 @@ static bool decode_raster_image(
 
 static bool decode_media_data(
     MediaImage* image,
+    PixelCapture* capture,
     const uint8_t* data,
     size_t size,
     int* out_w,
     int* out_h
 ) {
     if (bytes_are_webp(data, size)) {
-        return decode_webp_image(image, data, size, out_w, out_h);
+        return decode_webp_image(image, capture, data, size, out_w, out_h);
     } else if (bytes_are_svg(data, size)) {
-        return decode_svg_image(image, (char*)data, size, out_w, out_h);
+        return decode_svg_image(image, capture, (char*)data, size, out_w, out_h);
     } else {
-        return decode_raster_image(image, data, size, out_w, out_h);
+        return decode_raster_image(image, capture, data, size, out_w, out_h);
     }
 }
 
-#define MEDIA_PREFETCH_SLOTS 4
+#define MEDIA_PREFETCH_SLOTS 2
 
 typedef struct {
     char path[MEDIA_PATH_MAX];
@@ -643,18 +650,12 @@ bool ui_media_prefetch(const char* path) {
     size_t size = 0;
     uint8_t* data = read_media_file(path, &size);
     if (!data) return false;
-    s_capture_pixels_active = true;
-    free(s_captured_pixels);
-    s_captured_pixels = NULL;
-    s_captured_w = 0;
-    s_captured_h = 0;
+    PixelCapture capture = {0};
     int width = 0, height = 0;
-    bool ok = decode_media_data(NULL, data, size, &width, &height);
-    s_capture_pixels_active = false;
+    bool ok = decode_media_data(NULL, &capture, data, size, &width, &height);
     free(data);
-    if (!ok || !s_captured_pixels) {
-        free(s_captured_pixels);
-        s_captured_pixels = NULL;
+    if (!ok || !capture.pixels) {
+        free(capture.pixels);
         return false;
     }
     int slot = -1;
@@ -672,11 +673,10 @@ bool ui_media_prefetch(const char* path) {
         free(s_prefetch[slot].pixels);
     }
     snprintf(s_prefetch[slot].path, sizeof(s_prefetch[slot].path), "%s", path);
-    s_prefetch[slot].pixels = s_captured_pixels;
-    s_prefetch[slot].width = s_captured_w;
-    s_prefetch[slot].height = s_captured_h;
+    s_prefetch[slot].pixels = capture.pixels;
+    s_prefetch[slot].width = capture.width;
+    s_prefetch[slot].height = capture.height;
     s_prefetch[slot].used = ++s_prefetch_clock;
-    s_captured_pixels = NULL;
     return true;
 }
 
@@ -696,6 +696,7 @@ int ui_media_image(const char* path, int* out_width, int* out_height) {
             MediaImage* image = &s_media_images[slot];
             bool ok = upload_media_pixels(
                 image,
+                NULL,
                 s_prefetch[i].pixels,
                 s_prefetch[i].width,
                 s_prefetch[i].height,
@@ -733,7 +734,7 @@ int ui_media_image(const char* path, int* out_width, int* out_height) {
     }
     MediaImage* image = &s_media_images[slot];
     int width = 0, height = 0;
-    bool ok = decode_media_data(image, data, size, &width, &height);
+    bool ok = decode_media_data(image, NULL, data, size, &width, &height);
     free(data);
     if (!ok) {
         if (image->ready) {
@@ -1682,7 +1683,14 @@ void ui_audio_set_speed(float speed) {
     }
 }
 
-static bool audio_decode_mp3(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+static bool audio_decode_mp3(
+    const char* path,
+    int16_t* dst,
+    size_t dst_cap_bytes,
+    int* out_channels,
+    int* out_rate,
+    size_t* out_samples
+) {
     drmp3 mp3;
     if (!drmp3_init_file(&mp3, path, NULL)) return false;
     int channels = mp3.channels;
@@ -1691,12 +1699,12 @@ static bool audio_decode_mp3(const char* path, int* out_channels, int* out_rate,
         drmp3_uninit(&mp3);
         return false;
     }
-    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t capacity = dst_cap_bytes / sizeof(int16_t);
     size_t total = 0;
     while (total < capacity) {
         drmp3_uint64 want = (capacity - total) / (size_t)channels;
         if (want == 0) break;
-        drmp3_uint64 got = drmp3_read_pcm_frames_s16(&mp3, want, s_audio_pcm + total);
+        drmp3_uint64 got = drmp3_read_pcm_frames_s16(&mp3, want, dst + total);
         if (got == 0) break;
         total += (size_t)got * (size_t)channels;
     }
@@ -1708,7 +1716,14 @@ static bool audio_decode_mp3(const char* path, int* out_channels, int* out_rate,
     return true;
 }
 
-static bool audio_decode_vorbis(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+static bool audio_decode_vorbis(
+    const char* path,
+    int16_t* dst,
+    size_t dst_cap_bytes,
+    int* out_channels,
+    int* out_rate,
+    size_t* out_samples
+) {
     FILE* source = fopen(path, "rb");
     if (!source) return false;
     OggVorbis_File file;
@@ -1723,7 +1738,7 @@ static bool audio_decode_vorbis(const char* path, int* out_channels, int* out_ra
     }
     int channels = info->channels > 2 ? 2 : info->channels;
     int rate = (int)info->rate;
-    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t capacity = dst_cap_bytes / sizeof(int16_t);
     size_t total = 0;
     int16_t temp[4096];
     bool ok = false;
@@ -1742,7 +1757,7 @@ static bool audio_decode_vorbis(const char* path, int* out_channels, int* out_ra
         size_t frames = values / (size_t)info->channels;
         for (size_t frame = 0; frame < frames && total + (size_t)channels <= capacity; frame++) {
             for (int channel = 0; channel < channels; channel++) {
-                s_audio_pcm[total++] = temp[frame * (size_t)info->channels + (size_t)channel];
+                dst[total++] = temp[frame * (size_t)info->channels + (size_t)channel];
             }
         }
         if (total + (size_t)channels > capacity) {
@@ -1758,15 +1773,22 @@ static bool audio_decode_vorbis(const char* path, int* out_channels, int* out_ra
     return true;
 }
 
-static bool audio_decode_opus(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+static bool audio_decode_opus(
+    const char* path,
+    int16_t* dst,
+    size_t dst_cap_bytes,
+    int* out_channels,
+    int* out_rate,
+    size_t* out_samples
+) {
     int error = 0;
     OggOpusFile* file = op_open_file(path, &error);
     if (!file) return false;
-    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t capacity = dst_cap_bytes / sizeof(int16_t);
     size_t total = 0;
     bool ok = false;
     for (;;) {
-        int frames = op_read_stereo(file, s_audio_pcm + total, (int)(capacity - total));
+        int frames = op_read_stereo(file, dst + total, (int)(capacity - total));
         if (frames == 0) {
             ok = true;
             break;
@@ -1827,7 +1849,14 @@ static bool audio_parse_wav(const uint8_t* data, size_t size, WavInfo* wav) {
         && (wav->format == 1 || wav->format == 3);
 }
 
-static bool audio_decode_wav(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+static bool audio_decode_wav(
+    const char* path,
+    int16_t* dst,
+    size_t dst_cap_bytes,
+    int* out_channels,
+    int* out_rate,
+    size_t* out_samples
+) {
     size_t size = 0;
     uint8_t* data = read_media_file(path, &size);
     if (!data) return false;
@@ -1845,7 +1874,7 @@ static bool audio_decode_wav(const char* path, int* out_channels, int* out_rate,
         free(data);
         return false;
     }
-    size_t capacity = s_audio_capacity / sizeof(int16_t);
+    size_t capacity = dst_cap_bytes / sizeof(int16_t);
     size_t total = 0;
     size_t frames = wav.data_size / (size_t)frame_size;
     for (size_t frame = 0; frame < frames && total + (size_t)channels <= capacity; frame++) {
@@ -1871,7 +1900,7 @@ static bool audio_decode_wav(const char* path, int* out_channels, int* out_rate,
                 free(data);
                 return false;
             }
-            s_audio_pcm[total++] = audio_clamp16(value);
+            dst[total++] = audio_clamp16(value);
         }
     }
     free(data);
@@ -1889,15 +1918,22 @@ static bool audio_extension_is(const char* path, const char* first, const char* 
     return strcasecmp(dot, first) == 0 || (second && strcasecmp(dot, second) == 0);
 }
 
-static bool audio_decode_path(const char* path, int* out_channels, int* out_rate, size_t* out_samples) {
+static bool audio_decode_path(
+    const char* path,
+    int16_t* dst,
+    size_t dst_cap_bytes,
+    int* out_channels,
+    int* out_rate,
+    size_t* out_samples
+) {
     if (audio_extension_is(path, "ogg", "oga")) {
-        return audio_decode_vorbis(path, out_channels, out_rate, out_samples);
+        return audio_decode_vorbis(path, dst, dst_cap_bytes, out_channels, out_rate, out_samples);
     } else if (audio_extension_is(path, "opus", "spx")) {
-        return audio_decode_opus(path, out_channels, out_rate, out_samples);
+        return audio_decode_opus(path, dst, dst_cap_bytes, out_channels, out_rate, out_samples);
     } else if (audio_extension_is(path, "wav", "wave")) {
-        return audio_decode_wav(path, out_channels, out_rate, out_samples);
+        return audio_decode_wav(path, dst, dst_cap_bytes, out_channels, out_rate, out_samples);
     } else {
-        return audio_decode_mp3(path, out_channels, out_rate, out_samples);
+        return audio_decode_mp3(path, dst, dst_cap_bytes, out_channels, out_rate, out_samples);
     }
 }
 
@@ -1906,6 +1942,8 @@ static int s_prefetch_rate = 0;
 static size_t s_prefetch_samples = 0;
 
 void ui_audio_prefetch_clear(void) {
+    free(s_prefetch_pcm);
+    s_prefetch_pcm = NULL;
     s_prefetch_channels = 0;
     s_prefetch_rate = 0;
     s_prefetch_samples = 0;
@@ -1915,21 +1953,15 @@ void ui_audio_prefetch_clear(void) {
 bool ui_audio_prefetch(const char* path) {
     if (!path || !path[0]) return false;
     if (s_prefetch_pcm && strcmp(s_prefetch_audio_path, path) == 0) return true;
-    if (!audio_buffer_ensure()) return false;
     if (!s_prefetch_pcm) {
-        s_prefetch_pcm = (int16_t*)malloc(AUDIO_PCM_BYTES);
+        s_prefetch_pcm = (int16_t*)malloc(AUDIO_PREFETCH_PCM_BYTES);
         if (!s_prefetch_pcm) return false;
     }
-    int16_t* saved_pcm = s_audio_pcm;
-    size_t saved_capacity = s_audio_capacity;
-    s_audio_pcm = s_prefetch_pcm;
-    s_audio_capacity = AUDIO_PCM_BYTES;
     int channels = 0;
     int rate = 0;
     size_t samples = 0;
-    bool ok = audio_decode_path(path, &channels, &rate, &samples);
-    s_audio_pcm = saved_pcm;
-    s_audio_capacity = saved_capacity;
+    bool ok = audio_decode_path(
+        path, s_prefetch_pcm, AUDIO_PREFETCH_PCM_BYTES, &channels, &rate, &samples);
     if (!ok || samples == 0) {
         s_prefetch_channels = 0;
         s_prefetch_rate = 0;
@@ -1954,7 +1986,7 @@ bool ui_audio_decode(const char* path) {
     int channels = 0;
     int rate = 0;
     size_t samples = 0;
-    return audio_decode_path(path, &channels, &rate, &samples);
+    return audio_decode_path(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples);
 }
 
 bool ui_audio_play(const char* path) {
@@ -1973,16 +2005,16 @@ bool ui_audio_play(const char* path) {
     int channels = 0;
     int rate = 0;
     size_t samples = 0;
-    bool ok = audio_decode_path(path, &channels, &rate, &samples);
+    bool ok = audio_decode_path(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples);
     if (!ok) {
         if (audio_extension_is(path, "mp3", NULL)) {
-            ok = audio_decode_vorbis(path, &channels, &rate, &samples)
-                || audio_decode_opus(path, &channels, &rate, &samples);
+            ok = audio_decode_vorbis(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples)
+                || audio_decode_opus(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples);
         } else if (!audio_extension_is(path, "ogg", "oga") && !audio_extension_is(path, "opus", "spx")
             && !audio_extension_is(path, "wav", "wave")) {
-            ok = audio_decode_vorbis(path, &channels, &rate, &samples)
-                || audio_decode_opus(path, &channels, &rate, &samples)
-                || audio_decode_wav(path, &channels, &rate, &samples);
+            ok = audio_decode_vorbis(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples)
+                || audio_decode_opus(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples)
+                || audio_decode_wav(path, s_audio_pcm, s_audio_capacity, &channels, &rate, &samples);
         }
     }
     if (!ok) return false;
@@ -3145,16 +3177,23 @@ int ui_keyboard(const char* hint, const char* initial, char* output, size_t capa
     return -1;
 }
 
-bool ui_wifi_connected(void) {
-    static uint64_t next_check;
-    static bool connected;
-    uint64_t now = svcGetSystemTick();
-    if (now < next_check) return connected;
-    next_check = now + SYSCLOCK_ARM11;
+static uint64_t s_wifi_next_check;
+static bool s_wifi_connected;
+
+bool ui_wifi_connected_now(void) {
     u32 status = 0;
-    if (R_FAILED(acInit())) return osGetWifiStrength() != 0;
-    Result result = ACU_GetStatus(&status);
-    acExit();
-    connected = R_SUCCEEDED(result) && status == 3;
-    return connected;
+    if (R_FAILED(acInit())) {
+        s_wifi_connected = osGetWifiStrength() != 0;
+    } else {
+        Result result = ACU_GetStatus(&status);
+        acExit();
+        s_wifi_connected = R_SUCCEEDED(result) && status == 3;
+    }
+    s_wifi_next_check = svcGetSystemTick() + SYSCLOCK_ARM11;
+    return s_wifi_connected;
+}
+
+bool ui_wifi_connected(void) {
+    if (svcGetSystemTick() < s_wifi_next_check) return s_wifi_connected;
+    return ui_wifi_connected_now();
 }

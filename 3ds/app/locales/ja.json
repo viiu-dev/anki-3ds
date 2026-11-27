@@ -379,5 +379,16 @@
     "UI Sound Effects": "UI効果音",
     "UI Sound Effects: {0}": "UI効果音: {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "解答表示・評価・デッキ完了時に心地よい効果音を鳴らします。",
-    "Sound effects volume": "効果音の音量"
+    "Sound effects volume": "効果音の音量",
+    "Downloading image...": "画像をダウンロード中...",
+    "Loading image...": "画像を読み込み中...",
+    "Wi-Fi disabled": "Wi-Fi オフ",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi がオフまたは未接続です。無線通信をオンにしてネットワークに接続してから同期してください。",
+    "Check for updates: {0}": "アップデート確認: {0}",
+    "Check now": "今すぐアップデートを確認",
+    "Checking for updates...": "アップデートを確認中...",
+    "Update available: {0}": "アップデートあり: {0}",
+    "Up to date (v{0})": "最新です (v{0})",
+    "Update check failed: {0}": "確認に失敗しました: {0}",
+    "[Y] Dismiss": "[Y] 閉じる"
 }

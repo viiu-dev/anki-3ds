@@ -18,6 +18,7 @@ use super::review_text::DiffClass;
 use super::review_text::Inline;
 use super::review_text::PitchMarker;
 use super::review_text::Style;
+use super::review_text::TextAlign;
 
 pub const TOP_WIDTH: f32 = 400.0;
 pub const TOP_HEIGHT: f32 = 240.0;
@@ -80,6 +81,7 @@ extern "C" {
     ) -> bool;
     fn ui_set_theme(theme: *const Theme);
     fn ui_wifi_connected() -> bool;
+    fn ui_wifi_connected_now() -> bool;
     fn ui_fini();
     fn ui_frame_begin();
     fn ui_frame_end();
@@ -225,6 +227,9 @@ pub struct Ui;
 impl Ui {
     pub fn wifi_connected() -> bool {
         unsafe { ui_wifi_connected() }
+    }
+    pub fn wifi_connected_now() -> bool {
+        unsafe { ui_wifi_connected_now() }
     }
     pub fn keyboard(hint: &str, initial: &str) -> Result<Option<String>, String> {
         Self::keyboard_with_mode(hint, initial, false)
@@ -409,15 +414,22 @@ impl Ui {
         }
     }
 
-    /// Open animated media. Returns the slot id, or `None` when the format
-    /// is unsupported on this device (the caller draws a poster instead).
-    pub fn anim_open(path: &str) -> Option<(i32, i32, i32, i32)> {
-        let c_str = CString::new(path.as_bytes()).ok()?;
+    pub fn anim_open(path: &str) -> AnimLoad {
+        let Some(_guard) = try_lock_codec() else {
+            return AnimLoad::Busy;
+        };
+        let Some(c_str) = CString::new(path.as_bytes()).ok() else {
+            return AnimLoad::Unsupported;
+        };
         let mut width = 0;
         let mut height = 0;
         let mut frames = 0;
         let id = unsafe { ui_anim_open(c_str.as_ptr(), &mut width, &mut height, &mut frames) };
-        (id >= 0).then_some((id, width, height, frames))
+        if id >= 0 {
+            AnimLoad::Ready(id, width, height, frames)
+        } else {
+            AnimLoad::Unsupported
+        }
     }
 
     pub fn anim_tick(id: i32, elapsed_ms: u32) {
@@ -449,6 +461,7 @@ impl Ui {
     }
 
     pub fn anim_close_all() {
+        let _guard = lock_codec();
         unsafe { ui_anim_close_all() }
     }
 
@@ -513,9 +526,8 @@ impl Ui {
         unsafe { ui_media_prefetch_clear() }
     }
 
-    /// Forget cached "file is missing" results after background media sync
-    /// has written new files.
     pub fn media_refresh() {
+        let _guard = lock_codec();
         unsafe { ui_media_refresh() }
     }
 
@@ -769,13 +781,14 @@ struct CardLine {
     ruby_height: f32,
     upper: f32,
     width: f32,
+    avail_width: f32,
     pitch_height: f32,
     marker: Option<String>,
     pieces: Vec<CardPiece>,
     rule: bool,
-    /// Left indent in layout space (quotes, table columns). Positive indents
-    /// are left-aligned; zero-indent lines keep the centered layout.
     indent: f32,
+    align: TextAlign,
+    bounds: Option<(f32, f32)>,
 }
 
 struct LineDraft {
@@ -816,32 +829,52 @@ impl LineDraft {
 
 #[derive(Clone, Copy)]
 struct CardMetrics {
-    width: f32,
+    avail_width: f32,
     font_scale: f32,
     nominal: f32,
-    content_left: f32,
+    marker_offset: f32,
     indent: f32,
+    align: TextAlign,
+    bounds: Option<(f32, f32)>,
 }
 
-/// An opened animated-media item backing an `Inline::Media` box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnimStatus {
+    #[default]
+    Loading,
+    Downloading,
+    Ready,
+    UnsupportedVideo,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AnimHandle {
     pub path: String,
     pub id: i32,
+    pub still_tex: Option<i32>,
     pub width: f32,
     pub height: f32,
     pub frames: i32,
     pub playing: bool,
     pub supported: bool,
+    pub status: AnimStatus,
     pub video: bool,
     pub autoplay: bool,
 }
 
 impl AnimHandle {
     fn has_video_controls(&self) -> bool {
-        super::review_text::is_video_filename(&self.path)
-            || (self.supported && self.frames > 1 && is_animated_image(&self.path))
+        (super::review_text::is_video_filename(&self.path) && self.supported)
+            || (self.supported && self.still_tex.is_none() && self.frames > 1 && is_animated_image(&self.path))
     }
+}
+
+struct PendingImage {
+    top: f32,
+    x: f32,
+    width: f32,
+    height: f32,
+    downloading: bool,
 }
 
 struct PlacedAnim {
@@ -909,6 +942,12 @@ pub enum ImageLoad {
     Busy,
 }
 
+pub enum AnimLoad {
+    Ready(i32, i32, i32, i32),
+    Unsupported,
+    Busy,
+}
+
 pub enum AudioAttempt {
     Done(bool),
     Busy,
@@ -927,13 +966,12 @@ fn fallback_media_path(path: &str) -> Option<String> {
     (sharded != path).then_some(sharded)
 }
 
-/// Cached rich-card layout. HTML is parsed and measured only when the card or
-/// the selected font scale changes; drawing then uses the cached lines.
 #[derive(Default)]
 pub struct RichTextLayout {
     html: String,
     css: String,
     dark_mode: bool,
+    media_syncing: bool,
     image_paths: Vec<String>,
     width: f32,
     font_scale: f32,
@@ -943,6 +981,7 @@ pub struct RichTextLayout {
     hint_order: Vec<u16>,
     lines: Vec<CardLine>,
     images: Vec<CardImage>,
+    pending_images: Vec<PendingImage>,
     tables: Vec<TableGrid>,
     codes: Vec<PlacedCode>,
     quote_bars: Vec<(f32, f32, f32)>,
@@ -962,9 +1001,11 @@ struct LayoutScratch<'a> {
     boxes: Vec<PlacedBox>,
     placed: Vec<PlacedAnim>,
     images: Vec<CardImage>,
+    pending_images: Vec<PendingImage>,
     used_images: HashSet<String>,
     saw_img_tag: bool,
     busy: bool,
+    media_syncing: bool,
     image_paths: &'a [String],
     font_scale: f32,
     nominal: f32,
@@ -990,6 +1031,7 @@ impl RichTextLayout {
         font_scale: f32,
         hints_open: &HashSet<u16>,
         typed: &str,
+        media_syncing: bool,
     ) {
         let font_scale = font_scale.clamp(0.5, 2.5);
         let spacing = super::i18n::spacing_factor();
@@ -997,6 +1039,7 @@ impl RichTextLayout {
             && self.html == html
             && self.css == css
             && self.dark_mode == dark_mode
+            && self.media_syncing == media_syncing
             && self.image_paths == images
             && (self.width - width).abs() < 0.01
             && (self.font_scale - font_scale).abs() < 0.001
@@ -1011,9 +1054,11 @@ impl RichTextLayout {
         self.css.clear();
         self.css.push_str(css);
         self.dark_mode = dark_mode;
+        self.media_syncing = media_syncing;
         self.image_paths.clear();
         self.image_paths.extend(images.iter().cloned());
         self.images.clear();
+        self.pending_images.clear();
         self.boxes.clear();
         self.width = width;
         self.font_scale = font_scale;
@@ -1024,7 +1069,7 @@ impl RichTextLayout {
 
         let blocks = super::review_text::parse_html_with_css(html, css, dark_mode);
         self.hint_order = collect_hint_ids(&blocks);
-        self.open_anims(&blocks);
+        let anim_busy = self.open_anims(&blocks, media_syncing);
         let nominal = CARD_LINE_HEIGHT * font_scale * spacing;
         let block_gap = CARD_BLOCK_GAP * font_scale * spacing;
         let section_gap = CARD_SECTION_GAP * font_scale * spacing;
@@ -1038,9 +1083,11 @@ impl RichTextLayout {
             boxes: Vec::new(),
             placed: Vec::new(),
             images: Vec::new(),
+            pending_images: Vec::new(),
             used_images: HashSet::new(),
             saw_img_tag: false,
-            busy: false,
+            busy: anim_busy,
+            media_syncing,
             image_paths: images,
             font_scale,
             nominal,
@@ -1057,6 +1104,7 @@ impl RichTextLayout {
             0.0,
             0,
             width,
+            TextAlign::Center,
             &mut scratch,
             &mut cursor,
             &mut first,
@@ -1077,8 +1125,10 @@ impl RichTextLayout {
                     None,
                     None,
                     &mut scratch.images,
+                    &mut scratch.pending_images,
                     &mut cursor,
                     &mut scratch.busy,
+                    scratch.media_syncing,
                 );
                 first = false;
             }
@@ -1086,6 +1136,7 @@ impl RichTextLayout {
         self.content_height = cursor;
         self.lines = scratch.lines;
         self.images = scratch.images;
+        self.pending_images = scratch.pending_images;
         self.tables = scratch.tables;
         self.codes = scratch.codes;
         self.quote_bars = scratch.bars;
@@ -1104,11 +1155,9 @@ impl RichTextLayout {
         &self.controls
     }
 
-    /// Advance playing animations by the frame time. Call once per frame
-    /// before drawing.
     pub fn tick_anims(&self, elapsed_ms: u32) {
         for anim in &self.anims {
-            if anim.supported && anim.playing {
+            if anim.supported && anim.still_tex.is_none() && anim.id >= 0 && anim.playing {
                 Ui::anim_tick(anim.id, elapsed_ms);
             }
         }
@@ -1125,6 +1174,7 @@ impl RichTextLayout {
         indent: f32,
         depth: u8,
         width: f32,
+        default_align: TextAlign,
         scratch: &mut LayoutScratch<'_>,
         cursor: &mut f32,
         first: &mut bool,
@@ -1150,11 +1200,14 @@ impl RichTextLayout {
                         ruby_height: 0.0,
                         upper: 0.0,
                         width,
+                        avail_width: width,
                         pitch_height: 0.0,
                         marker: None,
                         pieces: Vec::new(),
                         rule: true,
                         indent: 0.0,
+                        align: TextAlign::Left,
+                        bounds: None,
                     });
                     *cursor += scratch.rule_height;
                 }
@@ -1172,6 +1225,7 @@ impl RichTextLayout {
                         } else {
                             1.0
                         };
+                    let align = resolve_block_align(content, default_align);
                     self.layout_inlines(
                         content,
                         None,
@@ -1179,6 +1233,8 @@ impl RichTextLayout {
                         scratch.font_scale,
                         block_scale,
                         indent,
+                        align,
+                        None,
                         scratch,
                         cursor,
                         scratch.nominal,
@@ -1187,6 +1243,7 @@ impl RichTextLayout {
                 Block::ListItem { marker, content } => {
                     *headword_pending = false;
                     *cursor += between;
+                    let align = resolve_block_align(content, TextAlign::Left);
                     self.layout_inlines(
                         content,
                         Some(marker.clone()),
@@ -1194,6 +1251,8 @@ impl RichTextLayout {
                         scratch.font_scale,
                         1.0,
                         indent,
+                        align,
+                        None,
                         scratch,
                         cursor,
                         scratch.nominal,
@@ -1226,6 +1285,7 @@ impl RichTextLayout {
                             indent,
                             depth,
                             width,
+                            default_align,
                             scratch,
                             cursor,
                             &mut nested_first,
@@ -1244,6 +1304,7 @@ impl RichTextLayout {
                         indent + 10.0,
                         depth + 1,
                         width,
+                        TextAlign::Left,
                         scratch,
                         cursor,
                         &mut nested_first,
@@ -1254,7 +1315,11 @@ impl RichTextLayout {
                     }
                 }
                 Block::Callout { style, content } => {
-                    *headword_pending = false;
+                    let is_centered_box = style.align == TextAlign::Center
+                        && style.border_left.is_none();
+                    if !is_centered_box {
+                        *headword_pending = false;
+                    }
                     *cursor += between;
                     let box_x = indent;
                     let box_w = (width - box_x).max(24.0);
@@ -1268,20 +1333,29 @@ impl RichTextLayout {
                     } else {
                         2.0
                     };
+                    let box_align = if style.align != TextAlign::Auto {
+                        style.align
+                    } else {
+                        TextAlign::Left
+                    };
                     let top = *cursor;
                     *cursor += pad_y;
                     let mut nested_first = true;
-                    let mut nested_hw = false;
+                    let mut nested_hw = is_centered_box && *headword_pending;
                     self.layout_blocks(
                         content,
                         indent + inner_pad,
                         depth + 1,
-                        (width - 5.0).max(indent + inner_pad + 24.0),
+                        (width - inner_pad.min(6.0)).max(indent + inner_pad + 24.0),
+                        box_align,
                         scratch,
                         cursor,
                         &mut nested_first,
                         &mut nested_hw,
                     );
+                    if is_centered_box && !nested_hw {
+                        *headword_pending = false;
+                    }
                     *cursor += pad_y;
                     if *cursor > top + 2.0 * pad_y {
                         scratch.boxes.push(PlacedBox {
@@ -1298,11 +1372,7 @@ impl RichTextLayout {
         }
     }
 
-    /// Open animated media for the card, capped at one video and two animated
-    /// images so a card cannot exhaust the frame budget. Rebuilds preserve
-    /// the playback state of already-open slots; clips beyond the cap remain
-    /// as posters so every video ref can still expose controls.
-    fn open_anims(&mut self, blocks: &[Block]) {
+    fn open_anims(&mut self, blocks: &[Block], media_syncing: bool) -> bool {
         let known: Vec<i32> = self
             .anims
             .iter()
@@ -1314,8 +1384,10 @@ impl RichTextLayout {
         collect_media(blocks, &mut medias);
         let mut videos = 0usize;
         let mut animated = 0usize;
+        let mut any_busy = false;
         for (path, autoplay, loop_) in medias {
             let animated_image = is_animated_image(&path);
+            let actual_video = super::review_text::is_video_filename(&path);
             let can_open = if animated_image {
                 let can = animated < 2;
                 animated += 1;
@@ -1325,15 +1397,86 @@ impl RichTextLayout {
                 videos += 1;
                 can
             };
-            let opened = if can_open {
-                resolve_anim_path(&path)
-            } else {
-                None
+            let disk_path = resolve_anim_disk_path(&path);
+            let Some(resolved) = disk_path else {
+                let status = if actual_video && !path.to_ascii_lowercase().ends_with(".avi") {
+                    AnimStatus::UnsupportedVideo
+                } else if media_syncing {
+                    AnimStatus::Downloading
+                } else if actual_video {
+                    AnimStatus::UnsupportedVideo
+                } else {
+                    AnimStatus::Loading
+                };
+                self.anims.push(AnimHandle {
+                    path,
+                    id: -1,
+                    still_tex: None,
+                    width: 0.0,
+                    height: 0.0,
+                    frames: 0,
+                    playing: false,
+                    supported: false,
+                    status,
+                    video: actual_video,
+                    autoplay,
+                });
+                continue;
             };
-            let (id, width, height, frames) = opened.unwrap_or((-1, 0, 0, 0));
-            let supported = id >= 0 && width > 0 && height > 0;
-            let fresh = supported && !known.contains(&id);
-            let playing = if !supported {
+            let mut id = -1;
+            let mut still_tex = None;
+            let mut width = 0;
+            let mut height = 0;
+            let mut frames = 0;
+            let mut status = if actual_video {
+                AnimStatus::UnsupportedVideo
+            } else {
+                AnimStatus::Loading
+            };
+            let mut busy_open = false;
+            if can_open {
+                match Ui::anim_open(&resolved) {
+                    AnimLoad::Ready(opened_id, w, h, f) if w > 0 && h > 0 => {
+                        id = opened_id;
+                        width = w;
+                        height = h;
+                        frames = f;
+                        status = AnimStatus::Ready;
+                    }
+                    AnimLoad::Busy => {
+                        any_busy = true;
+                        busy_open = true;
+                        status = AnimStatus::Loading;
+                    }
+                    _ => {}
+                }
+            }
+            if status != AnimStatus::Ready && !busy_open && animated_image {
+                match Ui::media_image(&resolved) {
+                    ImageLoad::Ready(tex, w, h) if w > 0 && h > 0 => {
+                        still_tex = Some(tex);
+                        width = w;
+                        height = h;
+                        frames = 1;
+                        status = AnimStatus::Ready;
+                    }
+                    ImageLoad::Busy => {
+                        any_busy = true;
+                        status = AnimStatus::Loading;
+                    }
+                    ImageLoad::Missing => {
+                        status = if media_syncing {
+                            AnimStatus::Downloading
+                        } else {
+                            AnimStatus::Loading
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            let supported = status == AnimStatus::Ready;
+            let fresh = supported && id >= 0 && !known.contains(&id);
+            let playing = if !supported || still_tex.is_some() {
                 false
             } else if fresh {
                 if animated_image {
@@ -1351,12 +1494,14 @@ impl RichTextLayout {
             self.anims.push(AnimHandle {
                 path,
                 id,
+                still_tex,
                 width: width as f32,
                 height: height as f32,
                 frames,
                 playing,
                 supported,
-                video: !animated_image,
+                status,
+                video: actual_video,
                 autoplay,
             });
         }
@@ -1366,6 +1511,7 @@ impl RichTextLayout {
             .filter(|anim| anim.has_video_controls())
             .cloned()
             .collect();
+        any_busy
     }
 
     fn layout_table(
@@ -1458,30 +1604,50 @@ impl RichTextLayout {
         let table_top = *cursor;
         let mut row_y = vec![table_top];
         let mut header = Vec::new();
+        let cell_pad_x = 3.0 * font_scale;
+        let cell_pad_y = 2.0 * font_scale;
+        let min_row_h = nominal * cell_scale * 0.8 + cell_pad_y * 2.0;
         for row in rows {
             let row_top = *cursor;
-            let mut height = 0.0f32;
+            let mut height = min_row_h;
             let mut column = 0usize;
             let mut pending_headers = Vec::new();
             for cell in row {
+                if column >= columns {
+                    break;
+                }
                 let span = cell.colspan.max(1) as usize;
                 let last = (column + span).min(columns);
-                let cell_w = (col_x[last] - col_x[column]).max(8.0);
-                *cursor = row_top;
+                let cell_left = indent + col_x[column];
+                let cell_right = indent + col_x[last];
+                let cell_w = (cell_right - cell_left).max(8.0);
+                let text_left = (cell_left + cell_pad_x).min(cell_right);
+                let text_right = (cell_right - cell_pad_x).max(text_left + 4.0);
+                let cell_align = resolve_block_align(
+                    &cell.content,
+                    if cell.header {
+                        TextAlign::Center
+                    } else {
+                        TextAlign::Left
+                    },
+                );
+                *cursor = row_top + cell_pad_y;
                 self.layout_inlines(
                     &cell.content,
                     None,
-                    indent + col_x[last],
+                    text_right,
                     font_scale * cell_scale,
                     1.0,
-                    indent + col_x[column],
+                    text_left,
+                    cell_align,
+                    Some((cell_left, cell_right)),
                     scratch,
                     cursor,
                     nominal * cell_scale,
                 );
-                height = height.max(*cursor - row_top);
+                height = height.max((*cursor - row_top) + cell_pad_y);
                 if cell.header {
-                    pending_headers.push((indent + col_x[column], cell_w));
+                    pending_headers.push((cell_left, cell_w));
                 }
                 column += span;
             }
@@ -1504,6 +1670,7 @@ impl RichTextLayout {
     pub fn draw_offset(&self, scroll: f32, offset_x: f32, offset_y: f32) {
         if self.lines.is_empty()
             && self.images.is_empty()
+            && self.pending_images.is_empty()
             && self.tables.is_empty()
             && self.codes.is_empty()
             && self.boxes.is_empty()
@@ -1575,10 +1742,14 @@ impl RichTextLayout {
                 );
                 continue;
             }
-            let line_left = if line.indent > 0.01 {
-                content_left + line.indent
-            } else {
-                content_left + (self.width - line.width).max(0.0) / 2.0
+            let line_left = match line.align {
+                TextAlign::Left => content_left + line.indent,
+                TextAlign::Right => {
+                    content_left + line.indent + (line.avail_width - line.width).max(0.0)
+                }
+                TextAlign::Center | TextAlign::Auto => {
+                    content_left + line.indent + (line.avail_width - line.width).max(0.0) / 2.0
+                }
             };
             let pitch_top = top + line.pitch_height + line.upper;
             let text_top = pitch_top + line.ruby_height;
@@ -1793,7 +1964,7 @@ impl RichTextLayout {
                             base_x + piece.base_width,
                             bar_y,
                             base_x + piece.base_width,
-                            y + 2.0 * self.font_scale,
+                            y + 4.5 * self.font_scale * piece.scale,
                             1.5,
                             pitch_color,
                         );
@@ -1839,9 +2010,16 @@ impl RichTextLayout {
                 if let Some(reading) = &piece.ruby {
                     let reading_scale = ruby_scale * piece.scale;
                     let mut ruby_x = x + (piece.width - piece.ruby_width) * 0.5;
-                    ruby_x = ruby_x.clamp(1.0, (TOP_WIDTH - piece.ruby_width - 1.0).max(1.0));
+                    let (min_x, max_x) = if let Some((b_left, b_right)) = line.bounds {
+                        let left = content_left + b_left + 1.0;
+                        let right = (content_left + b_right - piece.ruby_width - 1.0).max(left);
+                        (left, right)
+                    } else {
+                        (1.0, (TOP_WIDTH - piece.ruby_width - 1.0).max(1.0))
+                    };
+                    ruby_x = ruby_x.clamp(min_x, max_x);
                     if let Some(previous_right) = previous_ruby_right {
-                        ruby_x = ruby_x.max(previous_right + CARD_RUBY_MIN_GAP);
+                        ruby_x = ruby_x.max(previous_right + CARD_RUBY_MIN_GAP).min(max_x);
                     }
                     Ui::draw_card_text(
                         ruby_x,
@@ -1930,6 +2108,14 @@ impl RichTextLayout {
         for (top, height, x) in &self.quote_bars {
             Ui::draw_rect(content_left + x, origin + top, 3.0, *height, theme().accent);
         }
+        for pending in &self.pending_images {
+            let top = origin + pending.top;
+            if top > TOP_HEIGHT || top + pending.height < 0.0 {
+                continue;
+            }
+            let x = content_left + pending.x;
+            draw_image_placeholder(x, top, pending.width, pending.height, pending.downloading);
+        }
         for placed in &self.placed_anims {
             let top = origin + placed.top;
             if top > TOP_HEIGHT || top + placed.height < 0.0 {
@@ -1939,9 +2125,19 @@ impl RichTextLayout {
             let handle = self.anims.get(placed.handle);
             match handle {
                 Some(anim) if anim.supported => {
-                    Ui::anim_draw(anim.id, x, top, placed.width, placed.height);
+                    if let Some(tex) = anim.still_tex {
+                        Ui::media_draw(tex, x, top, placed.width, placed.height);
+                    } else {
+                        Ui::anim_draw(anim.id, x, top, placed.width, placed.height);
+                    }
                 }
-                _ => {
+                Some(anim) if anim.status == AnimStatus::Downloading => {
+                    draw_image_placeholder(x, top, placed.width, placed.height, true);
+                }
+                Some(anim) if anim.status == AnimStatus::Loading => {
+                    draw_image_placeholder(x, top, placed.width, placed.height, false);
+                }
+                Some(anim) if anim.status == AnimStatus::UnsupportedVideo => {
                     Ui::draw_rounded_rect(
                         x,
                         top,
@@ -1968,6 +2164,9 @@ impl RichTextLayout {
                         theme().text_muted,
                         tr("Unsupported video"),
                     );
+                }
+                _ => {
+                    draw_image_placeholder(x, top, placed.width, placed.height, self.media_syncing);
                 }
             }
         }
@@ -2110,6 +2309,8 @@ impl RichTextLayout {
         font_scale: f32,
         block_scale: f32,
         indent: f32,
+        align: TextAlign,
+        bounds: Option<(f32, f32)>,
         scratch: &mut LayoutScratch<'_>,
         cursor: &mut f32,
         nominal: f32,
@@ -2120,20 +2321,22 @@ impl RichTextLayout {
             .filter(|m| !m.is_empty())
             .map(|marker| Ui::get_card_text_width(scale, marker))
             .unwrap_or(0.0);
-        let content_left = indent
-            + match marker.as_deref() {
-                Some("") => 6.0 * font_scale,
-                Some(_) => marker_width + 4.0 * font_scale,
-                None => 0.0,
-            };
+        let marker_offset = match marker.as_deref() {
+            Some("") => 6.0 * font_scale,
+            Some(_) => marker_width + 4.0 * font_scale,
+            None => 0.0,
+        };
+        let avail_width = (width - indent).max(8.0);
         let metrics = CardMetrics {
-            width,
+            avail_width,
             font_scale,
             nominal,
-            content_left,
+            marker_offset,
             indent,
+            align,
+            bounds,
         };
-        let mut draft = LineDraft::new(content_left, marker);
+        let mut draft = LineDraft::new(marker_offset, marker);
         let mut pending_space = false;
         let lines = &mut scratch.lines;
         for inline in inlines {
@@ -2250,27 +2453,39 @@ impl RichTextLayout {
                     if scratch.images.len() >= MEDIA_IMAGE_SLOTS {
                         continue;
                     }
+                    if draft.has_content() || draft.marker.is_some() {
+                        finish_line(&mut draft, lines, cursor, metrics, true);
+                    }
+                    let avail = metrics.avail_width.max(32.0);
                     if let Some(resolved) = resolve_image_path(scratch.image_paths, src) {
-                        if draft.has_content() || draft.marker.is_some() {
-                            finish_line(&mut draft, lines, cursor, metrics, true);
-                        }
                         scratch.used_images.insert(resolved.to_owned());
-                        let prev = scratch.images.len();
+                        let prev = scratch.images.len() + scratch.pending_images.len();
                         place_resolved_image(
                             resolved,
                             metrics.indent,
-                            (metrics.width - metrics.indent).max(32.0),
+                            avail,
                             *max_w,
                             *max_h,
                             &mut scratch.images,
+                            &mut scratch.pending_images,
                             cursor,
                             &mut scratch.busy,
+                            scratch.media_syncing,
                         );
-                        if scratch.images.len() > prev {
+                        if scratch.images.len() + scratch.pending_images.len() > prev {
                             *cursor += scratch.block_gap;
                         }
-                        pending_space = false;
+                    } else {
+                        place_pending_image(
+                            metrics.indent,
+                            avail,
+                            scratch.media_syncing,
+                            &mut scratch.pending_images,
+                            cursor,
+                        );
+                        *cursor += scratch.block_gap;
                     }
+                    pending_space = false;
                 }
                 Inline::Break => {
                     let force = !(draft.pieces.is_empty() && draft.marker.is_none());
@@ -2474,7 +2689,7 @@ impl RichTextLayout {
             }
             PitchMarker::Graph(_) => 30.0 * factor,
         };
-        if draft.has_content() && draft.x + width > metrics.width {
+        if draft.has_content() && draft.x + width > metrics.avail_width {
             finish_line(draft, lines, cursor, metrics, true);
         }
         let x = draft.x;
@@ -2516,13 +2731,13 @@ impl RichTextLayout {
         let min_width = 120.0 * metrics.font_scale;
         let width = (text_width + 14.0)
             .max(min_width)
-            .min((metrics.width - metrics.content_left).max(min_width));
+            .min((metrics.avail_width - metrics.marker_offset).max(min_width));
         let gap = if draft.has_content() && *pending_space {
             self.space_width(metrics)
         } else {
             0.0
         };
-        if draft.has_content() && draft.x + gap + width > metrics.width {
+        if draft.has_content() && draft.x + gap + width > metrics.avail_width {
             finish_line(draft, lines, cursor, metrics, true);
         }
         let x = draft.x + if draft.has_content() { gap } else { 0.0 };
@@ -2569,7 +2784,7 @@ impl RichTextLayout {
         } else {
             0.0
         };
-        if draft.has_content() && draft.x + gap + width > metrics.width {
+        if draft.has_content() && draft.x + gap + width > metrics.avail_width {
             finish_line(draft, lines, cursor, metrics, true);
         }
         let x = draft.x + if draft.has_content() { gap } else { 0.0 };
@@ -2605,7 +2820,7 @@ impl RichTextLayout {
         if draft.has_content() || draft.marker.is_some() {
             finish_line(draft, lines, cursor, metrics, true);
         }
-        let avail = (metrics.width - metrics.indent).max(40.0);
+        let avail = metrics.avail_width.max(40.0);
         let handle = self.anims.iter().position(|anim| anim.path == path);
         let (width, height) = match handle.and_then(|index| self.anims.get(index)) {
             Some(anim) if anim.supported && anim.width > 0.0 && anim.height > 0.0 => {
@@ -2614,6 +2829,9 @@ impl RichTextLayout {
                     .min(4.0)
                     .max(0.05);
                 (anim.width * fit, anim.height * fit)
+            }
+            Some(anim) if matches!(anim.status, AnimStatus::Downloading | AnimStatus::Loading) => {
+                (180.0_f32.min(avail), 44.0)
             }
             _ => (160.0_f32.min(avail), 90.0),
         };
@@ -2666,13 +2884,13 @@ impl RichTextLayout {
             _ => 0.0,
         };
         let mut placed_x = nominal_x + ruby_shift;
-        if draft.has_content() && placed_x + width > metrics.width {
+        if draft.has_content() && placed_x + width > metrics.avail_width {
             finish_line(draft, lines, cursor, metrics, true);
             nominal_x = draft.x;
             ruby_shift = 0.0;
             placed_x = draft.x;
         }
-        let available = metrics.width - placed_x;
+        let available = metrics.avail_width - placed_x;
         if ruby.is_none() && width > available {
             if draft.has_content() {
                 finish_line(draft, lines, cursor, metrics, true);
@@ -2680,7 +2898,7 @@ impl RichTextLayout {
                 ruby_shift = 0.0;
                 placed_x = draft.x;
             }
-            if width > metrics.width - placed_x {
+            if width > metrics.avail_width - placed_x {
                 self.place_split_text(
                     text,
                     style,
@@ -2787,7 +3005,7 @@ impl RichTextLayout {
             let piece = ch.encode_utf8(&mut buffer);
             let (width, base_width, _, _, rise) =
                 self.measure_piece(piece, style, None, metrics.font_scale, piece_scale);
-            if draft.has_content() && draft.x + gap + width > metrics.width {
+            if draft.has_content() && draft.x + gap + width > metrics.avail_width {
                 finish_line(draft, lines, cursor, metrics, true);
                 gap = 0.0;
             }
@@ -2847,7 +3065,8 @@ impl RichTextLayout {
             width += 0.7 * font_scale * scale_multiplier;
         }
         if style.pill.is_some() {
-            width = (width + 10.0 * font_scale).max(16.0 * font_scale);
+            let pad = if text.chars().count() <= 2 { 6.5 } else { 9.0 };
+            width = (width + pad * font_scale).max(13.5 * font_scale);
         }
         let ruby_scale = CARD_TEXT_SCALE * font_scale * CARD_RUBY_SCALE * scale_multiplier;
         let ruby_width = ruby
@@ -2900,15 +3119,18 @@ fn finish_line(
         height,
         ruby_height: draft.ruby_height,
         upper: draft.upper,
-        width: draft.x.max(metrics.content_left),
+        width: draft.x.max(metrics.marker_offset),
+        avail_width: metrics.avail_width,
         pitch_height: draft.pitch_height,
         marker: draft.marker.take(),
         pieces: std::mem::take(&mut draft.pieces),
         rule: false,
         indent: metrics.indent,
+        align: metrics.align,
+        bounds: metrics.bounds,
     });
     *cursor += height;
-    draft.x = metrics.content_left;
+    draft.x = metrics.marker_offset;
     draft.ruby_height = 0.0;
     draft.upper = 0.0;
     draft.lower = 0.0;
@@ -3014,6 +3236,21 @@ fn is_small_kana(ch: char) -> bool {
             | 'ョ'
             | 'ヮ'
     )
+}
+
+fn resolve_block_align(content: &[Inline], default_align: TextAlign) -> TextAlign {
+    for inline in content {
+        let align = match inline {
+            Inline::Text { style, .. }
+            | Inline::Ruby { style, .. }
+            | Inline::PitchWord { style, .. } => style.align,
+            _ => TextAlign::Auto,
+        };
+        if align != TextAlign::Auto {
+            return align;
+        }
+    }
+    default_align
 }
 
 fn block_text(content: &[Inline]) -> String {
@@ -3150,6 +3387,43 @@ fn resolve_image_path<'a>(images: &'a [String], src: &str) -> Option<&'a str> {
     None
 }
 
+fn draw_image_placeholder(x: f32, y: f32, width: f32, height: f32, downloading: bool) {
+    Ui::draw_rounded_rect(x, y, width, height, 6.0, theme().surface_alt);
+    let label = if downloading {
+        tr("Downloading image...")
+    } else {
+        tr("Loading image...")
+    };
+    Ui::fit_text(
+        x + width / 2.0,
+        y + height / 2.0 - 6.0,
+        0.38,
+        (width - 12.0).max(20.0),
+        theme().text_muted,
+        label,
+    );
+}
+
+fn place_pending_image(
+    indent: f32,
+    avail_width: f32,
+    downloading: bool,
+    pending: &mut Vec<PendingImage>,
+    cursor: &mut f32,
+) {
+    let width = 180.0_f32.min(avail_width);
+    let height = 44.0;
+    let x = indent + (avail_width - width).max(0.0) / 2.0;
+    pending.push(PendingImage {
+        top: *cursor,
+        x,
+        width,
+        height,
+        downloading,
+    });
+    *cursor += height;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_resolved_image(
     path: &str,
@@ -3158,8 +3432,10 @@ fn place_resolved_image(
     max_w: Option<f32>,
     max_h: Option<f32>,
     out: &mut Vec<CardImage>,
+    pending: &mut Vec<PendingImage>,
     cursor: &mut f32,
     busy: &mut bool,
+    media_syncing: bool,
 ) {
     let (texture, image_w, image_h) = match Ui::media_image(path) {
         ImageLoad::Ready(texture, image_w, image_h) => (texture, image_w, image_h),
@@ -3169,10 +3445,14 @@ fn place_resolved_image(
                 &format!("image|{path}|{diag}"),
                 &format!("IMAGE load fail file={} {diag}", image_name(path)),
             );
+            if media_syncing || diag == "missing" {
+                place_pending_image(indent, avail_width, media_syncing, pending, cursor);
+            }
             return;
         }
         ImageLoad::Busy => {
             *busy = true;
+            place_pending_image(indent, avail_width, false, pending, cursor);
             return;
         }
     };
@@ -3332,24 +3612,11 @@ fn is_animated_image(path: &str) -> bool {
     matches!(ext.as_str(), "gif" | "webp")
 }
 
-/// Resolve a media filename to an open animation slot, trying the sharded
-/// media path first and the flat path second.
-fn resolve_anim_path(path: &str) -> Option<(i32, i32, i32, i32)> {
+fn resolve_anim_disk_path(path: &str) -> Option<String> {
     let name = path
         .rsplit(|ch| ch == '/' || ch == '\\')
         .next()
         .unwrap_or(path);
-    let sharded =
-        anki::media::files::sharded_path(std::path::Path::new(super::backend::MEDIA_DIR), name)
-            .to_string_lossy()
-            .into_owned();
-    if let Some(opened) = Ui::anim_open(&sharded) {
-        return Some(opened);
-    }
-    let root = format!("{}/{name}", super::backend::MEDIA_DIR);
-    if root != sharded {
-        Ui::anim_open(&root)
-    } else {
-        None
-    }
+    anki::media::files::locate_existing(std::path::Path::new(super::backend::MEDIA_DIR), name)
+        .map(|found| found.to_string_lossy().into_owned())
 }

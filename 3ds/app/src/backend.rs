@@ -363,18 +363,33 @@ impl Backend {
                             &mut client,
                         ))?;
                     if let (Some(endpoint), Some(auth)) = (state.new_endpoint, auth.as_mut()) {
-                        auth.endpoint = Some(ammonia::Url::parse(&endpoint)?);
+                        let parsed = ammonia::Url::parse(&endpoint)?;
+                        anki_3ds_sync_transport::validate_endpoint_change(
+                            &client.endpoint,
+                            &parsed,
+                        )?;
+                        auth.endpoint = Some(parsed);
                     }
                     Ok(Outcome::LoggedIn)
                 })();
                 return (Some(self), result);
             }
             Mode::Normal => {
+                let base_endpoint = client.endpoint.clone();
                 let output = block_on(self.collection.normal_sync_with_client(client));
                 let result = output
                     .map(|o| {
                         if let (Some(endpoint), Some(auth)) = (o.new_endpoint, auth.as_mut()) {
-                            auth.endpoint = ammonia::Url::parse(&endpoint).ok();
+                            if let Ok(parsed) = ammonia::Url::parse(&endpoint) {
+                                if anki_3ds_sync_transport::validate_endpoint_change(
+                                    &base_endpoint,
+                                    &parsed,
+                                )
+                                .is_ok()
+                                {
+                                    auth.endpoint = Some(parsed);
+                                }
+                            }
                         }
                         match o.required {
                             anki::sync::collection::normal::SyncActionRequired::FullSyncRequired {
@@ -443,6 +458,32 @@ impl Backend {
 
     pub fn media_exists(&self, filename: &str) -> bool {
         self.media_index.contains(filename)
+    }
+
+    pub fn mark_media_present(&self, filename: &str) {
+        if self.media_index.contains(filename) {
+            return;
+        }
+        let media_dir = std::path::Path::new(MEDIA_DIR);
+        let unmigrated = anki::media::files::locate_existing(media_dir, filename)
+            .is_some_and(|path| path.parent() == Some(media_dir));
+        self.media_index.insert(filename, unmigrated);
+    }
+
+    pub fn sync_media_presence(&self, card: &OfferedCard) -> bool {
+        let media_dir = std::path::Path::new(MEDIA_DIR);
+        let mut discovered = false;
+        for item in card.question_media.iter().chain(card.answer_media.iter()) {
+            if !self.media_index.contains(&item.filename) {
+                if let Some(existing) = anki::media::files::locate_existing(media_dir, &item.filename)
+                {
+                    let unmigrated = existing.parent() == Some(media_dir);
+                    self.media_index.insert(&item.filename, unmigrated);
+                    discovered = true;
+                }
+            }
+        }
+        discovered
     }
 
     pub fn media_index_handle(&self) -> std::sync::Arc<anki::media::files::MediaNameIndex> {

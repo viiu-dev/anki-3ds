@@ -2,17 +2,21 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::FileTimes;
 use std::io;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time;
 
 use anki_io::create_dir;
@@ -191,62 +195,68 @@ const MEDIA_INDEX_VERSION: &str = "1";
 const MEDIA_INDEX_SHARDED: char = 's';
 const MEDIA_INDEX_UNMIGRATED: char = 'u';
 
-/// Load a previously saved media index without touching the media folder.
-/// Returns None when the cache is missing or invalid.
 pub fn load_media_name_index(folder: &Path) -> Option<Arc<MediaNameIndex>> {
-    let data = String::from_utf8(std::fs::read(media_index_cache_path(folder)).ok()?).ok()?;
-    let mut lines = data.lines();
-    if lines.next() != Some(MEDIA_INDEX_VERSION) {
+    let file = fs::File::open(media_index_cache_path(folder)).ok()?;
+    let mut reader = BufReader::with_capacity(8 * 1024, file);
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    if line.trim_end_matches(['\r', '\n']) != MEDIA_INDEX_VERSION {
         return None;
     }
     let index = MediaNameIndex::new();
     {
         let mut inner = index
             .inner
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for line in lines {
-            let Some((flag, name)) = line.split_once('\t') else {
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).ok()?;
+            if read == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            let Some((flag, name)) = trimmed.split_once('\t') else {
                 continue;
             };
             if name.is_empty() {
                 continue;
             }
-            inner.files.insert(name.to_owned());
-            if flag.starts_with(MEDIA_INDEX_UNMIGRATED) {
-                inner.unmigrated.insert(name.to_owned());
-            }
+            inner.files.insert(
+                name.into(),
+                flag.starts_with(MEDIA_INDEX_UNMIGRATED),
+            );
         }
     }
     Some(index)
 }
 
-/// Persist the media index to a single compact newline-delimited file.
 pub fn save_media_name_index(index: &MediaNameIndex, folder: &Path) -> Result<()> {
-    let data = {
-        let inner = index
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut text = String::with_capacity(inner.files.len() * 48 + 4);
-        text.push_str(MEDIA_INDEX_VERSION);
-        text.push('\n');
-        for name in &inner.files {
-            let flag = if inner.unmigrated.contains(name) {
-                MEDIA_INDEX_UNMIGRATED
-            } else {
-                MEDIA_INDEX_SHARDED
-            };
-            text.push(flag);
-            text.push('\t');
-            text.push_str(name);
-            text.push('\n');
-        }
-        text
-    };
     let cache_path = media_index_cache_path(folder);
     let temp_path = cache_path.with_extension("idx.tmp");
-    fs::write(&temp_path, data.as_bytes())?;
+    {
+        let file = fs::File::create(&temp_path)?;
+        let mut writer = BufWriter::with_capacity(16 * 1024, file);
+        let inner = index
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        writer.write_all(MEDIA_INDEX_VERSION.as_bytes())?;
+        writer.write_all(b"\n")?;
+        for (name, unmigrated) in &inner.files {
+            let flag = if *unmigrated {
+                MEDIA_INDEX_UNMIGRATED as u8
+            } else {
+                MEDIA_INDEX_SHARDED as u8
+            };
+            writer.write_all(&[flag, b'\t'])?;
+            writer.write_all(name.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
+    }
     let _ = fs::remove_file(&cache_path);
     fs::rename(&temp_path, &cache_path)?;
     Ok(())
@@ -254,16 +264,12 @@ pub fn save_media_name_index(index: &MediaNameIndex, folder: &Path) -> Result<()
 
 #[derive(Default)]
 struct MediaNameIndexInner {
-    files: HashSet<String>,
-    unmigrated: HashSet<String>,
+    files: HashMap<Box<str>, bool>,
 }
 
-/// Concurrent set of media filenames present on disk, shared between the
-/// background sync worker and the UI thread. The worker pushes additions,
-/// removals and migration updates; readers only do in-memory lookups.
 #[derive(Default)]
 pub struct MediaNameIndex {
-    inner: Mutex<MediaNameIndexInner>,
+    inner: RwLock<MediaNameIndexInner>,
 }
 
 impl MediaNameIndex {
@@ -274,52 +280,54 @@ impl MediaNameIndex {
     pub fn insert(&self, fname: &str, unmigrated: bool) {
         let mut inner = self
             .inner
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.files.insert(fname.to_owned());
-        if unmigrated {
-            inner.unmigrated.insert(fname.to_owned());
+        if let Some(flag) = inner.files.get_mut(fname) {
+            *flag = unmigrated;
         } else {
-            inner.unmigrated.remove(fname);
+            inner.files.insert(fname.into(), unmigrated);
         }
     }
 
     pub fn remove(&self, fname: &str) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.files.remove(fname);
-        inner.unmigrated.remove(fname);
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .files
+            .remove(fname);
     }
 
     pub fn mark_migrated(&self, fname: &str) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unmigrated
-            .remove(fname);
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(flag) = inner.files.get_mut(fname) {
+            *flag = false;
+        }
     }
 
     pub fn contains(&self, fname: &str) -> bool {
         self.inner
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .files
-            .contains(fname)
+            .contains_key(fname)
     }
 
     pub fn is_unmigrated(&self, fname: &str) -> bool {
         self.inner
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unmigrated
-            .contains(fname)
+            .files
+            .get(fname)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn len(&self) -> usize {
         self.inner
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .files
             .len()

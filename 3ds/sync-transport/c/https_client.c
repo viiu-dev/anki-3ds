@@ -39,13 +39,41 @@ static CURL *g_easy[HTTPS_SLOT_COUNT];
 static CURLM *g_multi[HTTPS_SLOT_COUNT];
 
 typedef struct {
-    char host[128];
+    char host[256];
     char ip[16];
     uint64_t expires;
 } DnsCacheEntry;
 
 static DnsCacheEntry g_dns_cache[HTTPS_SLOT_COUNT][2];
 static int g_dns_cache_next[HTTPS_SLOT_COUNT];
+
+static void secure_zero(void *ptr, size_t len) {
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len--) *p++ = 0;
+}
+
+static bool has_ctl_or_space(const char *s, bool allow_space) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) return true;
+        if (!allow_space && *p == ' ') return true;
+    }
+    return false;
+}
+
+int anki_3ds_wifi_connected(void) {
+    u32 status = 0;
+    if (R_FAILED(acInit())) {
+        return osGetWifiStrength() != 0 ? 1 : 0;
+    }
+    Result result = ACU_GetStatus(&status);
+    acExit();
+    return (R_SUCCEEDED(result) && status == 3) ? 1 : 0;
+}
+
+int anki_3ds_random_bytes(uint8_t *out, size_t len) {
+    if (!out || len == 0) return -1;
+    return R_SUCCEEDED(PS_GenerateRandomBytes(out, len)) ? 0 : -1;
+}
 
 static size_t header_cb(char *data, size_t size, size_t count, void *context) {
     if (size && count > SIZE_MAX / size) return 0;
@@ -72,17 +100,25 @@ static size_t header_cb(char *data, size_t size, size_t count, void *context) {
     if (bytes > 15 && !strncasecmp(data, "Content-Length:", 15)) {
         size_t i = 15;
         while (i < bytes && (data[i] == ' ' || data[i] == '\t')) i++;
+        size_t digits = 0;
         uint64_t length = 0;
+        bool overflow = false;
         while (i < bytes && data[i] >= '0' && data[i] <= '9') {
-            length = length * 10 + (uint64_t)(data[i] - '0');
-            if (length > (uint64_t)SIZE_MAX) {
-                length = (uint64_t)SIZE_MAX;
-                break;
+            uint64_t digit = (uint64_t)(data[i] - '0');
+            if (length > (UINT64_MAX - digit) / 10) {
+                overflow = true;
+            } else {
+                length = length * 10 + digit;
             }
+            digits++;
             i++;
         }
-        buf->content_length = (curl_off_t)(length > (uint64_t)INT64_MAX
-            ? INT64_MAX : length);
+        while (i < bytes && (data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n')) i++;
+        if (digits > 0 && i == bytes && !overflow && length <= (uint64_t)INT64_MAX) {
+            buf->content_length = (curl_off_t)length;
+        } else {
+            buf->content_length = -1;
+        }
     }
     return bytes;
 }
@@ -134,14 +170,14 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 static int xfer_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
-    (void)dltotal; (void)ultotal;
     struct ResponseBuffer *buf = (struct ResponseBuffer *)clientp;
     if (!buf || !buf->options) return 0;
     uint32_t heap = (uint32_t)mallinfo().uordblks;
     if (heap > buf->sampled_heap_peak) buf->sampled_heap_peak = heap;
     if (buf->options->cancelled && buf->options->cancelled(buf->options->context)) return 1;
-    if (buf->options->progress && buf->options->progress(buf->options->context,
-        (uint64_t)(dlnow + ulnow), (uint64_t)(dltotal + ultotal))) return 1;
+    uint64_t done = (dlnow > 0 ? (uint64_t)dlnow : 0) + (ulnow > 0 ? (uint64_t)ulnow : 0);
+    uint64_t total = (dltotal > 0 ? (uint64_t)dltotal : 0) + (ultotal > 0 ? (uint64_t)ultotal : 0);
+    if (buf->options->progress && buf->options->progress(buf->options->context, done, total)) return 1;
     if (dlnow != buf->last_download || ulnow != buf->last_upload) {
         buf->last_download = dlnow;
         buf->last_upload = ulnow;
@@ -197,6 +233,10 @@ static const char *dns_cache_lookup(int slot, const char *host) {
 }
 
 static void dns_cache_store(int slot, const char *host, const char *ip) {
+    if (strlen(host) >= sizeof(g_dns_cache[0][0].host)
+        || strlen(ip) >= sizeof(g_dns_cache[0][0].ip)) {
+        return;
+    }
     DnsCacheEntry *entry = &g_dns_cache[slot][g_dns_cache_next[slot]];
     g_dns_cache_next[slot] = (g_dns_cache_next[slot] + 1) % 2;
     snprintf(entry->host, sizeof(entry->host), "%s", host);
@@ -217,10 +257,12 @@ void anki_3ds_https_cleanup(void) {
 
 static int request_with_ip(
     int slot,
+    bool is_get,
     const char *host,
     const char *ip,
     const char *path,
     const char *header_anki_sync,
+    const char *accept_header,
     const uint8_t *body,
     size_t body_len,
     uint32_t timeout_ms,
@@ -228,6 +270,22 @@ static int request_with_ip(
     const Anki3dsRequestOptions *options,
     Anki3dsHttpResponse *out_resp
 ) {
+    if (!host[0] || !path[0] || path[0] != '/' || options->port == 0 || options->port > 65535
+        || !options->ca_file || !options->ca_file[0]
+        || has_ctl_or_space(host, false) || has_ctl_or_space(path, false)
+        || strchr(host, '@') || strchr(host, '/') || strchr(host, ':')) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "invalid request target");
+        return -1;
+    }
+    if (header_anki_sync && has_ctl_or_space(header_anki_sync, true)) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "invalid sync header");
+        return -1;
+    }
+    if (accept_header && has_ctl_or_space(accept_header, true)) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "invalid accept header");
+        return -1;
+    }
+
     if (!g_easy[slot]) {
         g_easy[slot] = curl_easy_init();
         if (!g_easy[slot]) {
@@ -240,17 +298,68 @@ static int request_with_ip(
     CURL *easy = g_easy[slot];
 
     char url[512];
-    snprintf(url, sizeof(url), "https://%s:%u%s", host, (unsigned)options->port, path);
+    int url_len = snprintf(url, sizeof(url), "https://%s:%u%s", host, (unsigned)options->port, path);
+    if (url_len < 0 || (size_t)url_len >= sizeof(url)) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "request URL too long");
+        return -1;
+    }
 
-    char mapping[256];
-    snprintf(mapping, sizeof(mapping), "%s:%u:%s", host, (unsigned)options->port, ip);
+    char mapping[300];
+    int map_len = snprintf(mapping, sizeof(mapping), "%s:%u:%s", host, (unsigned)options->port, ip);
+    if (map_len < 0 || (size_t)map_len >= sizeof(mapping)) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "DNS resolve mapping too long");
+        return -1;
+    }
 
     struct curl_slist *resolve = curl_slist_append(NULL, mapping);
-    struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/octet-stream");
-    if (header_anki_sync && header_anki_sync[0]) {
-        char sync_hdr_line[512];
-        snprintf(sync_hdr_line, sizeof(sync_hdr_line), "anki-sync: %s", header_anki_sync);
-        headers = curl_slist_append(headers, sync_hdr_line);
+    if (!resolve) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
+        return -4;
+    }
+    struct curl_slist *headers = NULL;
+    if (is_get) {
+        if (accept_header && accept_header[0]) {
+            char accept_line[256];
+            int alen = snprintf(accept_line, sizeof(accept_line), "Accept: %s", accept_header);
+            if (alen < 0 || (size_t)alen >= sizeof(accept_line)) {
+                curl_slist_free_all(resolve);
+                snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "accept header too long");
+                return -1;
+            }
+            headers = curl_slist_append(NULL, accept_line);
+            if (!headers) {
+                curl_slist_free_all(resolve);
+                snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
+                return -4;
+            }
+        }
+    } else {
+        headers = curl_slist_append(NULL, "Content-Type: application/octet-stream");
+        if (!headers) {
+            curl_slist_free_all(resolve);
+            snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
+            return -4;
+        }
+    }
+    if (!is_get && header_anki_sync && header_anki_sync[0]) {
+        char sync_hdr_line[1024];
+        int hdr_len = snprintf(sync_hdr_line, sizeof(sync_hdr_line), "anki-sync: %s", header_anki_sync);
+        if (hdr_len < 0 || (size_t)hdr_len >= sizeof(sync_hdr_line)) {
+            secure_zero(sync_hdr_line, sizeof(sync_hdr_line));
+            curl_slist_free_all(headers);
+            curl_slist_free_all(resolve);
+            snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "sync header too long");
+            return -1;
+        }
+        struct curl_slist *next_headers = curl_slist_append(headers, sync_hdr_line);
+        secure_zero(sync_hdr_line, sizeof(sync_hdr_line));
+        if (!next_headers) {
+            curl_slist_free_all(headers);
+            curl_slist_free_all(resolve);
+            snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
+            return -4;
+        }
+        headers = next_headers;
     }
 
     struct ResponseBuffer rx_buf = {0};
@@ -268,14 +377,18 @@ static int request_with_ip(
             curl_slist_free_all(resolve);
             return -4;
         }
-        if (fseek(upload, 0, SEEK_END) || ftell(upload) < 0) {
+        long upload_size = -1;
+        if (fseek(upload, 0, SEEK_END) == 0) {
+            upload_size = ftell(upload);
+        }
+        if (upload_size < 0) {
             fclose(upload);
             curl_slist_free_all(headers);
             curl_slist_free_all(resolve);
             snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "cannot determine upload size");
             return -4;
         }
-        body_len = (size_t)ftell(upload);
+        body_len = (size_t)upload_size;
         if (body_len > options->max_file_bytes) {
             fclose(upload);
             curl_slist_free_all(headers);
@@ -295,19 +408,28 @@ static int request_with_ip(
         }
     }
 
-    curl_easy_setopt(easy, CURLOPT_URL, url);
+    if (curl_easy_setopt(easy, CURLOPT_URL, url) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_PROTOCOLS_STR, "https") != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS_STR, "https") != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_UNRESTRICTED_AUTH, 0L) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_CAINFO, options->ca_file) != CURLE_OK) {
+        if (upload) fclose(upload);
+        if (rx_buf.file) fclose(rx_buf.file);
+        curl_slist_free_all(headers);
+        curl_slist_free_all(resolve);
+        slot_teardown(slot);
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "TLS configuration failed");
+        return -3;
+    }
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, header_cb);
     curl_easy_setopt(easy, CURLOPT_HEADERDATA, &rx_buf);
     curl_easy_setopt(easy, CURLOPT_RESOLVE, resolve);
-    curl_easy_setopt(easy, CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(easy, CURLOPT_REDIR_PROTOCOLS_STR, "https");
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
-    curl_easy_setopt(easy, CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
-    curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(easy, CURLOPT_SSL_SESSIONID_CACHE, 1L);
-    curl_easy_setopt(easy, CURLOPT_CAINFO, options->ca_file);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, (long)connect_timeout_ms);
     curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, 0L);
     curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
@@ -329,7 +451,9 @@ static int request_with_ip(
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(easy, CURLOPT_USERAGENT, "Anki3DS/1.1");
 
-    if (upload) {
+    if (is_get) {
+        curl_easy_setopt(easy, CURLOPT_HTTPGET, 1L);
+    } else if (upload) {
         curl_easy_setopt(easy, CURLOPT_POST, 1L);
         curl_easy_setopt(easy, CURLOPT_READDATA, upload);
         curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
@@ -407,7 +531,10 @@ static int request_with_ip(
     char *redirect_url = NULL;
     curl_easy_getinfo(easy, CURLINFO_REDIRECT_URL, &redirect_url);
     if (redirect_url) {
-        snprintf(out_resp->redirect_url, sizeof(out_resp->redirect_url), "%s", redirect_url);
+        int rlen = snprintf(out_resp->redirect_url, sizeof(out_resp->redirect_url), "%s", redirect_url);
+        if (rlen < 0 || (size_t)rlen >= sizeof(out_resp->redirect_url)) {
+            out_resp->redirect_url[0] = '\0';
+        }
     }
 
     if (code != CURLE_OK) {
@@ -439,11 +566,13 @@ static int request_with_ip(
     return (code == CURLE_OK) ? 0 : (int)code;
 }
 
-int anki_3ds_https_post(
+static int https_request_internal(
     int slot,
+    bool is_get,
     const char *host,
     const char *path,
     const char *header_anki_sync,
+    const char *accept_header,
     const uint8_t *body,
     size_t body_len,
     uint32_t timeout_ms,
@@ -457,7 +586,10 @@ int anki_3ds_https_post(
         snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "missing request options");
         return -1;
     }
-    if (slot < 0 || slot >= HTTPS_SLOT_COUNT) slot = 0;
+    if (slot < 0 || slot >= HTTPS_SLOT_COUNT) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "invalid transport slot");
+        return -1;
+    }
     if (options->cancelled && options->cancelled(options->context)) {
         snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "sync cancelled");
         return CURLE_ABORTED_BY_CALLBACK;
@@ -467,6 +599,10 @@ int anki_3ds_https_post(
 #ifdef ANKI_3DS_EMULATOR
     allow_override = true;
 #endif
+    if (!allow_override && !anki_3ds_wifi_connected()) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "Wi-Fi is disabled or disconnected");
+        return -5;
+    }
     uint64_t started = osGetTime();
     char ip[16] = {0};
     const char *cached = dns_cache_lookup(slot, host);
@@ -487,10 +623,10 @@ int anki_3ds_https_post(
 
     int result = 0;
     const uint32_t backoff_ms[] = {0, 250, 750, 1500};
-    for (int attempt = 0; attempt < 4; attempt++) {
+    int max_attempts = is_get ? 2 : 4;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
         if (attempt > 0) {
             if (options->upload_file == NULL && options->download_file != NULL) {
-                /* truncate partial download file */
                 FILE *f = fopen(options->download_file, "wb"); if (f) fclose(f);
             }
             if (options->write_body) {
@@ -510,15 +646,49 @@ int anki_3ds_https_post(
             }
             char dns_error[160] = {0};
             if (probe_dns_with_context(host, ip, dns_error, dns_cancel, (void *)options, allow_override) != 0)
-                continue;   /* keep last result, try again */
+                continue;
             dns_cache_store(slot, host, ip);
         }
-        result = request_with_ip(slot, host, ip, path, header_anki_sync, body, body_len,
-                                 timeout_ms, connect_timeout_ms, options, out_resp);
+        result = request_with_ip(slot, is_get, host, ip, path, header_anki_sync, accept_header,
+                                 body, body_len, timeout_ms, connect_timeout_ms, options, out_resp);
         if (result == 0 || !is_transient(result) || out_resp->http_status != 0) break;
     }
     out_resp->total_ms = osGetTime() - started;
     return result;
+}
+
+int anki_3ds_https_post(
+    int slot,
+    const char *host,
+    const char *path,
+    const char *header_anki_sync,
+    const uint8_t *body,
+    size_t body_len,
+    uint32_t timeout_ms,
+    uint32_t connect_timeout_ms,
+    const Anki3dsRequestOptions *options,
+    Anki3dsHttpResponse *out_resp
+) {
+    return https_request_internal(
+        slot, false, host, path, header_anki_sync, NULL, body, body_len,
+        timeout_ms, connect_timeout_ms, options, out_resp
+    );
+}
+
+int anki_3ds_https_get(
+    int slot,
+    const char *host,
+    const char *path,
+    const char *accept_header,
+    uint32_t timeout_ms,
+    uint32_t connect_timeout_ms,
+    const Anki3dsRequestOptions *options,
+    Anki3dsHttpResponse *out_resp
+) {
+    return https_request_internal(
+        slot, true, host, path, NULL, accept_header, NULL, 0,
+        timeout_ms, connect_timeout_ms, options, out_resp
+    );
 }
 
 void anki_3ds_http_response_free(Anki3dsHttpResponse *resp) {

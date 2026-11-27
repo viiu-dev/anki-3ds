@@ -31,7 +31,23 @@ pub(crate) fn extract_into_media_folder(
     zip: Vec<u8>,
     cancelled: &mut impl FnMut() -> bool,
 ) -> error::Result<ExtractedDownload> {
-    let reader = io::Cursor::new(zip);
+    extract_into_media_folder_reader(media_folder, io::Cursor::new(zip), cancelled)
+}
+
+pub(crate) fn extract_file_into_media_folder(
+    media_folder: &Path,
+    zip_path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> error::Result<ExtractedDownload> {
+    let file = std::fs::File::open(zip_path)?;
+    extract_into_media_folder_reader(media_folder, io::BufReader::with_capacity(16 * 1024, file), cancelled)
+}
+
+fn extract_into_media_folder_reader<R: io::Read + io::Seek>(
+    media_folder: &Path,
+    reader: R,
+    cancelled: &mut impl FnMut() -> bool,
+) -> error::Result<ExtractedDownload> {
     let mut zip = zip::ZipArchive::new(reader)?;
 
     let meta_file = zip.by_name("_meta")?;

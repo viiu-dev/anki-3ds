@@ -101,6 +101,8 @@ float ui_draw_status_compact(float x_right, float y, float scale, int sync_state
                              const uint8_t* items, int count);
 void ui_draw_sync_icon(float x, float y, float size, int state);
 void ui_draw_wifi_icon(float x, float y, float size, bool connected);
+bool ui_wifi_connected(void);
+bool ui_wifi_connected_now(void);
 void ui_set_battery_linear(bool linear);
 // Minimal scroll thumb for full-screen content.
 void ui_draw_scroll_indicator(float x, float y, float w, float h, float scroll, float max_scroll);

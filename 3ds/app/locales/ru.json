@@ -379,5 +379,16 @@
     "UI Sound Effects": "Звуковые эффекты",
     "UI Sound Effects: {0}": "Звуковые эффекты: {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "Мягкие звуки при ответе, оценке карт и завершении колоды.",
-    "Sound effects volume": "Громкость эффектов"
+    "Sound effects volume": "Громкость эффектов",
+    "Downloading image...": "Загрузка изображения...",
+    "Loading image...": "Загрузка изображения...",
+    "Wi-Fi disabled": "Wi-Fi выключен",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi выключен или нет подключения. Включите беспроводную связь и подключитесь к сети для синхронизации.",
+    "Check for updates: {0}": "Проверка обновлений: {0}",
+    "Check now": "Проверить обновления",
+    "Checking for updates...": "Проверка обновлений...",
+    "Update available: {0}": "Доступно обновление: {0}",
+    "Up to date (v{0})": "Актуальная версия (v{0})",
+    "Update check failed: {0}": "Ошибка проверки: {0}",
+    "[Y] Dismiss": "[Y] Скрыть"
 }

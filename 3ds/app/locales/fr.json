@@ -379,5 +379,16 @@
     "UI Sound Effects": "Effets sonores",
     "UI Sound Effects: {0}": "Effets sonores : {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "Sons discrets pour les réponses, notes et fins de paquet.",
-    "Sound effects volume": "Volume des effets"
+    "Sound effects volume": "Volume des effets",
+    "Downloading image...": "Téléchargement de l'image...",
+    "Loading image...": "Chargement de l'image...",
+    "Wi-Fi disabled": "Wi-Fi désactivé",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Le Wi-Fi est désactivé ou déconnecté. Activez la communication sans fil et connectez-vous à un réseau pour synchroniser.",
+    "Check for updates: {0}": "Vérifier les mises à jour : {0}",
+    "Check now": "Vérifier maintenant",
+    "Checking for updates...": "Vérification des mises à jour...",
+    "Update available: {0}": "Mise à jour disponible : {0}",
+    "Up to date (v{0})": "À jour (v{0})",
+    "Update check failed: {0}": "Échec de vérification : {0}",
+    "[Y] Dismiss": "[Y] Fermer"
 }

@@ -73,7 +73,7 @@ impl MediaSync {
         let thread_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("media-sync".into())
-            .stack_size(1024 * 1024)
+            .stack_size(384 * 1024)
             .spawn(move || {
                 let config = move || MediaSyncConfig {
                     max_connections: connections,
@@ -342,7 +342,12 @@ fn run_with_resume(
         match block_on(mgr.sync_media_with_config(handler, client.clone(), None, config())) {
             Ok(()) => return Ok(()),
             Err(e) if is_interrupted(&e) => return Err(e),
-            Err(e) if is_network(&e) && attempts < 5 && !cancel.load(Ordering::Acquire) => {
+            Err(e)
+                if is_network(&e)
+                    && attempts < 5
+                    && !cancel.load(Ordering::Acquire)
+                    && super::clock::connected_now() =>
+            {
                 attempts += 1;
                 super::event(&format!(
                     "MEDIA_SYNC_RETRY attempt={attempts} {}",

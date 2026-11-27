@@ -379,5 +379,16 @@
     "UI Sound Effects": "UI Sound Effects",
     "UI Sound Effects: {0}": "UI Sound Effects: {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "Subtle chimes for reveal, ratings, and deck completion.",
-    "Sound effects volume": "Sound effects volume"
+    "Sound effects volume": "Sound effects volume",
+    "Downloading image...": "Downloading image...",
+    "Loading image...": "Loading image...",
+    "Wi-Fi disabled": "Wi-Fi disabled",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.",
+    "Check for updates: {0}": "Check for updates: {0}",
+    "Check now": "Check for updates now",
+    "Checking for updates...": "Checking for updates...",
+    "Update available: {0}": "Update available: {0}",
+    "Up to date (v{0})": "Up to date (v{0})",
+    "Update check failed: {0}": "Update check failed: {0}",
+    "[Y] Dismiss": "[Y] Dismiss"
 }
