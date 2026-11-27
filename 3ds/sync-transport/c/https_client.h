@@ -65,10 +65,13 @@ int anki_3ds_https_post(
 
 void anki_3ds_http_response_free(Anki3dsHttpResponse *resp);
 
-// Must be called once before any concurrent requests are issued.
 int anki_3ds_https_global_init(void);
 
 void anki_3ds_https_cleanup(void);
+
+int anki_3ds_wifi_connected(void);
+
+int anki_3ds_random_bytes(uint8_t *out, size_t len);
 
 #ifdef __cplusplus
 }

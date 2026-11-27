@@ -85,6 +85,9 @@ pub(crate) fn log_media_once(key: &str, text: &str) {
     let mut guard = logged
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.len() >= 128 && !guard.contains(key) {
+        return;
+    }
     if guard.insert(key.to_owned()) {
         event(text);
     }
@@ -799,37 +802,60 @@ fn prefetch_for_card(backend: &Backend, card: &backend::OfferedCard) -> Vec<Pref
     files
 }
 
+struct PrefetchQueue {
+    generation: u32,
+    files: Vec<PrefetchFile>,
+    pending: bool,
+    shutdown: bool,
+}
+
 #[derive(Default)]
 struct Prefetch {
     thread: Option<std::thread::JoinHandle<()>>,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: Option<std::sync::Arc<(std::sync::Mutex<PrefetchQueue>, std::sync::Condvar)>>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Prefetch {
-    fn stop(&mut self) {
-        if let Some(handle) = self.thread.take() {
-            self.cancel
-                .store(true, std::sync::atomic::Ordering::Release);
-            let _ = handle.join();
+    fn ensure_worker(&mut self) {
+        if self.thread.is_some() {
+            return;
         }
-    }
-
-    fn request(&mut self, files: Vec<PrefetchFile>) {
-        if let Some(handle) = self.thread.take() {
-            self.cancel
-                .store(true, std::sync::atomic::Ordering::Release);
-            let _ = handle.join();
-        }
-        self.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel = self.cancel.clone();
-        self.thread = std::thread::Builder::new()
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(PrefetchQueue {
+                generation: 0,
+                files: Vec::new(),
+                pending: false,
+                shutdown: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let worker_state = shared.clone();
+        let worker_gen = self.generation.clone();
+        let handle = std::thread::Builder::new()
             .name("prefetch".into())
-            .stack_size(1024 * 1024)
-            .spawn(move || {
+            .stack_size(256 * 1024)
+            .spawn(move || loop {
+                let (gen_id, files) = {
+                    let (lock, cv) = &*worker_state;
+                    let mut guard = lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !guard.pending && !guard.shutdown {
+                        guard = cv
+                            .wait(guard)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    if guard.shutdown {
+                        break;
+                    }
+                    guard.pending = false;
+                    (guard.generation, std::mem::take(&mut guard.files))
+                };
                 Ui::media_prefetch_clear();
                 Ui::audio_prefetch_clear();
                 for file in files {
-                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    if worker_gen.load(std::sync::atomic::Ordering::Acquire) != gen_id {
                         break;
                     }
                     match file {
@@ -843,6 +869,52 @@ impl Prefetch {
                 }
             })
             .ok();
+        if handle.is_some() {
+            self.state = Some(shared);
+            self.thread = handle;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(shared) = self.state.take() {
+            let (lock, cv) = &*shared;
+            let mut guard = lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.shutdown = true;
+            guard.files.clear();
+            cv.notify_one();
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+        Ui::media_prefetch_clear();
+        Ui::audio_prefetch_clear();
+    }
+
+    fn request(&mut self, files: Vec<PrefetchFile>) {
+        if files.is_empty() && self.thread.is_none() {
+            Ui::media_prefetch_clear();
+            Ui::audio_prefetch_clear();
+            return;
+        }
+        self.ensure_worker();
+        let next = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        if let Some(shared) = &self.state {
+            let (lock, cv) = &**shared;
+            let mut guard = lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.generation = next;
+            guard.files = files;
+            guard.pending = true;
+            cv.notify_one();
+        }
     }
 }
 
@@ -1442,11 +1514,29 @@ enum Action {
     Exit,
 }
 
+fn wifi_disabled_message() -> String {
+    tr("Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.").to_owned()
+}
+
 fn user_error(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(anki::error::AnkiError::NetworkError { source }) =
+        error.downcast_ref::<anki::error::AnkiError>()
+    {
+        if source.info.contains("Wi-Fi is disabled")
+            || (source.kind == anki::error::NetworkErrorKind::Offline && !clock::connected_now())
+        {
+            return wifi_disabled_message();
+        }
+    }
     if let Some(error) = error.downcast_ref::<anki::error::AnkiError>() {
         error.message(&anki::prelude::I18n::new(&[i18n::language()]))
     } else {
-        error_text(error)
+        let text = error_text(error);
+        if text.contains("Wi-Fi is disabled") || (!clock::connected_now() && text.contains("DNS failed")) {
+            wifi_disabled_message()
+        } else {
+            text
+        }
     }
 }
 
@@ -2548,7 +2638,11 @@ fn main() {
         if let Some(active) = &media_job {
             let changed = active.changed();
             let in_review = matches!(screen, Screen::Question { .. } | Screen::Answer { .. });
-            let interval = Duration::from_millis(if in_review { 1500 } else { 400 });
+            let interval = Duration::from_millis(if in_review && !card_media_pending {
+                1500
+            } else {
+                450
+            });
             if changed != last_media_changed && last_media_refresh.elapsed() >= interval {
                 last_media_changed = changed;
                 last_media_refresh = Instant::now();
@@ -3312,6 +3406,25 @@ fn main() {
                                     media_result =
                                         Some(i18n::format("failed: {0}", &[&tr("Not logged in")]));
                                     media_notice_until = Instant::now() + Duration::from_secs(3600);
+                                } else if !clock::connected_now() {
+                                    event("WIFI_DISABLED media_sync");
+                                    let old = std::mem::replace(&mut screen, Screen::Decks);
+                                    if let Screen::SettingsCategory {
+                                        category,
+                                        selected,
+                                        previous,
+                                    } = old
+                                    {
+                                        screen = Screen::Info {
+                                            title: tr("Wi-Fi disabled").into(),
+                                            text: wifi_disabled_message(),
+                                            previous: Box::new(Screen::SettingsCategory {
+                                                category,
+                                                selected,
+                                                previous,
+                                            }),
+                                        };
+                                    }
                                 } else {
                                     let priority = backend
                                         .as_mut()
@@ -3892,6 +4005,16 @@ fn main() {
                 action = Action::Clock;
             }
             if matches!(action, Action::Sync | Action::Login) || full_mode.is_some() {
+                if !clock::connected_now() {
+                    event("WIFI_DISABLED sync");
+                    let previous = std::mem::replace(&mut screen, Screen::Decks);
+                    screen = Screen::Info {
+                        title: tr("Wi-Fi disabled").into(),
+                        text: wifi_disabled_message(),
+                        previous: Box::new(previous),
+                    };
+                    return Ok(());
+                }
                 let offset = match clock::configure(
                     clock::needs_refresh(),
                     &apt,
@@ -4046,6 +4169,16 @@ fn main() {
                         .set_language(card)?;
                 }
                 Action::Clock => {
+                    if !clock::connected_now() {
+                        event("WIFI_DISABLED clock");
+                        let previous = std::mem::replace(&mut screen, Screen::Decks);
+                        screen = Screen::Info {
+                            title: tr("Wi-Fi disabled").into(),
+                            text: wifi_disabled_message(),
+                            previous: Box::new(previous),
+                        };
+                        return Ok(());
+                    }
                     if media_job
                         .as_ref()
                         .is_some_and(media_sync::MediaSync::is_running)
@@ -4314,6 +4447,9 @@ fn main() {
                     }
                     match Ui::audio_play(&resolved) {
                         AudioAttempt::Done(true) => {
+                            if let Some(active) = backend.as_ref() {
+                                active.mark_media_present(&filename);
+                            }
                             playing_audio = Some(filename.clone());
                             event(&format!(
                                 "AUDIO play index={chosen} ok=true file={filename}"
@@ -4966,6 +5102,9 @@ fn main() {
                 let (filename, resolved) = audio_queue[audio_queue_pos].clone();
                 match Ui::audio_play(&resolved) {
                     AudioAttempt::Done(true) => {
+                        if let Some(active) = backend.as_ref() {
+                            active.mark_media_present(&filename);
+                        }
                         playing_audio = Some(filename.clone());
                         if let Some((card, answer)) = match &screen {
                             Screen::Question { card, .. } => Some((card, false)),
@@ -5013,6 +5152,9 @@ fn main() {
                 Screen::Question { card, .. } | Screen::Answer { card, .. } => Some(card),
                 _ => None,
             };
+            if let (Some(card), Some(active_backend)) = (current, backend.as_ref()) {
+                active_backend.sync_media_presence(card);
+            }
             if let (Some(active), Some(card), Some(active_backend)) =
                 (media_job.as_ref(), current, backend.as_ref())
             {
@@ -5029,6 +5171,21 @@ fn main() {
                 prefetch.request(Vec::new());
             }
         }
+        if media_refreshed_now {
+            if let (Some((_, _)), Some(active_backend)) = (review_card, backend.as_ref()) {
+                let current = match &screen {
+                    Screen::Question { card, .. } | Screen::Answer { card, .. } => Some(card),
+                    _ => None,
+                };
+                if let Some(card) = current {
+                    let discovered = active_backend.sync_media_presence(card);
+                    if card_media_pending || discovered {
+                        top_card.invalidate();
+                        prefetch.request(prefetch_for_card(active_backend, card));
+                    }
+                }
+            }
+        }
         if card_changed || media_refreshed_now {
             card_media_pending = match (&screen, backend.as_ref()) {
                 (Screen::Question { card, .. }, Some(active_backend)) => {
@@ -5039,19 +5196,6 @@ fn main() {
                 }
                 _ => false,
             };
-        }
-        if media_refreshed_now {
-            if let (Some((_, answer)), Some(active_backend)) = (review_card, backend.as_ref()) {
-                let current = match &screen {
-                    Screen::Question { card, .. } | Screen::Answer { card, .. } => Some(card),
-                    _ => None,
-                };
-                if let Some(card) = current {
-                    if active_backend.card_media_missing(card, answer) {
-                        prefetch.request(prefetch_for_card(active_backend, card));
-                    }
-                }
-            }
         }
         if review_card.map(|entry| entry.0) != last_review_card.map(|entry| entry.0) {
             // New card (or left review): drop the typed answer, open hints,
@@ -5081,6 +5225,9 @@ fn main() {
                             .unwrap_or_else(|| first.path());
                         match Ui::audio_play(&resolved) {
                             AudioAttempt::Done(true) => {
+                                if let Some(active) = backend.as_ref() {
+                                    active.mark_media_present(&first.filename);
+                                }
                                 playing_audio = Some(first.filename.clone());
                                 event(&format!("AUDIO auto ok=true file={}", first.filename));
                                 last_autoplay_card = Some((id, answer));
@@ -5377,6 +5524,7 @@ fn main() {
                     i18n::font_scale_factor(),
                     &review.hints_set(),
                     review.typed.as_deref().unwrap_or(""),
+                    media_running_now,
                 );
                 if !review.media_ready {
                     // Adopt the autoplay policy once per card: animated

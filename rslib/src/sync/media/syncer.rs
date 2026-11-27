@@ -47,9 +47,14 @@ use crate::sync::media::MAX_MEDIA_FILES_IN_ZIP;
 use crate::sync::request::IntoSyncRequest;
 use crate::version;
 
-/// Files accumulated before the downloaded additions are committed to the
-/// media database. Batching keeps SD journal writes rare during sync.
 const DOWNLOAD_COMMIT_FILES: usize = 100;
+const DOWNLOAD_BATCH_FILES: usize = if cfg!(target_os = "horizon") {
+    10
+} else {
+    MAX_MEDIA_FILES_IN_ZIP
+};
+const INDEX_SAVE_INTERVAL_FILES: usize = 100;
+const PRIORITY_CACHE_LIMIT: usize = 256;
 const BATCH_RETRIES: u32 = 3;
 
 fn is_network_error(e: &AnkiError) -> bool {
@@ -67,7 +72,10 @@ pub struct MediaSyncer<T> {
     focus: Option<Arc<MediaPriority>>,
     index: Option<Arc<MediaNameIndex>>,
     index_dirty: bool,
+    index_dirty_count: usize,
     parallel_downloads: bool,
+    last_focus_version: u32,
+    last_priority_version: u32,
     priority_attempted: HashSet<String>,
     priority_fetched: HashSet<String>,
 }
@@ -91,7 +99,10 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             focus: None,
             index: None,
             index_dirty: false,
+            index_dirty_count: 0,
             parallel_downloads: true,
+            last_focus_version: u32::MAX,
+            last_priority_version: u32::MAX,
             priority_attempted: HashSet::new(),
             priority_fetched: HashSet::new(),
         })
@@ -137,16 +148,16 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             .is_some_and(|paused| paused.load(Ordering::Acquire))
     }
 
-    fn on_demand_priority(&self) -> Option<Arc<MediaPriority>> {
+    fn on_demand_priority(&self) -> Option<(Arc<MediaPriority>, bool)> {
         if self.bulk_paused() {
-            self.focus.clone()
+            self.focus.clone().map(|p| (p, true))
         } else {
-            self.priority.clone()
+            self.priority.clone().map(|p| (p, false))
         }
     }
 
     async fn pause_point(&mut self) -> Result<()> {
-        if self.bulk_paused() {
+        if self.bulk_paused() && self.index_dirty_count >= INDEX_SAVE_INTERVAL_FILES {
             self.save_index();
         }
         while self.bulk_paused() {
@@ -158,7 +169,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                 return Err(AnkiError::Interrupted);
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(50));
         }
         Ok(())
     }
@@ -168,8 +179,13 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             debug!("sync error: {:?}", e);
             e
         });
+        let _ = std::fs::remove_file(self.download_scratch_path());
         self.save_index();
         result
+    }
+
+    fn download_scratch_path(&self) -> std::path::PathBuf {
+        self.mgr.media_folder.with_file_name(".media-batch.zip")
     }
 
     fn save_index(&mut self) {
@@ -177,6 +193,7 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             return;
         }
         self.index_dirty = false;
+        self.index_dirty_count = 0;
         if let Some(index) = &self.index {
             let _ = save_media_name_index(index, &self.mgr.media_folder);
         }
@@ -280,19 +297,38 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         Ok((changed, removed))
     }
 
-    /// Fetch prioritized files that are missing on disk directly by name,
-    /// without waiting for them to appear in a mediaChanges batch.
     async fn fetch_priority_now(&mut self) -> Result<()> {
-        let Some(priority) = self.on_demand_priority() else {
+        let Some((priority, is_focus)) = self.on_demand_priority() else {
             return Ok(());
         };
+        let version = priority.version();
+        let last = if is_focus {
+            &mut self.last_focus_version
+        } else {
+            &mut self.last_priority_version
+        };
+        if *last == version {
+            return Ok(());
+        }
+        *last = version;
+        let snapshot = priority.snapshot();
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        if self.priority_attempted.len() > PRIORITY_CACHE_LIMIT {
+            self.priority_attempted.clear();
+        }
         let mut missing = Vec::new();
-        for name in priority.snapshot() {
+        for name in snapshot {
             let name = normalize_filename(&name).into_owned();
             if name.is_empty() || !self.priority_attempted.insert(name.clone()) {
                 continue;
             }
-            if locate_existing(&self.mgr.media_folder, &name).is_some() {
+            if let Some(existing) = locate_existing(&self.mgr.media_folder, &name) {
+                if let Some(index) = &self.index {
+                    let unmigrated = existing.parent() == Some(self.mgr.media_folder.as_path());
+                    index.insert(&name, unmigrated);
+                }
                 priority.remove(&[name]);
             } else {
                 missing.push(name);
@@ -313,29 +349,61 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             }
             let (files, rest) = remaining.split_at(chunk.min(remaining.len()));
             remaining = rest;
-            chunk = MAX_MEDIA_FILES_IN_ZIP;
+            chunk = DOWNLOAD_BATCH_FILES;
             let request = DownloadFilesRequest {
                 files: files.to_vec(),
             }
             .try_into_sync_request()?;
-            match self.client.download_files(request).await {
-                Ok(response) => {
-                    let data = response.data;
+            let scratch = self.download_scratch_path();
+            let downloaded = match self.client.download_files_to_file(request, &scratch).await {
+                Some(Ok(bytes)) => {
                     self.progress
-                        .update(false, |p| p.downloaded_bytes += data.len() as u64)?;
-                    if self.write_zip(data, &mut pending)? {
-                        result = Err(AnkiError::Interrupted);
-                        break;
+                        .update(false, |p| p.downloaded_bytes += bytes)?;
+                    let interrupted = self.write_zip_file(&scratch, &mut pending);
+                    let _ = std::fs::remove_file(&scratch);
+                    match interrupted {
+                        Ok(cancelled) => Ok(cancelled),
+                        Err(e) => Err(e),
                     }
+                }
+                Some(Err(e)) => {
+                    let _ = std::fs::remove_file(&scratch);
+                    Err(e.into())
+                }
+                None => {
+                    let request = DownloadFilesRequest {
+                        files: files.to_vec(),
+                    }
+                    .try_into_sync_request()?;
+                    match self.client.download_files(request).await {
+                        Ok(response) => {
+                            let data = response.data;
+                            self.progress
+                                .update(false, |p| p.downloaded_bytes += data.len() as u64)?;
+                            self.write_zip(data, &mut pending)
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                }
+            };
+            match downloaded {
+                Ok(true) => {
+                    result = Err(AnkiError::Interrupted);
+                    break;
+                }
+                Ok(false) => {
                     for name in files {
                         if locate_existing(&self.mgr.media_folder, name).is_some() {
+                            if self.priority_fetched.len() > PRIORITY_CACHE_LIMIT {
+                                self.priority_fetched.clear();
+                            }
                             self.priority_fetched.insert(name.clone());
                         }
                     }
                     priority.remove(files);
                 }
                 Err(error) => {
-                    if self.client.is_cancelled() {
+                    if self.client.is_cancelled() || matches!(error, AnkiError::Interrupted) {
                         result = Err(AnkiError::Interrupted);
                         break;
                     }
@@ -455,10 +523,10 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             }
             self.apply_priority(to_download);
             let group: Vec<String> = to_download
-                .drain(..MAX_MEDIA_FILES_IN_ZIP.min(to_download.len()))
+                .drain(..DOWNLOAD_BATCH_FILES.min(to_download.len()))
                 .collect();
             let batches: Vec<Vec<String>> = group
-                .chunks(MAX_MEDIA_FILES_IN_ZIP)
+                .chunks(DOWNLOAD_BATCH_FILES)
                 .map(|chunk| chunk.to_vec())
                 .collect();
             match self.download_group(batches, pending).await {
@@ -487,6 +555,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         let Some(priority) = &self.priority else {
             return;
         };
+        if priority.is_empty() {
+            return;
+        }
         let wanted = priority.snapshot();
         if wanted.is_empty() {
             return;
@@ -496,11 +567,16 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             .enumerate()
             .map(|(index, name)| (normalize_filename(name).into_owned(), index))
             .collect();
-        to_download.sort_by_cached_key(|name| {
-            rank.get(normalize_filename(name).as_ref())
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
+        let mut front = 0usize;
+        for i in 0..to_download.len() {
+            if rank.contains_key(to_download[i].as_str()) {
+                to_download.swap(front, i);
+                front += 1;
+            }
+        }
+        if front > 1 {
+            to_download[..front].sort_by_key(|name| rank.get(name.as_str()).copied().unwrap_or(usize::MAX));
+        }
     }
 
     async fn download_group(
@@ -532,22 +608,39 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
             if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                 return Err(AnkiError::Interrupted);
             }
+            let scratch = self.download_scratch_path();
             let mut attempt = 0;
-            let zip_data = loop {
+            enum BatchPayload {
+                File(u64),
+                Memory(Vec<u8>),
+            }
+            let payload = loop {
                 if self.client.is_cancelled() || self.progress.check_cancelled().is_err() {
                     return Err(AnkiError::Interrupted);
                 }
-                match self
-                    .client
-                    .download_files(
-                        DownloadFilesRequest {
-                            files: files.clone(),
-                        }
-                        .try_into_sync_request()?,
-                    )
-                    .await
-                {
-                    Ok(r) => break r.data,
+                let req = DownloadFilesRequest {
+                    files: files.clone(),
+                }
+                .try_into_sync_request()?;
+                let outcome = match self.client.download_files_to_file(req, &scratch).await {
+                    Some(Ok(bytes)) => Ok(BatchPayload::File(bytes)),
+                    Some(Err(e)) => {
+                        let _ = std::fs::remove_file(&scratch);
+                        Err(e)
+                    }
+                    None => self
+                        .client
+                        .download_files(
+                            DownloadFilesRequest {
+                                files: files.clone(),
+                            }
+                            .try_into_sync_request()?,
+                        )
+                        .await
+                        .map(|r| BatchPayload::Memory(r.data)),
+                };
+                match outcome {
+                    Ok(payload) => break payload,
                     Err(e) => {
                         let net_err: AnkiError = e.into();
                         if attempt < BATCH_RETRIES && is_network_error(&net_err) {
@@ -561,10 +654,23 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
                     }
                 }
             };
-            self.progress
-                .update(false, |p| p.downloaded_bytes += zip_data.len() as u64)?;
-            if self.write_zip(zip_data, pending)? {
-                return Err(AnkiError::Interrupted);
+            match payload {
+                BatchPayload::File(bytes) => {
+                    self.progress
+                        .update(false, |p| p.downloaded_bytes += bytes)?;
+                    let extracted = self.write_zip_file(&scratch, pending);
+                    let _ = std::fs::remove_file(&scratch);
+                    if extracted? {
+                        return Err(AnkiError::Interrupted);
+                    }
+                }
+                BatchPayload::Memory(zip_data) => {
+                    self.progress
+                        .update(false, |p| p.downloaded_bytes += zip_data.len() as u64)?;
+                    if self.write_zip(zip_data, pending)? {
+                        return Err(AnkiError::Interrupted);
+                    }
+                }
             }
         }
         Ok(())
@@ -641,8 +747,6 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         Ok(())
     }
 
-    /// Unpack one zip directly into the media folder and buffer the additions.
-    /// Returns true if extraction was interrupted.
     fn write_zip(&mut self, zip_data: Vec<u8>, pending: &mut Vec<AddedFile>) -> Result<bool> {
         let folder = self.mgr.media_folder.clone();
         let client = &self.client;
@@ -650,9 +754,40 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         let extracted = download::extract_into_media_folder(&folder, zip_data, &mut || {
             client.is_cancelled() || progress.check_cancelled().is_err()
         })?;
+        self.finish_extracted(extracted, pending)
+    }
+
+    fn write_zip_file(
+        &mut self,
+        zip_path: &std::path::Path,
+        pending: &mut Vec<AddedFile>,
+    ) -> Result<bool> {
+        let folder = self.mgr.media_folder.clone();
+        let client = &self.client;
+        let progress = &mut self.progress;
+        let extracted = download::extract_file_into_media_folder(&folder, zip_path, &mut || {
+            client.is_cancelled() || progress.check_cancelled().is_err()
+        })?;
+        self.finish_extracted(extracted, pending)
+    }
+
+    fn finish_extracted(
+        &mut self,
+        extracted: download::ExtractedDownload,
+        pending: &mut Vec<AddedFile>,
+    ) -> Result<bool> {
         let downloaded = extracted.added.len();
         let cancelled = extracted.cancelled;
         let unpacked_bytes = extracted.bytes;
+        if let Some(index) = &self.index {
+            for added in &extracted.added {
+                index.insert(&added.fname, false);
+            }
+        }
+        if downloaded > 0 {
+            self.index_dirty = true;
+            self.index_dirty_count += downloaded;
+        }
         pending.extend(extracted.added);
         self.progress.update(false, |p| {
             p.downloaded_files += downloaded;
@@ -661,6 +796,9 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         self.notify_changed();
         if pending.len() >= DOWNLOAD_COMMIT_FILES {
             self.flush_additions(pending)?;
+        }
+        if self.index_dirty_count >= INDEX_SAVE_INTERVAL_FILES {
+            self.save_index();
         }
         std::thread::yield_now();
         std::thread::sleep(Duration::from_millis(8));
@@ -671,20 +809,11 @@ impl<T: MediaSyncProtocol> MediaSyncer<T> {
         if pending.is_empty() {
             return Ok(());
         }
-        let fnames: Vec<String> = pending.iter().map(|file| file.fname.clone()).collect();
         let additions = std::mem::take(pending);
         self.mgr.db.transact(|ctx| {
             ctx.record_additions(additions)?;
             Ok(())
         })?;
-        if let Some(index) = &self.index {
-            for fname in &fnames {
-                index.insert(fname, false);
-            }
-        }
-        if !fnames.is_empty() {
-            self.index_dirty = true;
-        }
         Ok(())
     }
 

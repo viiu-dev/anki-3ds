@@ -216,6 +216,56 @@ extern "C" {
     fn anki_3ds_https_global_init() -> std::os::raw::c_int;
 
     fn anki_3ds_https_cleanup();
+
+    #[cfg(target_os = "horizon")]
+    fn anki_3ds_wifi_connected() -> std::os::raw::c_int;
+
+    #[cfg(target_os = "horizon")]
+    fn anki_3ds_random_bytes(out: *mut u8, len: usize) -> std::os::raw::c_int;
+}
+
+pub fn wifi_connected() -> bool {
+    #[cfg(target_os = "horizon")]
+    {
+        unsafe { anki_3ds_wifi_connected() != 0 }
+    }
+    #[cfg(not(target_os = "horizon"))]
+    {
+        true
+    }
+}
+
+fn zeroize_string(secret: &mut String) {
+    unsafe {
+        for byte in secret.as_bytes_mut() {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    secret.clear();
+}
+
+pub fn validate_endpoint_change(current: &Url, candidate: &Url) -> anki::prelude::Result<()> {
+    let same_host = candidate.origin() == current.origin();
+    let official = |url: &Url| {
+        url.host_str()
+            .is_some_and(|host| host == "ankiweb.net" || host.ends_with(".ankiweb.net"))
+    };
+    if candidate.scheme() != "https"
+        || candidate.host_str().is_none()
+        || candidate.port_or_known_default() != Some(443)
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.query().is_some()
+        || candidate.fragment().is_some()
+        || !(same_host || (official(current) && official(candidate)))
+    {
+        return Err(anki::error::SyncError {
+            info: "untrusted native sync redirect".into(),
+            kind: anki::error::SyncErrorKind::Other,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub const HTTPS_SLOT_COUNT: usize = 5;
@@ -404,7 +454,26 @@ impl NativeSyncClient {
                 "native sync requires HTTPS without URL credentials".into(),
             ));
         }
-        let host_str = self.endpoint.host_str().unwrap_or(DEFAULT_ANKIWEB_HOST);
+        let host_str = self.endpoint.host_str().ok_or_else(|| {
+            SyncTransportError::Serialization("sync endpoint missing host".into())
+        })?;
+        let port = self.endpoint.port_or_known_default().unwrap_or(0);
+        if port == 0 {
+            return Err(SyncTransportError::Serialization(
+                "sync endpoint missing valid port".into(),
+            ));
+        }
+        if !path.starts_with('/')
+            || host_str.bytes().any(|b| b < 0x21 || b == 0x7f || matches!(b, b'@' | b'/' | b':'))
+            || path.bytes().any(|b| b < 0x21 || b == 0x7f)
+            || header_json.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || self.ca_file.is_empty()
+            || self.ca_file.bytes().any(|b| b == 0)
+        {
+            return Err(SyncTransportError::Serialization(
+                "invalid sync request parameters".into(),
+            ));
+        }
 
         let c_host =
             CString::new(host_str).map_err(|e| SyncTransportError::Serialization(e.to_string()))?;
@@ -430,7 +499,7 @@ impl NativeSyncClient {
             write_error: None,
         };
         let options = RequestOptions {
-            port: self.endpoint.port_or_known_default().unwrap_or(443) as u32,
+            port: u32::from(port),
             ca_file: ca.as_ptr(),
             upload_file: upload.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             download_file: download.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
@@ -531,7 +600,8 @@ impl NativeSyncClient {
             if let Some(msg) = write_error {
                 return Err(SyncTransportError::Transport(-4, msg.into()));
             }
-            return Err(SyncTransportError::Transport(curl_code, err_msg));
+            let code = if curl_code != 0 { curl_code } else { rc };
+            return Err(SyncTransportError::Transport(code, err_msg));
         }
 
         Ok(HttpResponse {
@@ -571,28 +641,32 @@ impl NativeSyncClient {
             session_key: self.session_key.clone(),
         };
 
-        let header_json = serde_json::to_string(&header).map_err(|e| HttpError {
+        let mut header_json = serde_json::to_string(&header).map_err(|e| HttpError {
             code: StatusCode::INTERNAL_SERVER_ERROR,
             context: format!("failed to serialize sync header: {e}"),
             source: None,
         })?;
 
-        let compressed_body = compress_low_mem(&request.data).map_err(|e| HttpError {
-            code: StatusCode::INTERNAL_SERVER_ERROR,
-            context: format!("failed to compress request body: {e}"),
-            source: None,
+        let compressed_body = compress_low_mem(&request.data).map_err(|e| {
+            zeroize_string(&mut header_json);
+            HttpError {
+                code: StatusCode::INTERNAL_SERVER_ERROR,
+                context: format!("failed to compress request body: {e}"),
+                source: None,
+            }
         })?;
         drop(request.data);
 
         if compressed_body.len() > MAX_RESPONSE_BYTES {
+            zeroize_string(&mut header_json);
             return Err(HttpError::new_without_source(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "compressed sync request exceeds 8 MiB buffer budget",
             ));
         }
-        let resp = self
-            .post_raw(path, &header_json, &compressed_body)
-            .map_err(|e| self.transport_error(e))?;
+        let resp = self.post_raw(path, &header_json, &compressed_body);
+        zeroize_string(&mut header_json);
+        let resp = resp.map_err(|e| self.transport_error(e))?;
         drop(compressed_body);
 
         let status_code = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -749,12 +823,22 @@ fn decompress_zstd_body_if_needed(body: Vec<u8>) -> HttpResult<Vec<u8>> {
 }
 
 fn simple_session_id() -> String {
+    #[cfg(target_os = "horizon")]
+    {
+        let mut bytes = [0u8; 8];
+        if unsafe { anki_3ds_random_bytes(bytes.as_mut_ptr(), bytes.len()) } == 0 {
+            return format!("{:016x}", u64::from_be_bytes(bytes));
+        }
+    }
+    use std::sync::atomic::AtomicU32;
     use std::time::SystemTime;
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
     let seed = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(123456789);
-    format!("{:016x}", seed)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        ^ (COUNTER.fetch_add(1, Ordering::Relaxed) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    format!("{seed:016x}")
 }
 
 #[async_trait]
@@ -859,6 +943,107 @@ impl MediaSyncProtocol for NativeSyncClient {
         req: SyncRequest<DownloadFilesRequest>,
     ) -> HttpResult<SyncResponse<Vec<u8>>> {
         self.request(MediaSyncMethod::DownloadFiles, req).await
+    }
+
+    async fn download_files_to_file(
+        &self,
+        req: SyncRequest<DownloadFilesRequest>,
+        path: &Path,
+    ) -> Option<HttpResult<u64>> {
+        let result = (|| -> HttpResult<u64> {
+            if req.data.len() > MAX_DECOMPRESSED_BYTES {
+                return Err(HttpError::new_without_source(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "sync request exceeds 16 MiB buffer budget",
+                ));
+            }
+            let endpoint_url = MediaSyncMethod::DownloadFiles.as_sync_endpoint(&self.endpoint);
+            let url_path = endpoint_url.path();
+            let header = SyncHeader {
+                sync_version: req.sync_version,
+                sync_key: self.sync_key.clone(),
+                client_ver: req.client_version,
+                session_key: self.session_key.clone(),
+            };
+            let mut header_json = serde_json::to_string(&header).map_err(|e| HttpError {
+                code: StatusCode::INTERNAL_SERVER_ERROR,
+                context: format!("failed to serialize sync header: {e}"),
+                source: None,
+            })?;
+            let compressed_body = compress_low_mem(&req.data).map_err(|e| {
+                zeroize_string(&mut header_json);
+                HttpError {
+                    code: StatusCode::INTERNAL_SERVER_ERROR,
+                    context: format!("failed to compress request body: {e}"),
+                    source: None,
+                }
+            })?;
+            drop(req.data);
+            if compressed_body.len() > MAX_RESPONSE_BYTES {
+                zeroize_string(&mut header_json);
+                return Err(HttpError::new_without_source(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "compressed sync request exceeds 8 MiB buffer budget",
+                ));
+            }
+            let resp = self.transfer(url_path, &header_json, &compressed_body, None, Some(path), None);
+            zeroize_string(&mut header_json);
+            drop(compressed_body);
+            let resp = resp.map_err(|e| self.transport_error(e))?;
+            let status_code = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            if status_code == StatusCode::PERMANENT_REDIRECT {
+                let _ = std::fs::remove_file(path);
+                return Err(HttpError {
+                    code: StatusCode::PERMANENT_REDIRECT,
+                    context: resp.redirect_url.unwrap_or_default(),
+                    source: None,
+                });
+            }
+            if !status_code.is_success() {
+                let _ = std::fs::remove_file(path);
+                return Err(HttpError {
+                    code: status_code,
+                    context: format!("HTTP {} from native sync transport", status_code.as_u16()),
+                    source: Some(Box::new(anki::error::error_for_status_code(
+                        String::new(),
+                        status_code,
+                    ))),
+                });
+            }
+            let file_len = std::fs::metadata(path).map_err(io_http)?.len();
+            let mut magic = [0u8; 4];
+            let has_magic = file_len >= 4
+                && std::fs::File::open(path)
+                    .and_then(|mut f| f.read_exact(&mut magic))
+                    .is_ok();
+            if has_magic && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+                let zstd_path = path.with_extension("zip.zst");
+                let _ = std::fs::remove_file(&zstd_path);
+                std::fs::rename(path, &zstd_path).map_err(io_http)?;
+                let decompress_result = (|| -> HttpResult<()> {
+                    let input = std::fs::File::open(&zstd_path).map_err(io_http)?;
+                    let mut output = std::fs::File::create(path).map_err(io_http)?;
+                    let limit = *anki::sync::request::MAXIMUM_SYNC_PAYLOAD_BYTES_UNCOMPRESSED;
+                    let mut decoder = zstd::Decoder::new(input).map_err(io_http)?;
+                    decoder.window_log_max(23).map_err(io_http)?;
+                    let written =
+                        copy_with_cancel(&mut decoder.take(limit + 1), &mut output, &self.cancel)
+                            .map_err(|e| self.file_error(e))?;
+                    if written > limit {
+                        return Err(HttpError::new_without_source(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "decompressed media batch exceeds limit",
+                        ));
+                    }
+                    output.sync_all().map_err(io_http)?;
+                    Ok(())
+                })();
+                let _ = std::fs::remove_file(&zstd_path);
+                decompress_result?;
+            }
+            Ok(file_len)
+        })();
+        Some(result)
     }
 
     fn download_files_parallel(
@@ -1015,23 +1200,7 @@ impl anki::sync::collection::protocol::SyncClient for NativeSyncClient {
         &self.endpoint
     }
     fn set_endpoint(&mut self, endpoint: Url) -> anki::prelude::Result<()> {
-        let same_host = endpoint.origin() == self.endpoint.origin();
-        let official = |url: &Url| {
-            url.host_str()
-                .is_some_and(|host| host == "ankiweb.net" || host.ends_with(".ankiweb.net"))
-        };
-        if endpoint.scheme() != "https"
-            || endpoint.port_or_known_default() != Some(443)
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || !(same_host || (official(&self.endpoint) && official(&endpoint)))
-        {
-            return Err(anki::error::SyncError {
-                info: "untrusted native sync redirect".into(),
-                kind: anki::error::SyncErrorKind::Other,
-            }
-            .into());
-        }
+        validate_endpoint_change(&self.endpoint, &endpoint)?;
         self.endpoint = endpoint;
         Ok(())
     }
@@ -1119,6 +1288,8 @@ mod tests {
             "https://attacker.invalid/",
             "https://sync.ankiweb.net:444/",
             "https://secret@sync.ankiweb.net/",
+            "https://sync2.ankiweb.net/?token=leak",
+            "https://sync2.ankiweb.net/#frag",
         ] {
             assert!(
                 client.set_endpoint(Url::parse(target).unwrap()).is_err(),
@@ -1149,7 +1320,7 @@ impl NativeSyncClient {
                 SyncTransportError::Transport(-2, info) if info.contains("timeout") => {
                     anki::error::NetworkErrorKind::Timeout
                 }
-                SyncTransportError::Transport(-2 | 6 | 7, _) => {
+                SyncTransportError::Transport(-5 | -2 | 6 | 7, _) => {
                     anki::error::NetworkErrorKind::Offline
                 }
                 _ => anki::error::NetworkErrorKind::Other,
@@ -1255,22 +1426,22 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             path = %compressed.display(),
             "full upload scratch ready"
         );
-        let header = self.file_header(
+        let mut header = self.file_header(
             EmptyInput::default()
                 .try_into_sync_request()
                 .map_err(io_http)?,
         )?;
         let endpoint = SyncMethod::Upload.as_sync_endpoint(&self.endpoint);
-        let response = self
-            .transfer(
-                endpoint.path(),
-                &header,
-                &[],
-                Some(compressed.as_ref()),
-                None,
-                Some(progress),
-            )
-            .map_err(|e| self.transport_error(e))?;
+        let response = self.transfer(
+            endpoint.path(),
+            &header,
+            &[],
+            Some(compressed.as_ref()),
+            None,
+            Some(progress),
+        );
+        zeroize_string(&mut header);
+        let response = response.map_err(|e| self.transport_error(e))?;
         let response = self.check_file_response(response)?;
         Ok(SyncResponse::from_vec(decompress_zstd_body_if_needed(
             response.body,
@@ -1311,18 +1482,18 @@ impl anki::sync::collection::protocol::FullSyncClient for NativeSyncClient {
             "full download scratch created"
         );
         let body = compress_low_mem(&request.data).map_err(io_http)?;
-        let header = self.file_header(request)?;
+        let mut header = self.file_header(request)?;
         let endpoint = SyncMethod::Download.as_sync_endpoint(&self.endpoint);
-        let response = self
-            .transfer(
-                endpoint.path(),
-                &header,
-                &body,
-                None,
-                Some(compressed.as_ref()),
-                Some(progress),
-            )
-            .map_err(|e| self.transport_error(e))?;
+        let response = self.transfer(
+            endpoint.path(),
+            &header,
+            &body,
+            None,
+            Some(compressed.as_ref()),
+            Some(progress),
+        );
+        zeroize_string(&mut header);
+        let response = response.map_err(|e| self.transport_error(e))?;
         drop(body);
         self.check_file_response(response)?;
         tracing::debug!(

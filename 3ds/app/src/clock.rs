@@ -125,6 +125,17 @@ pub fn connected() -> bool {
     Ui::wifi_connected()
 }
 
+pub fn connected_now() -> bool {
+    #[cfg(feature = "emulator")]
+    {
+        static TEST: OnceLock<bool> = OnceLock::new();
+        if *TEST.get_or_init(|| super::sync::Login::new().is_test()) {
+            return true;
+        }
+    }
+    Ui::wifi_connected_now()
+}
+
 pub struct Job {
     receiver: mpsc::Receiver<Result<Correction, String>>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -149,7 +160,7 @@ impl Job {
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("clock-setup".into())
-            .stack_size(1024 * 1024)
+            .stack_size(256 * 1024)
             .spawn(move || {
                 let result = (|| {
                     let ps = Ps::new().map_err(|e| e.to_string())?;
@@ -234,6 +245,9 @@ pub fn configure(
 ) -> Result<i32, String> {
     if !force {
         return Ok(init());
+    }
+    if !connected_now() {
+        return Err(tr("Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.").into());
     }
     let mut job = match pending {
         Some(job) => job,

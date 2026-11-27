@@ -379,5 +379,9 @@
     "UI Sound Effects": "UI Sound Effects",
     "UI Sound Effects: {0}": "UI Sound Effects: {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "Subtle chimes for reveal, ratings, and deck completion.",
-    "Sound effects volume": "Sound effects volume"
+    "Sound effects volume": "Sound effects volume",
+    "Downloading image...": "Downloading image...",
+    "Loading image...": "Loading image...",
+    "Wi-Fi disabled": "Wi-Fi disabled",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync."
 }

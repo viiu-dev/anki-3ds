@@ -379,5 +379,9 @@
     "UI Sound Effects": "Effetti sonori",
     "UI Sound Effects: {0}": "Effetti sonori: {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "Suoni delicati per risposte, valutazioni e fine mazzo.",
-    "Sound effects volume": "Volume effetti"
+    "Sound effects volume": "Volume effetti",
+    "Downloading image...": "Download immagine...",
+    "Loading image...": "Caricamento immagine...",
+    "Wi-Fi disabled": "Wi-Fi disattivato",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Il Wi-Fi è disattivato o disconnesso. Attiva la comunicazione wireless e connettiti a una rete per sincronizzare."
 }

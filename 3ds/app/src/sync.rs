@@ -216,7 +216,7 @@ impl Job {
         let (sender, receiver) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("collection-sync".into())
-            .stack_size(1024 * 1024)
+            .stack_size(512 * 1024)
             .spawn(move || {
                 let completed = run_job(backend, client, auth, (username, password), mode, shared);
                 let _ = sender.send(completed);
@@ -417,7 +417,7 @@ fn run_job(
                 if let Err(error) = saved {
                     Err(Box::new(error) as Box<dyn std::error::Error>)
                 } else {
-                    let media_client = client.clone();
+                    let mut media_client = client.clone();
                     let cancel = client.cancel.clone();
                     let (reopened, result) =
                         backend
@@ -427,6 +427,17 @@ fn run_job(
                     backend = reopened;
                     super::event(&format!("SYNC_COLLECTION_DONE ok={}", result.is_ok()));
                     if matches!(result, Ok(Outcome::Complete)) && !cancel.load(Ordering::Acquire) {
+                        if let Some(updated_endpoint) = auth.as_ref().and_then(|a| a.endpoint.clone())
+                        {
+                            if anki_3ds_sync_transport::validate_endpoint_change(
+                                &media_client.endpoint,
+                                &updated_endpoint,
+                            )
+                            .is_ok()
+                            {
+                                media_client.endpoint = updated_endpoint;
+                            }
+                        }
                         if let Some(active) = backend.as_mut() {
                             let priority = active.priority_media(20);
                             let index = active.media_index_handle();

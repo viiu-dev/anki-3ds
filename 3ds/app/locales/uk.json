@@ -379,5 +379,9 @@
     "UI Sound Effects": "Звукові ефекти",
     "UI Sound Effects: {0}": "Звукові ефекти: {0}",
     "Subtle chimes for reveal, ratings, and deck completion.": "М'які звуки під час відповіді, оцінки й завершення колоди.",
-    "Sound effects volume": "Гучність ефектів"
+    "Sound effects volume": "Гучність ефектів",
+    "Downloading image...": "Завантаження зображення...",
+    "Loading image...": "Завантаження зображення...",
+    "Wi-Fi disabled": "Wi-Fi вимкнено",
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi вимкнено або немає з'єднання. Увімкніть бездротовий зв'язок і підключіться до мережі для синхронізації."
 }
