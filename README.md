@@ -11,7 +11,12 @@ Anki is a spaced repetition program. This project brings it to the Nintendo 3DS 
 
 ## Preview
 
-<img width="400" alt="anki-3ds-preview-small" src="https://github.com/user-attachments/assets/e2ffbaf6-e796-4cae-9865-aa1321c603ee" />
+<p align="center">
+  <img width="410" alt="Decks" src="https://github.com/user-attachments/assets/2b0ec721-ec84-4e16-8d7b-0bea5feff608" />
+  <img width="410" alt="Stats" src="https://github.com/user-attachments/assets/830615e5-f45b-41fa-a34e-ce34060bf7bb" />
+  <br />
+  <img width="410" alt="anki-3ds-preview-small" src="https://github.com/user-attachments/assets/e2ffbaf6-e796-4cae-9865-aa1321c603ee" />
+</p>
 
 ## Install
 
