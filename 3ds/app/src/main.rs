@@ -20,6 +20,7 @@ mod sync;
 mod theme;
 mod time_correction;
 mod ui;
+mod update;
 use std::collections::HashSet;
 use std::fs;
 use std::time::Duration;
@@ -1511,6 +1512,8 @@ enum Action {
     MediaReplay,
     MediaSelect(i32),
     MediaSync,
+    CheckUpdates,
+    DismissUpdate,
     Exit,
 }
 
@@ -1821,6 +1824,7 @@ enum ToggleKind {
     CardCounts,
     RatingIntervals,
     UiSfx,
+    CheckUpdates,
 }
 
 #[derive(Clone, Copy)]
@@ -1869,13 +1873,15 @@ const CONTROLS_ITEMS: [SettingsItem; 13] = [
     SettingsItem::Binding(ReviewAction::ScrollDown),
     SettingsItem::ResetControls,
 ];
-const NETWORK_ITEMS: [SettingsItem; 6] = [
+const NETWORK_ITEMS: [SettingsItem; 8] = [
     SettingsItem::Action(Action::Login, "Log in"),
     SettingsItem::Action(Action::Logout, "Log out"),
     SettingsItem::Action(Action::FullSync, "Full sync"),
     SettingsItem::Action(Action::Clock, "Update clock"),
     SettingsItem::Choice(ChoiceKind::Connections),
     SettingsItem::Action(Action::MediaSync, "Media sync"),
+    SettingsItem::Toggle(ToggleKind::CheckUpdates),
+    SettingsItem::Action(Action::CheckUpdates, "Check now"),
 ];
 const SYSTEM_ITEMS: [SettingsItem; 3] = [
     SettingsItem::Toggle(ToggleKind::ConsoleLeds),
@@ -2104,6 +2110,10 @@ fn apply_toggle(kind: ToggleKind) -> std::io::Result<()> {
             }
             event(&format!("UI_SFX {}", if value { "on" } else { "off" }));
         }
+        ToggleKind::CheckUpdates => {
+            let value = i18n::toggle_check_updates()?;
+            event(&format!("CHECK_UPDATES {}", if value { "on" } else { "off" }));
+        }
     }
     Ok(())
 }
@@ -2113,6 +2123,9 @@ fn settings_item_label(
     media_running: bool,
     media_files: usize,
     media_status: Option<&str>,
+    update_checking: bool,
+    update_available: Option<&str>,
+    update_status: Option<&str>,
 ) -> String {
     match item {
         SettingsItem::Choice(kind) => choice_label(kind),
@@ -2148,6 +2161,10 @@ fn settings_item_label(
             "UI Sound Effects: {0}",
             &[tr(if i18n::ui_sfx() { "On" } else { "Off" })],
         ),
+        SettingsItem::Toggle(ToggleKind::CheckUpdates) => i18n::format(
+            "Check for updates: {0}",
+            &[tr(if i18n::check_updates() { "On" } else { "Off" })],
+        ),
         SettingsItem::Binding(action) => i18n::format(
             "{0}: {1}",
             &[
@@ -2174,8 +2191,49 @@ fn settings_item_label(
         SettingsItem::Action(Action::MediaSync, _) => {
             media_sync_label(media_running, media_files, media_status)
         }
+        SettingsItem::Action(Action::CheckUpdates, _) => {
+            if update_checking {
+                tr("Checking for updates...").to_owned()
+            } else if let Some(version) = update_available {
+                i18n::format("Update available: {0}", &[version])
+            } else if let Some(status) = update_status {
+                status.to_owned()
+            } else {
+                tr("Check now").to_owned()
+            }
+        }
         SettingsItem::Action(_, label) => tr(label).to_owned(),
     }
+}
+
+fn draw_update_banner_top(version: &str) {
+    let th = current_theme();
+    Ui::draw_rounded_rect(14.0, 210.0, 372.0, 22.0, 5.0, th.accent);
+    Ui::draw_rounded_rect(15.0, 211.0, 370.0, 20.0, 4.0, th.surface_alt);
+    let msg = i18n::format("Update available: {0}", &[version]);
+    Ui::draw_text(
+        22.0,
+        214.0,
+        0.42,
+        th.accent,
+        &Ui::ellipsize(&msg, 0.42, 260.0),
+    );
+    Ui::draw_text_right(378.0, 214.0, 0.38, th.text_muted, tr("[Y] Dismiss"));
+}
+
+fn draw_update_badge_bottom(version: &str) {
+    let th = current_theme();
+    Ui::draw_rounded_rect(10.0, 204.0, 292.0, 22.0, 5.0, th.accent);
+    Ui::draw_rounded_rect(11.0, 205.0, 290.0, 20.0, 4.0, th.surface_alt);
+    let msg = i18n::format("Update available: {0}", &[version]);
+    Ui::draw_text(
+        18.0,
+        208.0,
+        0.42,
+        th.accent,
+        &Ui::ellipsize(&msg, 0.42, 250.0),
+    );
+    Ui::draw_text_right(294.0, 208.0, 0.42, th.text_muted, "×");
 }
 
 fn media_sync_label(media_running: bool, media_files: usize, media_status: Option<&str>) -> String {
@@ -2397,6 +2455,12 @@ fn main() {
     let mut clock_auto_done = clock::is_known() && !clock::needs_refresh();
     let mut next_clock_check = Instant::now();
     let mut clock_connected = false;
+    let mut update_job: Option<update::Job> = None;
+    let mut update_checked = false;
+    let mut update_manual = false;
+    let mut update_available: Option<String> = None;
+    let mut update_dismissed = false;
+    let mut update_status: Option<String> = None;
     let mut backend = if startup_error.is_some() {
         None
     } else {
@@ -2547,6 +2611,7 @@ fn main() {
         clock_connected = connected;
         if !clock_auto_done
             && clock_job.is_none()
+            && update_job.is_none()
             && job.is_none()
             && media_job.is_none()
             && screen_is_startup_or_decks(&screen)
@@ -2562,6 +2627,55 @@ fn main() {
                     event("CLOCK_AUTO_START");
                 }
                 Err(error) => event(&format!("CLOCK_AUTO_ERROR {error}")),
+            }
+        }
+        if let Some(result) = update_job.as_mut().and_then(update::Job::poll) {
+            update_job = None;
+            let manual = update_manual;
+            update_manual = false;
+            match result {
+                Ok(update::Outcome::Available(version)) => {
+                    event(&format!("UPDATE_AVAILABLE {version}"));
+                    update_status = Some(i18n::format("Update available: {0}", &[&version]));
+                    update_available = Some(version);
+                    update_dismissed = false;
+                }
+                Ok(update::Outcome::UpToDate) => {
+                    event("UPDATE_UP_TO_DATE");
+                    update_available = None;
+                    if manual {
+                        update_status = Some(i18n::format(
+                            "Up to date (v{0})",
+                            &[update::CURRENT_VERSION],
+                        ));
+                    }
+                }
+                Err(error) => {
+                    event(&format!("UPDATE_CHECK_ERROR {error}"));
+                    if manual {
+                        update_status = Some(i18n::format("Update check failed: {0}", &[&error]));
+                    }
+                }
+            }
+        }
+        if i18n::check_updates()
+            && !update_checked
+            && update_job.is_none()
+            && clock_job.is_none()
+            && job.is_none()
+            && media_job.is_none()
+            && screen_is_startup_or_decks(&screen)
+            && connected
+            && frame >= 90
+        {
+            update_checked = true;
+            match update::Job::start() {
+                Ok(worker) => {
+                    update_job = Some(worker);
+                    update_manual = false;
+                    event("UPDATE_CHECK_AUTO_START");
+                }
+                Err(error) => event(&format!("UPDATE_CHECK_ERROR {error}")),
             }
         }
         if let Some(done) = job.as_mut().and_then(sync::Job::poll) {
@@ -2762,6 +2876,14 @@ fn main() {
             Action::Search
         } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::Y) {
             Action::Left
+        } else if matches!(
+            screen,
+            Screen::Decks | Screen::Settings { .. } | Screen::SettingsCategory { .. }
+        ) && update_available.is_some()
+            && !update_dismissed
+            && down.contains(KeyPad::Y)
+        {
+            Action::DismissUpdate
         } else if matches!(screen, Screen::SettingsToolbar { .. }) && down.contains(KeyPad::X) {
             Action::Right
         } else if matches!(screen, Screen::Stats { .. }) && down.contains(KeyPad::L) {
@@ -2996,6 +3118,12 @@ fn main() {
                     if let Some(index) = list_hit(x, y, start, SettingsCategory::ALL.len()) {
                         *selected = index;
                         Action::Primary
+                    } else if update_available.is_some()
+                        && !update_dismissed
+                        && (10.0..302.0).contains(&x)
+                        && (204.0..228.0).contains(&y)
+                    {
+                        Action::DismissUpdate
                     } else {
                         Action::None
                     }
@@ -3176,6 +3304,7 @@ fn main() {
                     "LANGUAGE" => Action::Language,
                     "UNDO" => Action::Undo,
                     "CLOCK" => Action::Clock,
+                    "CHECK_UPDATES" => Action::CheckUpdates,
                     "EXIT" => Action::Exit,
                     "UP" => Action::Up,
                     "DOWN" => Action::Down,
@@ -3426,6 +3555,11 @@ fn main() {
                                         };
                                     }
                                 } else {
+                                    if let Some(active) = update_job.take() {
+                                        active.cancel();
+                                        drop(active);
+                                        update_manual = false;
+                                    }
                                     let priority = backend
                                         .as_mut()
                                         .map(|active| active.priority_media(200))
@@ -4005,6 +4139,11 @@ fn main() {
                 action = Action::Clock;
             }
             if matches!(action, Action::Sync | Action::Login) || full_mode.is_some() {
+                if let Some(active) = update_job.take() {
+                    active.cancel();
+                    drop(active);
+                    update_manual = false;
+                }
                 if !clock::connected_now() {
                     event("WIFI_DISABLED sync");
                     let previous = std::mem::replace(&mut screen, Screen::Decks);
@@ -4169,6 +4308,11 @@ fn main() {
                         .set_language(card)?;
                 }
                 Action::Clock => {
+                    if let Some(active) = update_job.take() {
+                        active.cancel();
+                        drop(active);
+                        update_manual = false;
+                    }
                     if !clock::connected_now() {
                         event("WIFI_DISABLED clock");
                         let previous = std::mem::replace(&mut screen, Screen::Decks);
@@ -5027,6 +5171,49 @@ fn main() {
                         card_scroll = 0;
                     }
                 }
+                Action::CheckUpdates => {
+                    if update_job.is_some() {
+                        return Ok(());
+                    }
+                    if !clock::connected_now() {
+                        event("WIFI_DISABLED update_check");
+                        let previous = std::mem::replace(&mut screen, Screen::Decks);
+                        screen = Screen::Info {
+                            title: tr("Wi-Fi disabled").into(),
+                            text: wifi_disabled_message(),
+                            previous: Box::new(previous),
+                        };
+                        return Ok(());
+                    }
+                    if job.is_some()
+                        || clock_job.is_some()
+                        || media_job
+                            .as_ref()
+                            .is_some_and(media_sync::MediaSync::is_running)
+                    {
+                        update_status =
+                            Some(tr("Media sync is running. Try again when it finishes.").into());
+                        return Ok(());
+                    }
+                    update_checked = true;
+                    match update::Job::start() {
+                        Ok(worker) => {
+                            update_job = Some(worker);
+                            update_manual = true;
+                            update_status = Some(tr("Checking for updates...").into());
+                            event("UPDATE_CHECK_MANUAL_START");
+                        }
+                        Err(error) => {
+                            event(&format!("UPDATE_CHECK_ERROR {error}"));
+                            update_status =
+                                Some(i18n::format("Update check failed: {0}", &[&error]));
+                        }
+                    }
+                }
+                Action::DismissUpdate => {
+                    update_dismissed = true;
+                    event("UPDATE_DISMISSED");
+                }
                 Action::None
                 | Action::Menu
                 | Action::MediaSync
@@ -5423,6 +5610,7 @@ fn main() {
                 top_layout.draw(&text, 360.0, 200.0, 60.0, 8, 0);
             }
             Screen::Decks => {
+                let show_update = update_available.as_deref().filter(|_| !update_dismissed);
                 Ui::draw_text_centered(200.0, 32.0, 0.65, current_theme().text, tr("Decks"));
                 Ui::draw_line(20.0, 60.0, 380.0, 60.0, 1.0, current_theme().border);
                 if let Some(deck) = decks.get(selected) {
@@ -5443,10 +5631,12 @@ fn main() {
                         &deck.name,
                     );
                     counts(deck.new_count, deck.learn_count, deck.review_count, 136.0);
+                    let daily_y = if show_update.is_some() { 168.0 } else { 176.0 };
+                    let due_y = if show_update.is_some() { 186.0 } else { 194.0 };
                     if !daily_studied.is_empty() {
                         Ui::fit_text(
                             200.0,
-                            176.0,
+                            daily_y,
                             0.40,
                             360.0,
                             current_theme().text_muted,
@@ -5456,7 +5646,7 @@ fn main() {
                     let due = deck.new_count + deck.learn_count + deck.review_count;
                     Ui::fit_text(
                         200.0,
-                        194.0,
+                        due_y,
                         0.44,
                         360.0,
                         current_theme().text,
@@ -5470,6 +5660,9 @@ fn main() {
                         current_theme().text,
                         tr("No decks"),
                     );
+                }
+                if let Some(version) = show_update {
+                    draw_update_banner_top(version);
                 }
             }
             Screen::Question { card, .. } | Screen::Answer { card, .. } => {
@@ -5612,6 +5805,16 @@ fn main() {
                     current_theme().text_muted,
                     tr("Choose a category. B returns."),
                 );
+                Ui::draw_text_centered(
+                    200.0,
+                    148.0,
+                    0.40,
+                    current_theme().text_faint,
+                    &format!("Anki 3DS v{}", update::CURRENT_VERSION),
+                );
+                if let Some(version) = update_available.as_deref().filter(|_| !update_dismissed) {
+                    draw_update_banner_top(version);
+                }
             }
             Screen::SettingsCategory {
                 category, selected, ..
@@ -5642,6 +5845,23 @@ fn main() {
                         current_theme().text_faint,
                         tr("A opens or changes. B returns."),
                     );
+                    if *category == SettingsCategory::Network {
+                        if let Some(status) = update_status.as_deref() {
+                            Ui::fit_text(
+                                200.0,
+                                168.0,
+                                0.44,
+                                360.0,
+                                current_theme().accent,
+                                status,
+                            );
+                        }
+                    }
+                    if let Some(version) =
+                        update_available.as_deref().filter(|_| !update_dismissed)
+                    {
+                        draw_update_banner_top(version);
+                    }
                 }
             }
             Screen::SettingsButton { action, .. } => {
@@ -6135,6 +6355,9 @@ fn main() {
                         false,
                     );
                 }
+                if let Some(version) = update_available.as_deref().filter(|_| !update_dismissed) {
+                    draw_update_badge_bottom(version);
+                }
             }
             Screen::SettingsCategory {
                 category, selected, ..
@@ -6159,8 +6382,15 @@ fn main() {
                 {
                     let (x, y) = settings_tile(index - start);
                     let style = if index == *selected { 0 } else { 6 };
-                    let label =
-                        settings_item_label(*item, media_running, media_files, media_status);
+                    let label = settings_item_label(
+                        *item,
+                        media_running,
+                        media_files,
+                        media_status,
+                        update_job.is_some(),
+                        update_available.as_deref(),
+                        update_status.as_deref(),
+                    );
                     let label = Ui::ellipsize(&label, 0.50, SETTINGS_TILE_W - 12.0);
                     Ui::draw_button(
                         x,
@@ -6474,6 +6704,7 @@ fn main() {
             backend = done.backend;
         }
     }
+    drop(update_job);
     drop(clock_job);
     drop(media_job.take());
     prefetch.stop();

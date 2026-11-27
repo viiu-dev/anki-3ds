@@ -67,6 +67,7 @@ pub fn init() {
     load_animations();
     load_ui_sfx();
     load_sfx_volume();
+    load_check_updates();
     let saved = fs::read_to_string(PATH)
         .ok()
         .and_then(|text| index_of(text.trim()));
@@ -992,6 +993,23 @@ fn load_sfx_volume() {
         .unwrap_or(2)
         .min(SFX_VOLUMES.len() as u64 - 1);
     SFX_VOLUME.store(value as u8, Ordering::Relaxed);
+}
+
+static CHECK_UPDATES: AtomicBool = AtomicBool::new(true);
+
+pub fn check_updates() -> bool {
+    CHECK_UPDATES.load(Ordering::Relaxed)
+}
+
+pub fn toggle_check_updates() -> io::Result<bool> {
+    let value = !check_updates();
+    write_setting("check_updates", serde_json::json!(value))?;
+    CHECK_UPDATES.store(value, Ordering::Relaxed);
+    Ok(value)
+}
+
+fn load_check_updates() {
+    load_bool_setting("check_updates", &CHECK_UPDATES);
 }
 
 pub fn tr(message: &'static str) -> &'static str {

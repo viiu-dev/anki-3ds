@@ -141,6 +141,7 @@ struct TransferContext<'a> {
         >,
     >,
     body: Vec<u8>,
+    max_bytes: usize,
     write_error: Option<&'static str>,
 }
 extern "C" fn check_cancel(context: *mut std::ffi::c_void) -> i32 {
@@ -178,13 +179,13 @@ extern "C" fn write_body_chunk(
     if len == 0 {
         return 0;
     }
-    if len > MAX_RESPONSE_BYTES.saturating_sub(context.body.len()) {
-        context.write_error = Some("response exceeds 8 MiB buffer budget");
+    if len > context.max_bytes.saturating_sub(context.body.len()) {
+        context.write_error = Some("response exceeds buffer budget");
         return -1;
     }
     if context.body.is_empty()
         && content_length_hint > len
-        && content_length_hint <= MAX_RESPONSE_BYTES
+        && content_length_hint <= context.max_bytes
     {
         let _ = context.body.try_reserve_exact(content_length_hint);
     }
@@ -205,6 +206,17 @@ extern "C" {
         header_anki_sync: *const std::os::raw::c_char,
         body: *const u8,
         body_len: usize,
+        timeout_ms: u32,
+        connect_timeout_ms: u32,
+        options: *const RequestOptions,
+        out_resp: *mut RawHttpResponse,
+    ) -> std::os::raw::c_int;
+
+    fn anki_3ds_https_get(
+        slot: std::os::raw::c_int,
+        host: *const std::os::raw::c_char,
+        path: *const std::os::raw::c_char,
+        accept_header: *const std::os::raw::c_char,
         timeout_ms: u32,
         connect_timeout_ms: u32,
         options: *const RequestOptions,
@@ -383,6 +395,130 @@ impl NativeSyncClient {
         self.transfer(path, header_json, compressed_body, None, None, None)
     }
 
+    pub fn https_get(
+        &self,
+        host: &str,
+        path: &str,
+        accept: &str,
+        max_bytes: usize,
+    ) -> Result<HttpResponse, SyncTransportError> {
+        if host.is_empty()
+            || !path.starts_with('/')
+            || host
+                .bytes()
+                .any(|b| b < 0x21 || b == 0x7f || matches!(b, b'@' | b'/' | b':'))
+            || path.bytes().any(|b| b < 0x21 || b == 0x7f)
+            || accept.bytes().any(|b| b < 0x20 || b == 0x7f)
+            || self.ca_file.is_empty()
+            || self.ca_file.bytes().any(|b| b == 0)
+        {
+            return Err(SyncTransportError::Serialization(
+                "invalid HTTPS GET parameters".into(),
+            ));
+        }
+        let max_bytes = max_bytes.clamp(1024, MAX_RESPONSE_BYTES);
+        let c_host =
+            CString::new(host).map_err(|e| SyncTransportError::Serialization(e.to_string()))?;
+        let c_path =
+            CString::new(path).map_err(|e| SyncTransportError::Serialization(e.to_string()))?;
+        let c_accept =
+            CString::new(accept).map_err(|e| SyncTransportError::Serialization(e.to_string()))?;
+        let ca = CString::new(self.ca_file.as_str())
+            .map_err(|e| SyncTransportError::Serialization(e.to_string()))?;
+
+        let mut context = TransferContext {
+            cancel: &self.cancel,
+            progress: None,
+            body: Vec::new(),
+            max_bytes,
+            write_error: None,
+        };
+        let options = RequestOptions {
+            port: 443,
+            ca_file: ca.as_ptr(),
+            upload_file: std::ptr::null(),
+            download_file: std::ptr::null(),
+            max_file_bytes: max_bytes,
+            cancelled: check_cancel,
+            progress: update_progress,
+            write_body: Some(
+                write_body_chunk
+                    as extern "C" fn(*mut std::ffi::c_void, *const u8, usize, usize) -> i32,
+            ),
+            context: &mut context as *mut TransferContext as *mut _,
+        };
+        let mut raw_resp = RawHttpResponse {
+            http_status: 0,
+            curl_code: 0,
+            response_body: std::ptr::null_mut(),
+            response_body_len: 0,
+            error_msg: [0; 256],
+            redirect_url: [0; 512],
+            response_capacity_peak: 0,
+            sampled_heap_peak: 0,
+            server_time: 0,
+            dns_ms: 0,
+            tcp_ms: 0,
+            tls_ms: 0,
+            first_byte_ms: 0,
+            total_ms: 0,
+        };
+
+        let _https = lock_https(self.slot);
+        let rc = unsafe {
+            anki_3ds_https_get(
+                self.slot as std::os::raw::c_int,
+                c_host.as_ptr(),
+                c_path.as_ptr(),
+                c_accept.as_ptr(),
+                self.timeout.as_millis() as u32,
+                self.connect_timeout.as_millis() as u32,
+                &options,
+                &mut raw_resp,
+            )
+        };
+
+        let err_msg = unsafe {
+            CStr::from_ptr(raw_resp.error_msg.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let redirect_url = unsafe {
+            let s = CStr::from_ptr(raw_resp.redirect_url.as_ptr()).to_string_lossy();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.into_owned())
+            }
+        };
+        let server_time = (raw_resp.server_time > 0).then_some(raw_resp.server_time);
+        let status = raw_resp.http_status as u16;
+        let curl_code = raw_resp.curl_code;
+        let write_error = context.write_error;
+        let body_bytes = if rc == 0 {
+            std::mem::take(&mut context.body)
+        } else {
+            Vec::new()
+        };
+
+        unsafe { anki_3ds_http_response_free(&mut raw_resp) };
+
+        if rc != 0 {
+            if let Some(msg) = write_error {
+                return Err(SyncTransportError::Transport(-4, msg.into()));
+            }
+            let code = if curl_code != 0 { curl_code } else { rc };
+            return Err(SyncTransportError::Transport(code, err_msg));
+        }
+
+        Ok(HttpResponse {
+            status,
+            body: body_bytes,
+            redirect_url,
+            server_time,
+        })
+    }
+
     fn transfer(
         &self,
         path: &str,
@@ -496,6 +632,7 @@ impl NativeSyncClient {
             cancel: &self.cancel,
             progress,
             body: Vec::new(),
+            max_bytes: MAX_RESPONSE_BYTES,
             write_error: None,
         };
         let options = RequestOptions {

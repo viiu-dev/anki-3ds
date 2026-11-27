@@ -257,10 +257,12 @@ void anki_3ds_https_cleanup(void) {
 
 static int request_with_ip(
     int slot,
+    bool is_get,
     const char *host,
     const char *ip,
     const char *path,
     const char *header_anki_sync,
+    const char *accept_header,
     const uint8_t *body,
     size_t body_len,
     uint32_t timeout_ms,
@@ -277,6 +279,10 @@ static int request_with_ip(
     }
     if (header_anki_sync && has_ctl_or_space(header_anki_sync, true)) {
         snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "invalid sync header");
+        return -1;
+    }
+    if (accept_header && has_ctl_or_space(accept_header, true)) {
+        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "invalid accept header");
         return -1;
     }
 
@@ -310,13 +316,32 @@ static int request_with_ip(
         snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
         return -4;
     }
-    struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/octet-stream");
-    if (!headers) {
-        curl_slist_free_all(resolve);
-        snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
-        return -4;
+    struct curl_slist *headers = NULL;
+    if (is_get) {
+        if (accept_header && accept_header[0]) {
+            char accept_line[256];
+            int alen = snprintf(accept_line, sizeof(accept_line), "Accept: %s", accept_header);
+            if (alen < 0 || (size_t)alen >= sizeof(accept_line)) {
+                curl_slist_free_all(resolve);
+                snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "accept header too long");
+                return -1;
+            }
+            headers = curl_slist_append(NULL, accept_line);
+            if (!headers) {
+                curl_slist_free_all(resolve);
+                snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
+                return -4;
+            }
+        }
+    } else {
+        headers = curl_slist_append(NULL, "Content-Type: application/octet-stream");
+        if (!headers) {
+            curl_slist_free_all(resolve);
+            snprintf(out_resp->error_msg, sizeof(out_resp->error_msg), "out of memory");
+            return -4;
+        }
     }
-    if (header_anki_sync && header_anki_sync[0]) {
+    if (!is_get && header_anki_sync && header_anki_sync[0]) {
         char sync_hdr_line[1024];
         int hdr_len = snprintf(sync_hdr_line, sizeof(sync_hdr_line), "anki-sync: %s", header_anki_sync);
         if (hdr_len < 0 || (size_t)hdr_len >= sizeof(sync_hdr_line)) {
@@ -426,7 +451,9 @@ static int request_with_ip(
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(easy, CURLOPT_USERAGENT, "Anki3DS/1.1");
 
-    if (upload) {
+    if (is_get) {
+        curl_easy_setopt(easy, CURLOPT_HTTPGET, 1L);
+    } else if (upload) {
         curl_easy_setopt(easy, CURLOPT_POST, 1L);
         curl_easy_setopt(easy, CURLOPT_READDATA, upload);
         curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
@@ -539,11 +566,13 @@ static int request_with_ip(
     return (code == CURLE_OK) ? 0 : (int)code;
 }
 
-int anki_3ds_https_post(
+static int https_request_internal(
     int slot,
+    bool is_get,
     const char *host,
     const char *path,
     const char *header_anki_sync,
+    const char *accept_header,
     const uint8_t *body,
     size_t body_len,
     uint32_t timeout_ms,
@@ -594,10 +623,10 @@ int anki_3ds_https_post(
 
     int result = 0;
     const uint32_t backoff_ms[] = {0, 250, 750, 1500};
-    for (int attempt = 0; attempt < 4; attempt++) {
+    int max_attempts = is_get ? 2 : 4;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
         if (attempt > 0) {
             if (options->upload_file == NULL && options->download_file != NULL) {
-                /* truncate partial download file */
                 FILE *f = fopen(options->download_file, "wb"); if (f) fclose(f);
             }
             if (options->write_body) {
@@ -617,15 +646,49 @@ int anki_3ds_https_post(
             }
             char dns_error[160] = {0};
             if (probe_dns_with_context(host, ip, dns_error, dns_cancel, (void *)options, allow_override) != 0)
-                continue;   /* keep last result, try again */
+                continue;
             dns_cache_store(slot, host, ip);
         }
-        result = request_with_ip(slot, host, ip, path, header_anki_sync, body, body_len,
-                                 timeout_ms, connect_timeout_ms, options, out_resp);
+        result = request_with_ip(slot, is_get, host, ip, path, header_anki_sync, accept_header,
+                                 body, body_len, timeout_ms, connect_timeout_ms, options, out_resp);
         if (result == 0 || !is_transient(result) || out_resp->http_status != 0) break;
     }
     out_resp->total_ms = osGetTime() - started;
     return result;
+}
+
+int anki_3ds_https_post(
+    int slot,
+    const char *host,
+    const char *path,
+    const char *header_anki_sync,
+    const uint8_t *body,
+    size_t body_len,
+    uint32_t timeout_ms,
+    uint32_t connect_timeout_ms,
+    const Anki3dsRequestOptions *options,
+    Anki3dsHttpResponse *out_resp
+) {
+    return https_request_internal(
+        slot, false, host, path, header_anki_sync, NULL, body, body_len,
+        timeout_ms, connect_timeout_ms, options, out_resp
+    );
+}
+
+int anki_3ds_https_get(
+    int slot,
+    const char *host,
+    const char *path,
+    const char *accept_header,
+    uint32_t timeout_ms,
+    uint32_t connect_timeout_ms,
+    const Anki3dsRequestOptions *options,
+    Anki3dsHttpResponse *out_resp
+) {
+    return https_request_internal(
+        slot, true, host, path, NULL, accept_header, NULL, 0,
+        timeout_ms, connect_timeout_ms, options, out_resp
+    );
 }
 
 void anki_3ds_http_response_free(Anki3dsHttpResponse *resp) {

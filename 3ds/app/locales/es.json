@@ -383,5 +383,12 @@
     "Downloading image...": "Descargando imagen...",
     "Loading image...": "Cargando imagen...",
     "Wi-Fi disabled": "Wi-Fi desactivado",
-    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "El Wi-Fi está desactivado o desconectado. Activa la comunicación inalámbrica y conéctate a una red para sincronizar."
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "El Wi-Fi está desactivado o desconectado. Activa la comunicación inalámbrica y conéctate a una red para sincronizar.",
+    "Check for updates: {0}": "Buscar actualizaciones: {0}",
+    "Check now": "Buscar actualizaciones ahora",
+    "Checking for updates...": "Buscando actualizaciones...",
+    "Update available: {0}": "Actualización disponible: {0}",
+    "Up to date (v{0})": "Actualizado (v{0})",
+    "Update check failed: {0}": "Error al buscar actualizaciones: {0}",
+    "[Y] Dismiss": "[Y] Ocultar"
 }

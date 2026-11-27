@@ -63,6 +63,17 @@ int anki_3ds_https_post(
     Anki3dsHttpResponse *out_resp
 );
 
+int anki_3ds_https_get(
+    int slot,
+    const char *host,
+    const char *path,
+    const char *accept_header,
+    uint32_t timeout_ms,
+    uint32_t connect_timeout_ms,
+    const Anki3dsRequestOptions *options,
+    Anki3dsHttpResponse *out_resp
+);
+
 void anki_3ds_http_response_free(Anki3dsHttpResponse *resp);
 
 int anki_3ds_https_global_init(void);

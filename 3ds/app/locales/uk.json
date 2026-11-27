@@ -383,5 +383,12 @@
     "Downloading image...": "Завантаження зображення...",
     "Loading image...": "Завантаження зображення...",
     "Wi-Fi disabled": "Wi-Fi вимкнено",
-    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi вимкнено або немає з'єднання. Увімкніть бездротовий зв'язок і підключіться до мережі для синхронізації."
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "Wi-Fi вимкнено або немає з'єднання. Увімкніть бездротовий зв'язок і підключіться до мережі для синхронізації.",
+    "Check for updates: {0}": "Перевірка оновлень: {0}",
+    "Check now": "Перевірити оновлення",
+    "Checking for updates...": "Перевірка оновлень...",
+    "Update available: {0}": "Доступне оновлення: {0}",
+    "Up to date (v{0})": "Актуальна версія (v{0})",
+    "Update check failed: {0}": "Помилка перевірки: {0}",
+    "[Y] Dismiss": "[Y] Сховати"
 }

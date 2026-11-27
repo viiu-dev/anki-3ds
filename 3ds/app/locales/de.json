@@ -383,5 +383,12 @@
     "Downloading image...": "Bild wird heruntergeladen...",
     "Loading image...": "Bild wird geladen...",
     "Wi-Fi disabled": "WLAN deaktiviert",
-    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "WLAN ist deaktiviert oder getrennt. Aktiviere die drahtlose Verbindung und verbinde dich mit einem Netzwerk zum Synchronisieren."
+    "Wi-Fi is disabled or disconnected. Turn on wireless communication and connect to a network to sync.": "WLAN ist deaktiviert oder getrennt. Aktiviere die drahtlose Verbindung und verbinde dich mit einem Netzwerk zum Synchronisieren.",
+    "Check for updates: {0}": "Nach Updates suchen: {0}",
+    "Check now": "Jetzt nach Updates suchen",
+    "Checking for updates...": "Suche nach Updates...",
+    "Update available: {0}": "Update verfügbar: {0}",
+    "Up to date (v{0})": "Aktuell (v{0})",
+    "Update check failed: {0}": "Update-Prüfung fehlgeschlagen: {0}",
+    "[Y] Dismiss": "[Y] Schließen"
 }
