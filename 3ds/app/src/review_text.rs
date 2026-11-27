@@ -459,7 +459,11 @@ enum PseudoClass {
     FirstChild,
     LastChild,
     OnlyChild,
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
     NthChild(i32, i32),
+    NthOfType(i32, i32),
     Empty,
     Checked,
     Open,
@@ -607,6 +611,7 @@ struct ComputedCss {
     max_width_px: Option<f32>,
     max_height_px: Option<f32>,
     overflow_hidden: bool,
+    clipped_hidden: bool,
     content_tokens: Option<Vec<ContentToken>>,
 }
 
@@ -617,7 +622,9 @@ struct ElementInfo {
     classes: Vec<String>,
     attrs: Vec<(String, String)>,
     nth_child: usize,
+    nth_of_type: usize,
     is_last_child: bool,
+    is_last_of_type: bool,
     is_empty: bool,
     prev_siblings: Vec<SiblingInfo>,
 }
@@ -628,6 +635,9 @@ struct SiblingInfo {
     id: Option<String>,
     classes: Vec<String>,
     attrs: Vec<(String, String)>,
+    nth_child: usize,
+    nth_of_type: usize,
+    is_empty: bool,
 }
 
 impl Stylesheet {
@@ -671,7 +681,9 @@ impl Stylesheet {
                 if dark_mode { "dark" } else { "light" }.into(),
             )],
             nth_child: 1,
+            nth_of_type: 1,
             is_last_child: true,
+            is_last_of_type: true,
             is_empty: false,
             prev_siblings: Vec::new(),
         };
@@ -1427,7 +1439,11 @@ fn compound_specificity(c: &CompoundSelector) -> (u16, u16, u16) {
 
 fn compound_needs_lookahead(c: &CompoundSelector) -> bool {
     c.pseudos.iter().any(|p| match p {
-        PseudoClass::LastChild | PseudoClass::OnlyChild | PseudoClass::Empty => true,
+        PseudoClass::LastChild
+        | PseudoClass::OnlyChild
+        | PseudoClass::LastOfType
+        | PseudoClass::OnlyOfType
+        | PseudoClass::Empty => true,
         PseudoClass::Not(list) | PseudoClass::Is(list) | PseudoClass::Where(list) => {
             list.iter().any(compound_needs_lookahead)
         }
@@ -1534,12 +1550,20 @@ fn parse_compound_selector<'a>(
                             sel.tag = Some("html".into());
                         }
                     }
-                    "first-child" | "first-of-type" => sel.pseudos.push(PseudoClass::FirstChild),
-                    "last-child" | "last-of-type" => sel.pseudos.push(PseudoClass::LastChild),
+                    "first-child" => sel.pseudos.push(PseudoClass::FirstChild),
+                    "first-of-type" => sel.pseudos.push(PseudoClass::FirstOfType),
+                    "last-child" => sel.pseudos.push(PseudoClass::LastChild),
+                    "last-of-type" => sel.pseudos.push(PseudoClass::LastOfType),
                     "only-child" => sel.pseudos.push(PseudoClass::OnlyChild),
+                    "only-of-type" => sel.pseudos.push(PseudoClass::OnlyOfType),
                     "nth-child" => {
                         if let Some((a, b)) = arg.and_then(parse_nth) {
                             sel.pseudos.push(PseudoClass::NthChild(a, b));
+                        }
+                    }
+                    "nth-of-type" => {
+                        if let Some((a, b)) = arg.and_then(parse_nth) {
+                            sel.pseudos.push(PseudoClass::NthOfType(a, b));
                         }
                     }
                     "not" | "is" | "where" => {
@@ -1697,6 +1721,14 @@ fn parse_nth(expr: &str) -> Option<(i32, i32)> {
     }
 }
 
+fn nth_matches(idx: i32, a: i32, b: i32) -> bool {
+    if a == 0 {
+        idx == b
+    } else {
+        (idx - b) % a == 0 && (idx - b) / a >= 0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compound_matches(
     sel: &CompoundSelector,
@@ -1705,7 +1737,9 @@ fn compound_matches(
     classes: &[String],
     attrs: &[(String, String)],
     nth_child: usize,
+    nth_of_type: usize,
     is_last_child: bool,
+    is_last_of_type: bool,
     is_empty: bool,
 ) -> bool {
     if let Some(req_tag) = &sel.tag {
@@ -1763,14 +1797,28 @@ fn compound_matches(
                     return false;
                 }
             }
+            PseudoClass::FirstOfType => {
+                if nth_of_type != 1 {
+                    return false;
+                }
+            }
+            PseudoClass::LastOfType => {
+                if !is_last_of_type {
+                    return false;
+                }
+            }
+            PseudoClass::OnlyOfType => {
+                if nth_of_type != 1 || !is_last_of_type {
+                    return false;
+                }
+            }
             PseudoClass::NthChild(a, b) => {
-                let idx = nth_child as i32;
-                let ok = if *a == 0 {
-                    idx == *b
-                } else {
-                    (idx - *b) % *a == 0 && (idx - *b) / *a >= 0
-                };
-                if !ok {
+                if !nth_matches(nth_child as i32, *a, *b) {
+                    return false;
+                }
+            }
+            PseudoClass::NthOfType(a, b) => {
+                if !nth_matches(nth_of_type as i32, *a, *b) {
                     return false;
                 }
             }
@@ -1798,7 +1846,9 @@ fn compound_matches(
                         classes,
                         attrs,
                         nth_child,
+                        nth_of_type,
                         is_last_child,
+                        is_last_of_type,
                         is_empty,
                     )
                 }) {
@@ -1814,7 +1864,9 @@ fn compound_matches(
                         classes,
                         attrs,
                         nth_child,
+                        nth_of_type,
                         is_last_child,
+                        is_last_of_type,
                         is_empty,
                     )
                 }) {
@@ -1860,8 +1912,18 @@ fn implicit_root_matches(sel: &CompoundSelector, dark_mode: bool) -> bool {
 fn selector_matches_root_only(sel: &Selector, root: &ElementInfo, dark_mode: bool) -> bool {
     if sel.steps.len() == 1 {
         let c = &sel.steps[0].compound;
-        return compound_matches(c, &root.tag, None, &root.classes, &root.attrs, 1, true, false)
-            || implicit_root_matches(c, dark_mode);
+        return compound_matches(
+            c,
+            &root.tag,
+            None,
+            &root.classes,
+            &root.attrs,
+            1,
+            1,
+            true,
+            true,
+            false,
+        ) || implicit_root_matches(c, dark_mode);
     }
     if sel.steps.len() == 2 {
         return implicit_root_matches(&sel.steps[1].compound, dark_mode)
@@ -1886,7 +1948,9 @@ fn selector_matches(
         &elem.classes,
         &elem.attrs,
         elem.nth_child,
+        elem.nth_of_type,
         elem.is_last_child,
+        elem.is_last_of_type,
         elem.is_empty,
     ) {
         return false;
@@ -1925,7 +1989,9 @@ fn match_chain(
                     &parent.info.classes,
                     &parent.info.attrs,
                     parent.info.nth_child,
+                    parent.info.nth_of_type,
                     parent.info.is_last_child,
+                    parent.info.is_last_of_type,
                     parent.info.is_empty,
                 ) {
                     return match_chain(
@@ -1953,7 +2019,9 @@ fn match_chain(
                     &anc.info.classes,
                     &anc.info.attrs,
                     anc.info.nth_child,
+                    anc.info.nth_of_type,
                     anc.info.is_last_child,
+                    anc.info.is_last_of_type,
                     anc.info.is_empty,
                 ) && match_chain(
                     steps,
@@ -1975,9 +2043,11 @@ fn match_chain(
                     prev.id.as_deref(),
                     &prev.classes,
                     &prev.attrs,
-                    1,
+                    prev.nth_child,
+                    prev.nth_of_type,
                     false,
                     false,
+                    prev.is_empty,
                 ) {
                     return match_chain(steps, step_idx + 1, ancestors, rest_sibs, dark_mode);
                 }
@@ -1993,9 +2063,11 @@ fn match_chain(
                     prev.id.as_deref(),
                     &prev.classes,
                     &prev.attrs,
-                    1,
+                    prev.nth_child,
+                    prev.nth_of_type,
                     false,
                     false,
+                    prev.is_empty,
                 ) && match_chain(
                     steps,
                     step_idx + 1,
@@ -2108,6 +2180,11 @@ fn apply_css_decl(
         "overflow" | "overflow-y" | "overflow-x" => {
             if lower.contains("hidden") || lower.contains("clip") {
                 css.overflow_hidden = true;
+            }
+        }
+        "clip" | "clip-path" => {
+            if lower.contains("rect(0") || lower.contains("inset(50%") || lower.contains("inset(100%") {
+                css.clipped_hidden = true;
             }
         }
         "width" => css.width_px = parse_px_len(&lower),
@@ -3044,7 +3121,395 @@ fn parse_blocks_with_sheet(html: &str, sheet: &Stylesheet, dark_mode: bool) -> V
         parser.handle_text(&html[position..]);
     }
     parser.finish();
+    deduplicate_blocks(&mut parser.blocks);
     parser.blocks
+}
+
+fn push_norm_words(out: &mut String, text: &str) {
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+}
+
+fn push_norm_token(out: &mut String, prefix: &str, value: &str) {
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push('\u{1f}');
+    out.push_str(prefix);
+    out.push(':');
+    out.push_str(value);
+}
+
+fn inlines_norm_text(inlines: &[Inline], out: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text { text, .. } => push_norm_words(out, text),
+            Inline::Ruby { base, .. } | Inline::PitchWord { base, .. } => {
+                push_norm_words(out, base);
+            }
+            Inline::Marker(_) | Inline::Break => {}
+            Inline::TypeInput => push_norm_token(out, "type", ""),
+            Inline::HintToggle { label, .. } => push_norm_token(out, "hint", label),
+            Inline::Media { path, .. } => push_norm_token(out, "media", path),
+            Inline::Image { src, .. } => push_norm_token(out, "img", src),
+        }
+    }
+}
+
+fn block_norm_text(block: &Block) -> String {
+    let mut out = String::new();
+    match block {
+        Block::Paragraph(inlines)
+        | Block::Section(inlines)
+        | Block::ListItem { content: inlines, .. } => {
+            inlines_norm_text(inlines, &mut out);
+        }
+        Block::Rule | Block::Hint { .. } => {}
+        Block::Code { text } => push_norm_words(&mut out, text),
+        Block::Table { rows } => {
+            for row in rows {
+                for cell in row {
+                    inlines_norm_text(&cell.content, &mut out);
+                }
+            }
+        }
+        Block::Quote(content) | Block::Callout { content, .. } => {
+            for child in content {
+                let piece = block_norm_text(child);
+                if !piece.is_empty() {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&piece);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn blocks_norm_text(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        let piece = block_norm_text(block);
+        if !piece.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&piece);
+        }
+    }
+    out
+}
+
+fn substantial_text_chars(norm: &str) -> usize {
+    norm.split(' ')
+        .filter(|tok| !tok.is_empty() && !tok.starts_with('\u{1f}'))
+        .map(|tok| tok.chars().count())
+        .sum()
+}
+
+fn is_short_divider(block: &Block, norm: &str) -> bool {
+    match block {
+        Block::Rule => true,
+        Block::Paragraph(inlines)
+        | Block::Section(inlines)
+        | Block::ListItem { content: inlines, .. } => {
+            let has_special = inlines.iter().any(|i| {
+                matches!(
+                    i,
+                    Inline::Image { .. }
+                        | Inline::Media { .. }
+                        | Inline::TypeInput
+                        | Inline::HintToggle { .. }
+                )
+            });
+            !has_special && substantial_text_chars(norm) <= 24
+        }
+        _ => false,
+    }
+}
+
+fn slice_equals_joined(norms: &[String], target: &str) -> bool {
+    let mut rest = target;
+    let mut first = true;
+    for s in norms {
+        if s.is_empty() {
+            continue;
+        }
+        if !first {
+            let Some(after_space) = rest.strip_prefix(' ') else {
+                return false;
+            };
+            rest = after_space;
+        }
+        first = false;
+        let Some(after) = rest.strip_prefix(s.as_str()) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
+}
+
+fn find_matching_slice(blocks: &[Block], norms: &[String], target: &str) -> Option<(usize, usize)> {
+    let target_len = target.len();
+    if target_len == 0 {
+        return None;
+    }
+    for a in 0..norms.len() {
+        if norms[a].is_empty() || matches!(blocks[a], Block::Hint { .. }) {
+            continue;
+        }
+        let mut acc_len = 0usize;
+        let mut non_empty = 0usize;
+        for b in a..norms.len() {
+            if matches!(blocks[b], Block::Hint { .. }) {
+                break;
+            }
+            if !norms[b].is_empty() {
+                if non_empty > 0 {
+                    acc_len += 1;
+                }
+                acc_len += norms[b].len();
+                non_empty += 1;
+            }
+            if acc_len > target_len {
+                break;
+            }
+            if acc_len == target_len && !norms[b].is_empty() && slice_equals_joined(&norms[a..=b], target) {
+                return Some((a, b + 1));
+            }
+        }
+    }
+    None
+}
+
+fn trim_stray_rules(blocks: &mut Vec<Block>) {
+    while matches!(blocks.first(), Some(Block::Rule)) {
+        blocks.remove(0);
+    }
+    while matches!(blocks.last(), Some(Block::Rule)) {
+        blocks.pop();
+    }
+    let mut i = 1;
+    while i < blocks.len() {
+        if matches!(blocks[i], Block::Rule) && matches!(blocks[i - 1], Block::Rule) {
+            blocks.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn container_children(block: &Block) -> Option<&[Block]> {
+    match block {
+        Block::Callout { content, .. } | Block::Quote(content) => Some(content),
+        _ => None,
+    }
+}
+
+fn container_children_mut(block: &mut Block) -> Option<&mut Vec<Block>> {
+    match block {
+        Block::Callout { content, .. } | Block::Quote(content) => Some(content),
+        _ => None,
+    }
+}
+
+fn deduplicate_blocks(blocks: &mut Vec<Block>) {
+    for block in blocks.iter_mut() {
+        match block {
+            Block::Callout { content, .. }
+            | Block::Quote(content)
+            | Block::Hint { content, .. } => deduplicate_blocks(content),
+            _ => {}
+        }
+    }
+    if blocks.len() < 2 {
+        return;
+    }
+
+    let mut norms: Vec<String> = blocks.iter().map(block_norm_text).collect();
+    let mut removed_any = false;
+
+    let mut i = 0;
+    while i < blocks.len() {
+        if norms[i].is_empty() || matches!(blocks[i], Block::Hint { .. }) {
+            i += 1;
+            continue;
+        }
+        let max_len = (blocks.len() - i) / 2;
+        let mut matched = false;
+        for len in (1..=max_len).rev() {
+            if norms[i + len - 1].is_empty()
+                || blocks[i..i + len]
+                    .iter()
+                    .any(|b| matches!(b, Block::Hint { .. }))
+            {
+                continue;
+            }
+            let total_chars: usize = norms[i..i + len]
+                .iter()
+                .map(|s| substantial_text_chars(s))
+                .sum();
+            let min_chars = if len >= 2 { 20 } else { 30 };
+            if total_chars < min_chars {
+                continue;
+            }
+            let adjacent_match = norms[i..i + len] == norms[i + len..i + 2 * len]
+                && !blocks[i + len..i + 2 * len]
+                    .iter()
+                    .any(|b| matches!(b, Block::Hint { .. }));
+            let divider_match = !adjacent_match
+                && i + 2 * len + 1 <= blocks.len()
+                && is_short_divider(&blocks[i + len], &norms[i + len])
+                && norms[i..i + len] == norms[i + len + 1..i + 2 * len + 1]
+                && !blocks[i + len + 1..i + 2 * len + 1]
+                    .iter()
+                    .any(|b| matches!(b, Block::Hint { .. }));
+            if adjacent_match {
+                blocks.drain(i + len..i + 2 * len);
+                norms.drain(i + len..i + 2 * len);
+                removed_any = true;
+                matched = true;
+                break;
+            } else if divider_match {
+                let remove_divider = matches!(blocks[i + len], Block::Rule)
+                    || i + 2 * len + 1 == blocks.len();
+                let start = if remove_divider { i + len } else { i + len + 1 };
+                blocks.drain(start..i + 2 * len + 1);
+                norms.drain(start..i + 2 * len + 1);
+                removed_any = true;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            i += 1;
+        }
+    }
+
+    let mut seen_full: Vec<String> = Vec::new();
+    let mut idx = 0;
+    while idx < blocks.len() {
+        if container_children(&blocks[idx]).is_some() {
+            let mut stripped_from_self = false;
+            let mut drop_self = false;
+            let mut matched_prev_full: Option<String> = None;
+
+            for prev in &seen_full {
+                let Some(children) = container_children_mut(&mut blocks[idx]) else {
+                    break;
+                };
+                let child_norms: Vec<String> = children.iter().map(block_norm_text).collect();
+                if let Some((a, b)) = find_matching_slice(children, &child_norms, prev) {
+                    children.drain(a..b);
+                    trim_stray_rules(children);
+                    stripped_from_self = true;
+                    matched_prev_full = Some(prev.clone());
+                }
+            }
+
+            if stripped_from_self {
+                removed_any = true;
+                let remaining = blocks_norm_text(container_children(&blocks[idx]).unwrap_or(&[]));
+                if remaining.is_empty() {
+                    drop_self = true;
+                } else if let Some(ref prev) = matched_prev_full {
+                    let rem_chars = substantial_text_chars(&remaining);
+                    if rem_chars <= 32
+                        && container_children(&blocks[idx]).is_some_and(|c| c.len() == 1)
+                        && prev
+                            .to_ascii_lowercase()
+                            .contains(&remaining.to_ascii_lowercase())
+                    {
+                        drop_self = true;
+                    }
+                }
+                norms[idx] = remaining;
+            }
+
+            if !drop_self && substantial_text_chars(&norms[idx]) >= 30 {
+                let cur = &norms[idx];
+                if seen_full.iter().any(|prev| prev == cur) {
+                    drop_self = true;
+                } else if find_matching_slice(&blocks[..idx], &norms[..idx], cur).is_some() {
+                    drop_self = true;
+                } else {
+                    for prev_block in &blocks[..idx] {
+                        if let Some(prev_children) = container_children(prev_block) {
+                            let prev_norms: Vec<String> =
+                                prev_children.iter().map(block_norm_text).collect();
+                            if find_matching_slice(prev_children, &prev_norms, cur).is_some() {
+                                drop_self = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if drop_self {
+                blocks.remove(idx);
+                norms.remove(idx);
+                removed_any = true;
+                continue;
+            }
+
+            if substantial_text_chars(&norms[idx]) >= 30 {
+                seen_full.push(norms[idx].clone());
+            }
+            idx += 1;
+        } else if !norms[idx].is_empty() && !matches!(blocks[idx], Block::Hint { .. }) {
+            let mut removed_run = false;
+            for prev in &seen_full {
+                let target_len = prev.len();
+                let mut acc_len = 0usize;
+                let mut non_empty = 0usize;
+                for b in idx..blocks.len() {
+                    if matches!(blocks[b], Block::Hint { .. }) || container_children(&blocks[b]).is_some() {
+                        break;
+                    }
+                    if !norms[b].is_empty() {
+                        if non_empty > 0 {
+                            acc_len += 1;
+                        }
+                        acc_len += norms[b].len();
+                        non_empty += 1;
+                    }
+                    if acc_len > target_len {
+                        break;
+                    }
+                    if acc_len == target_len
+                        && !norms[b].is_empty()
+                        && slice_equals_joined(&norms[idx..=b], prev)
+                    {
+                        blocks.drain(idx..=b);
+                        norms.drain(idx..=b);
+                        removed_any = true;
+                        removed_run = true;
+                        break;
+                    }
+                }
+                if removed_run {
+                    break;
+                }
+            }
+            if !removed_run {
+                idx += 1;
+            }
+        } else {
+            idx += 1;
+        }
+    }
+
+    if removed_any {
+        trim_stray_rules(blocks);
+    }
 }
 
 fn tag_end(text: &str) -> Option<usize> {
@@ -3476,11 +3941,14 @@ impl<'a> Parser<'a> {
         let css_hidden = css.display == Some(CssDisplay::None)
             || css.visibility_hidden == Some(true)
             || css.opacity_zero
+            || css.clipped_hidden
             || (css.display != Some(CssDisplay::Inline)
                 && css.pos_abs != Some(true)
                 && css.overflow_hidden
                 && (css.max_height_px.is_some_and(|h| h <= 0.5)
-                    || css.height_px.is_some_and(|h| h <= 0.5)));
+                    || css.height_px.is_some_and(|h| h <= 0.5)
+                    || css.max_width_px.is_some_and(|w| w <= 0.5)
+                    || css.width_px.is_some_and(|w| w <= 0.5)));
 
         if css_hidden || (attr_hidden && css.display.is_none()) {
             self.var_scope.truncate(vars_len);
@@ -3972,13 +4440,20 @@ impl<'a> Parser<'a> {
             self.root_child_count += 1;
             (self.root_child_count, self.root_prev_siblings.clone())
         };
-        let (is_empty, is_last_child) = if self.sheet.needs_lookahead {
+        let nth_of_type = prev_siblings
+            .iter()
+            .filter(|sib| sib.tag.eq_ignore_ascii_case(name))
+            .count()
+            + 1;
+        let (is_empty, is_last_child, is_last_of_type) = if self.sheet.needs_lookahead {
+            let (last_child, last_of_type) = peek_sibling_info(after_tag, name, self_closing);
             (
                 peek_element_is_empty(after_tag, name, self_closing),
-                peek_element_is_last_child(after_tag, name, self_closing),
+                last_child,
+                last_of_type,
             )
         } else {
-            (self_closing, false)
+            (self_closing, false, false)
         };
         let id = attribute(attributes, "id").map(str::to_owned);
         let classes = attribute(attributes, "class")
@@ -3990,7 +4465,9 @@ impl<'a> Parser<'a> {
             classes,
             attrs: attributes.to_vec(),
             nth_child,
+            nth_of_type,
             is_last_child,
+            is_last_of_type,
             is_empty,
             prev_siblings,
         }
@@ -4002,6 +4479,9 @@ impl<'a> Parser<'a> {
             id: info.id.clone(),
             classes: info.classes.clone(),
             attrs: info.attrs.clone(),
+            nth_child: info.nth_child,
+            nth_of_type: info.nth_of_type,
+            is_empty: info.is_empty,
         };
         let target = if let Some(parent) = self.element_stack.last_mut() {
             &mut parent.prev_siblings
@@ -4546,24 +5026,24 @@ fn peek_element_is_empty(after_tag: &str, tag: &str, self_closing: bool) -> bool
             .is_some_and(|ch| ch == '>' || ch.is_whitespace())
 }
 
-fn peek_element_is_last_child(after_tag: &str, tag: &str, self_closing: bool) -> bool {
+fn peek_sibling_info(after_tag: &str, tag: &str, self_closing: bool) -> (bool, bool) {
     let mut rest = after_tag;
     if !self_closing {
         let mut depth = 1usize;
         while depth > 0 {
             let Some(lt) = rest.find('<') else {
-                return true;
+                return (true, true);
             };
             rest = &rest[lt..];
             if let Some(after) = rest.strip_prefix("<!--") {
                 rest = match after.find("-->") {
                     Some(idx) => &after[idx + 3..],
-                    None => return true,
+                    None => return (true, true),
                 };
                 continue;
             }
             let Some(end) = tag_end(rest) else {
-                return true;
+                return (true, true);
             };
             let raw = &rest[..end];
             rest = &rest[end..];
@@ -4600,7 +5080,7 @@ fn peek_element_is_last_child(after_tag: &str, tag: &str, self_closing: bool) ->
                     rest = &rest[close..];
                     continue;
                 }
-                return true;
+                return (true, true);
             }
             if name.eq_ignore_ascii_case(tag) {
                 if closing {
@@ -4611,31 +5091,82 @@ fn peek_element_is_last_child(after_tag: &str, tag: &str, self_closing: bool) ->
             }
         }
     }
+    let mut is_last_child = true;
+    let mut depth = 0usize;
     loop {
         rest = skip_html_ws_and_comments(rest);
         let Some(lt) = rest.find('<') else {
-            return true;
+            break;
         };
         rest = &rest[lt..];
         if let Some(after) = rest.strip_prefix("<!--") {
             rest = match after.find("-->") {
                 Some(idx) => &after[idx + 3..],
-                None => return true,
+                None => break,
             };
             continue;
         }
-        if rest.starts_with("</") {
-            return true;
+        let Some(end) = tag_end(rest) else {
+            break;
+        };
+        let raw = &rest[..end];
+        rest = &rest[end..];
+        let inner = raw
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
+        if inner.is_empty() || inner.starts_with('!') || inner.starts_with('?') {
+            continue;
         }
-        if rest[1..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
+        let closing = inner.starts_with('/');
+        let body = if closing {
+            inner[1..].trim_start()
+        } else {
+            inner
+        };
+        let self_close = body.ends_with('/');
+        let clean = body.trim_end_matches('/').trim_end();
+        let ne = clean
+            .find(|ch: char| ch.is_whitespace())
+            .unwrap_or(clean.len());
+        let name = &clean[..ne];
+        if name.is_empty() || !name.as_bytes()[0].is_ascii_alphabetic() {
+            continue;
+        }
+        if closing {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+            continue;
+        }
+        if depth == 0 {
+            is_last_child = false;
+            if name.eq_ignore_ascii_case(tag) {
+                return (false, false);
+            }
+        }
+        if !self_close
+            && (name.eq_ignore_ascii_case("script") || name.eq_ignore_ascii_case("style"))
         {
-            return false;
+            let lower_rest = rest.to_ascii_lowercase();
+            let target = if name.eq_ignore_ascii_case("script") {
+                "script"
+            } else {
+                "style"
+            };
+            if let Some(close) = find_closing_rawtext(&lower_rest, target) {
+                rest = &rest[close..];
+            } else {
+                break;
+            }
+            continue;
         }
-        rest = &rest[1..];
+        if !self_close && !is_void_tag(&name.to_ascii_lowercase()) {
+            depth += 1;
+        }
     }
+    (is_last_child, true)
 }
 
 fn pitch_color_from_css(css: &ComputedCss) -> Option<[u8; 3]> {
@@ -7225,5 +7756,102 @@ mod tests {
         find_markers(&blocks, &mut markers);
         assert!(markers.iter().any(|m| m.contains('①')), "{markers:?}");
         assert!(markers.iter().any(|m| m.contains('②')), "{markers:?}");
+    }
+
+    #[test]
+    fn nth_of_type_and_clipped_hidden_suppress_secondary_blocks() {
+        let css = r#"
+            .entry-list > div:nth-of-type(n+2) { display: none; }
+            .only-first > p:not(:first-of-type) { display: none; }
+            .visually-hidden { width: 0; overflow: hidden; }
+            .clipped { clip-path: inset(100%); }
+        "#;
+        let html = r#"
+            <div class="entry-list">
+                <span>Header</span>
+                <div>Primary glossary entry with full explanation.</div>
+                <div>Duplicate second glossary entry hidden via nth-of-type.</div>
+            </div>
+            <div class="only-first">
+                <p>First paragraph stays.</p>
+                <p>Second paragraph hidden.</p>
+            </div>
+            <div class="visually-hidden">Zero width hidden duplicate</div>
+            <div class="clipped">Clipped hidden duplicate</div>
+        "#;
+        let blocks = parse_html_with_css(html, css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert!(text.contains("Primary glossary entry"), "{text}");
+        assert!(!text.contains("Duplicate second glossary"), "{text}");
+        assert!(text.contains("First paragraph stays"), "{text}");
+        assert!(!text.contains("Second paragraph hidden"), "{text}");
+        assert!(!text.contains("Zero width hidden"), "{text}");
+        assert!(!text.contains("Clipped hidden"), "{text}");
+    }
+
+    #[test]
+    fn deduplicates_identical_adjacent_dictionary_descriptions() {
+        let css = r#"
+            .dict-box {
+                border-left: 2px solid #dcdcdc;
+                background: rgba(255,255,255,0.04);
+                padding: 6px;
+            }
+        "#;
+        let entry = r#"
+            <div>(priority form, ★, Dictionary [2026-10-03])</div>
+            <ol>
+                <li>parent | parents | mother and father</li>
+                <li>dealer | banker</li>
+                <li>ancestor | forefather</li>
+            </ol>
+        "#;
+
+        let sibling_boxes = format!(
+            r#"<div class="dict-box">{entry}</div><div class="dict-box">{entry}</div>"#
+        );
+        let blocks = parse_html_with_css(&sibling_boxes, css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert_eq!(text.matches("mother and father").count(), 1, "{text}");
+        assert_eq!(text.matches("forefather").count(), 1, "{text}");
+
+        let single_box_twice = format!(r#"<div class="dict-box">{entry}<hr>{entry}</div>"#);
+        let blocks = parse_html_with_css(&single_box_twice, css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert_eq!(text.matches("mother and father").count(), 1, "{text}");
+
+        let extra_dict = r#"
+            <div>(Second Dictionary)</div>
+            <p>completely different secondary definition entry here</p>
+        "#;
+        let main_plus_all = format!(
+            r#"<div class="dict-box">{entry}</div><div class="dict-box">{entry}{extra_dict}</div>"#
+        );
+        let blocks = parse_html_with_css(&main_plus_all, css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert_eq!(text.matches("mother and father").count(), 1, "{text}");
+        assert!(
+            text.contains("completely different secondary definition"),
+            "distinct dictionary entry must be preserved: {text}"
+        );
+
+        let short_repeat = r#"<p>Yes</p><p>Yes</p>"#;
+        let blocks = parse_html_with_css(short_repeat, css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert_eq!(text.matches("Yes").count(), 2, "short lines must not be stripped: {text}");
+
+        let sib_css = r#"
+            .main-def:not(:empty) ~ .fallback-def { display: none; }
+        "#;
+        let with_main = r#"<div class="main-def">Main definition text</div><div class="fallback-def">Fallback definition text</div>"#;
+        let blocks = parse_html_with_css(with_main, sib_css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert!(text.contains("Main definition text"), "{text}");
+        assert!(!text.contains("Fallback definition text"), "{text}");
+
+        let empty_main = r#"<div class="main-def"></div><div class="fallback-def">Fallback definition text</div>"#;
+        let blocks = parse_html_with_css(empty_main, sib_css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert!(text.contains("Fallback definition text"), "{text}");
     }
 }
