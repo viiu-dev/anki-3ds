@@ -188,11 +188,21 @@ pub struct PillStyle {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    #[default]
+    Auto,
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BoxStyle {
     pub bg: Option<[u8; 3]>,
     pub bg_alpha: u8,
     pub border_left: Option<[u8; 3]>,
     pub border_all: Option<[u8; 3]>,
+    pub align: TextAlign,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -227,6 +237,7 @@ pub struct Style {
     pub highlight: Option<[u8; 3]>,
     pub scale: Option<u8>,
     pub muted: bool,
+    pub align: TextAlign,
     pub pill: Option<PillStyle>,
     pub pitch: PitchStyle,
 }
@@ -274,6 +285,9 @@ impl Style {
         }
         if other.scale.is_some() {
             self.scale = other.scale;
+        }
+        if other.align != TextAlign::Auto {
+            self.align = other.align;
         }
         if other.pill.is_some() {
             self.pill = other.pill;
@@ -428,6 +442,7 @@ enum AttrOp {
     Exists,
     Equals(String),
     ContainsWord(String),
+    DashPrefix(String),
     Prefix(String),
     Suffix(String),
     Substring(String),
@@ -445,7 +460,13 @@ enum PseudoClass {
     LastChild,
     OnlyChild,
     NthChild(i32, i32),
-    Not(Box<CompoundSelector>),
+    Empty,
+    Checked,
+    Open,
+    Not(Vec<CompoundSelector>),
+    Is(Vec<CompoundSelector>),
+    Where(Vec<CompoundSelector>),
+    Never,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -465,9 +486,6 @@ struct SelectorStep {
 
 #[derive(Clone, Debug)]
 struct Selector {
-    /// Stored right-to-left: `steps[0]` matches the target element,
-    /// `steps[i].comb` describes the link from `steps[i-1]` back to
-    /// `steps[i]`.
     steps: Vec<SelectorStep>,
     pseudo: PseudoElement,
     specificity: (u16, u16, u16),
@@ -477,6 +495,7 @@ struct Selector {
 struct CssDecl {
     prop: String,
     value: String,
+    important: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -487,9 +506,51 @@ struct CssRule {
 }
 
 #[derive(Clone, Debug, Default)]
+struct CounterStyle {
+    symbols: Vec<String>,
+    prefix: String,
+    suffix: String,
+    cyclic: bool,
+}
+
+impl CounterStyle {
+    fn format(&self, value: i32) -> String {
+        if self.symbols.is_empty() || value <= 0 {
+            return format!("{}{value}{}", self.prefix, self.suffix);
+        }
+        let idx = (value - 1) as usize;
+        if let Some(sym) = self.symbols.get(idx) {
+            return format!("{}{sym}{}", self.prefix, self.suffix);
+        }
+        if self.cyclic {
+            let sym = &self.symbols[idx % self.symbols.len()];
+            return format!("{}{sym}{}", self.prefix, self.suffix);
+        }
+        format!("{}{value}{}", self.prefix, self.suffix)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListStyleKind {
+    None,
+    Disc,
+    Decimal,
+    Custom(String),
+    Literal(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ContentToken {
+    Literal(String),
+    Counter { name: String, style: Option<String> },
+}
+
+#[derive(Clone, Debug, Default)]
 struct Stylesheet {
     rules: Vec<CssRule>,
     vars: HashMap<String, String>,
+    counter_styles: HashMap<String, CounterStyle>,
+    needs_lookahead: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -499,6 +560,7 @@ enum CssDisplay {
     InlineBlock,
     Flex,
     InlineFlex,
+    Contents,
     None,
 }
 
@@ -514,6 +576,8 @@ enum BorderSide {
 struct ComputedCss {
     display: Option<CssDisplay>,
     flex_column: bool,
+    flex_center: bool,
+    text_align: Option<TextAlign>,
     visibility_hidden: Option<bool>,
     opacity_zero: bool,
     opacity: Option<f32>,
@@ -532,15 +596,18 @@ struct ComputedCss {
     border_right: BorderSide,
     border_bottom: BorderSide,
     border_left: BorderSide,
+    border_color_fallback: Option<[u8; 3]>,
     has_radius: bool,
     has_padding: bool,
-    list_style_none: Option<bool>,
+    list_style: Option<ListStyleKind>,
+    counter_reset: Vec<(String, i32)>,
+    counter_increment: Vec<(String, i32)>,
     width_px: Option<f32>,
     height_px: Option<f32>,
     max_width_px: Option<f32>,
     max_height_px: Option<f32>,
     overflow_hidden: bool,
-    content_literal: Option<String>,
+    content_tokens: Option<Vec<ContentToken>>,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +617,8 @@ struct ElementInfo {
     classes: Vec<String>,
     attrs: Vec<(String, String)>,
     nth_child: usize,
+    is_last_child: bool,
+    is_empty: bool,
     prev_siblings: Vec<SiblingInfo>,
 }
 
@@ -572,7 +641,18 @@ impl Stylesheet {
         let stripped = strip_css_comments(css);
         let mut sheet = Stylesheet::default();
         let mut order = 0u32;
-        parse_css_block(&stripped, dark_mode, &mut sheet.rules, &mut order);
+        parse_css_block(
+            &stripped,
+            &[],
+            dark_mode,
+            &mut sheet.rules,
+            &mut sheet.counter_styles,
+            &mut order,
+        );
+        sheet.needs_lookahead = sheet
+            .rules
+            .iter()
+            .any(|rule| selector_needs_lookahead(&rule.selector));
         sheet.extract_root_vars(dark_mode);
         sheet
     }
@@ -591,6 +671,8 @@ impl Stylesheet {
                 if dark_mode { "dark" } else { "light" }.into(),
             )],
             nth_child: 1,
+            is_last_child: true,
+            is_empty: false,
             prev_siblings: Vec::new(),
         };
         let mut matches: Vec<&CssRule> = self
@@ -603,10 +685,12 @@ impl Stylesheet {
             })
             .collect();
         matches.sort_by_key(|rule| (rule.selector.specificity, rule.order));
-        for rule in matches {
-            for decl in &rule.decls {
-                if decl.prop.starts_with("--") {
-                    self.vars.insert(decl.prop.clone(), decl.value.clone());
+        for important_pass in [false, true] {
+            for rule in &matches {
+                for decl in &rule.decls {
+                    if decl.prop.starts_with("--") && decl.important == important_pass {
+                        self.vars.insert(decl.prop.clone(), decl.value.clone());
+                    }
                 }
             }
         }
@@ -629,35 +713,49 @@ impl Stylesheet {
         }
         matched.sort_by_key(|(rule, _)| (rule.selector.specificity, rule.order));
 
-        for (rule, pseudo) in &matched {
-            if *pseudo == PseudoElement::None {
-                for decl in &rule.decls {
-                    if decl.prop.starts_with("--") {
-                        var_scope.push((decl.prop.clone(), decl.value.clone()));
+        let inline_decls = inline_style.map(parse_declarations).unwrap_or_default();
+        for important_pass in [false, true] {
+            for (rule, pseudo) in &matched {
+                if *pseudo == PseudoElement::None {
+                    for decl in &rule.decls {
+                        if decl.prop.starts_with("--") && decl.important == important_pass {
+                            var_scope.push((decl.prop.clone(), decl.value.clone()));
+                        }
                     }
                 }
             }
-        }
-        let inline_decls = inline_style.map(parse_declarations).unwrap_or_default();
-        for decl in &inline_decls {
-            if decl.prop.starts_with("--") {
-                var_scope.push((decl.prop.clone(), decl.value.clone()));
+            for decl in &inline_decls {
+                if decl.prop.starts_with("--") && decl.important == important_pass {
+                    var_scope.push((decl.prop.clone(), decl.value.clone()));
+                }
             }
         }
 
         let mut base = ComputedCss::default();
         let mut before: Option<ComputedCss> = None;
         let mut after: Option<ComputedCss> = None;
-        for (rule, pseudo) in matched {
-            let target = match pseudo {
-                PseudoElement::None => &mut base,
-                PseudoElement::Before => before.get_or_insert_with(ComputedCss::default),
-                PseudoElement::After => after.get_or_insert_with(ComputedCss::default),
-            };
-            for decl in &rule.decls {
-                if !decl.prop.starts_with("--") {
+        for important_pass in [false, true] {
+            for (rule, pseudo) in &matched {
+                if *pseudo != PseudoElement::None {
+                    continue;
+                }
+                for decl in &rule.decls {
+                    if !decl.prop.starts_with("--") && decl.important == important_pass {
+                        apply_css_decl(
+                            &mut base,
+                            &decl.prop,
+                            &decl.value,
+                            &self.vars,
+                            var_scope,
+                            parent_color,
+                        );
+                    }
+                }
+            }
+            for decl in &inline_decls {
+                if !decl.prop.starts_with("--") && decl.important == important_pass {
                     apply_css_decl(
-                        target,
+                        &mut base,
                         &decl.prop,
                         &decl.value,
                         &self.vars,
@@ -667,16 +765,26 @@ impl Stylesheet {
                 }
             }
         }
-        for decl in &inline_decls {
-            if !decl.prop.starts_with("--") {
-                apply_css_decl(
-                    &mut base,
-                    &decl.prop,
-                    &decl.value,
-                    &self.vars,
-                    var_scope,
-                    parent_color,
-                );
+        let elem_color = base.color.or(parent_color);
+        for important_pass in [false, true] {
+            for (rule, pseudo) in &matched {
+                let target = match pseudo {
+                    PseudoElement::None => continue,
+                    PseudoElement::Before => before.get_or_insert_with(ComputedCss::default),
+                    PseudoElement::After => after.get_or_insert_with(ComputedCss::default),
+                };
+                for decl in &rule.decls {
+                    if !decl.prop.starts_with("--") && decl.important == important_pass {
+                        apply_css_decl(
+                            target,
+                            &decl.prop,
+                            &decl.value,
+                            &self.vars,
+                            var_scope,
+                            elem_color,
+                        );
+                    }
+                }
             }
         }
         (base, before, after)
@@ -865,8 +973,16 @@ fn find_outside_parens(text: &str, target: &[u8]) -> Option<usize> {
     None
 }
 
-fn parse_css_block(css: &str, dark_mode: bool, rules: &mut Vec<CssRule>, order: &mut u32) {
+fn parse_css_block(
+    css: &str,
+    parent_selectors: &[String],
+    dark_mode: bool,
+    rules: &mut Vec<CssRule>,
+    counter_styles: &mut HashMap<String, CounterStyle>,
+    order: &mut u32,
+) {
     let mut pos = 0usize;
+    let mut direct_decls = Vec::new();
     while pos < css.len() {
         let rest = css[pos..].trim_start();
         let trimmed_skip = css[pos..].len() - rest.len();
@@ -892,45 +1008,166 @@ fn parse_css_block(css: &str, dark_mode: bool, rules: &mut Vec<CssRule>, order: 
             let lower_header = header.to_ascii_lowercase();
             if let Some(cond) = lower_header.strip_prefix("@media") {
                 if eval_media_query(cond, dark_mode) {
-                    parse_css_block(inner, dark_mode, rules, order);
+                    parse_css_block(
+                        inner,
+                        parent_selectors,
+                        dark_mode,
+                        rules,
+                        counter_styles,
+                        order,
+                    );
                 }
             } else if lower_header.starts_with("@supports") || lower_header.starts_with("@layer") {
-                parse_css_block(inner, dark_mode, rules, order);
+                parse_css_block(
+                    inner,
+                    parent_selectors,
+                    dark_mode,
+                    rules,
+                    counter_styles,
+                    order,
+                );
+            } else if let Some(cs_name) = lower_header.strip_prefix("@counter-style") {
+                let name = cs_name.trim().to_owned();
+                if !name.is_empty() {
+                    if let Some(cs) = parse_counter_style(inner) {
+                        counter_styles.insert(name, cs);
+                    }
+                }
             }
             pos += (close + 1).min(rest.len());
             continue;
         }
-        let Some(open) = find_outside_parens(rest, &[b'{', b';']) else {
+        let Some(delim) = find_outside_parens(rest, &[b'{', b';']) else {
+            if !parent_selectors.is_empty() {
+                if let Some(decl) = parse_single_declaration(rest) {
+                    direct_decls.push(decl);
+                }
+            }
             break;
         };
-        if rest.as_bytes()[open] == b';' {
-            pos += open + 1;
+        if rest.as_bytes()[delim] == b';' {
+            if !parent_selectors.is_empty() {
+                if let Some(decl) = parse_single_declaration(&rest[..delim]) {
+                    direct_decls.push(decl);
+                }
+            }
+            pos += delim + 1;
             continue;
         }
-        let selector_text = rest[..open].trim();
-        let close = find_matching_brace(rest, open);
-        let body = if close > open + 1 {
-            &rest[open + 1..close]
+        let selector_text = rest[..delim].trim();
+        let close = find_matching_brace(rest, delim);
+        let body = if close > delim + 1 {
+            &rest[delim + 1..close]
         } else {
             ""
         };
         if !selector_text.is_empty() && !body.trim().is_empty() {
-            let decls = parse_declarations(body);
-            if !decls.is_empty() {
-                for sel_str in split_top_level(selector_text, b',') {
-                    if let Some(selector) = parse_selector(sel_str) {
-                        *order += 1;
-                        rules.push(CssRule {
-                            selector,
-                            decls: decls.clone(),
-                            order: *order,
-                        });
-                    }
-                }
+            let combined = combine_nested_selectors(parent_selectors, selector_text);
+            if !combined.is_empty() {
+                parse_css_block(body, &combined, dark_mode, rules, counter_styles, order);
             }
         }
         pos += (close + 1).min(rest.len());
     }
+    if !direct_decls.is_empty() && !parent_selectors.is_empty() {
+        for sel_str in parent_selectors {
+            if let Some(selector) = parse_selector(sel_str) {
+                *order += 1;
+                rules.push(CssRule {
+                    selector,
+                    decls: direct_decls.clone(),
+                    order: *order,
+                });
+            }
+        }
+    }
+}
+
+fn combine_nested_selectors(parents: &[String], child_list: &str) -> Vec<String> {
+    let children: Vec<&str> = split_top_level(child_list, b',')
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parents.is_empty() {
+        return children.into_iter().map(str::to_owned).collect();
+    }
+    let mut out = Vec::with_capacity(parents.len().saturating_mul(children.len()).min(64));
+    for parent in parents {
+        for child in &children {
+            if out.len() >= 64 {
+                return out;
+            }
+            if child.contains('&') {
+                out.push(child.replace('&', parent));
+            } else {
+                out.push(format!("{parent} {child}"));
+            }
+        }
+    }
+    out
+}
+
+fn parse_counter_style(body: &str) -> Option<CounterStyle> {
+    let mut cs = CounterStyle {
+        suffix: ". ".to_owned(),
+        ..CounterStyle::default()
+    };
+    for decl in parse_declarations(body) {
+        match decl.prop.as_str() {
+            "system" => {
+                cs.cyclic = decl.value.to_ascii_lowercase().starts_with("cyclic");
+            }
+            "prefix" => {
+                cs.prefix = parse_css_string_literal(&decl.value).unwrap_or_default();
+            }
+            "suffix" => {
+                cs.suffix = parse_css_string_literal(&decl.value).unwrap_or_default();
+            }
+            "symbols" => {
+                cs.symbols = parse_counter_symbols(&decl.value);
+            }
+            _ => {}
+        }
+    }
+    (!cs.symbols.is_empty()).then_some(cs)
+}
+
+fn parse_counter_symbols(value: &str) -> Vec<String> {
+    let mut symbols = Vec::new();
+    let mut rest = value.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
+            let mut end = 1usize;
+            let bytes = rest.as_bytes();
+            while end < bytes.len() {
+                if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                    end += 2;
+                    continue;
+                }
+                if bytes[end] == quote as u8 {
+                    break;
+                }
+                end += 1;
+            }
+            let lit = &rest[..end.min(rest.len()) + usize::from(end < rest.len())];
+            if let Some(s) = parse_css_string_literal(lit) {
+                symbols.push(s);
+            }
+            rest = &rest[(end + 1).min(rest.len())..];
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(rest.len());
+            symbols.push(unescape_css_string(&rest[..end]));
+            rest = &rest[end..];
+        }
+    }
+    symbols
 }
 
 fn eval_media_query(query: &str, dark_mode: bool) -> bool {
@@ -1042,31 +1279,42 @@ fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
     parts
 }
 
+fn parse_single_declaration(raw: &str) -> Option<CssDecl> {
+    let (key, val) = raw.split_once(':')?;
+    let prop = key.trim();
+    if prop.is_empty() {
+        return None;
+    }
+    let prop = if prop.starts_with("--") {
+        prop.to_owned()
+    } else {
+        prop.to_ascii_lowercase()
+    };
+    let trimmed = val.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (val, important) = if lower.ends_with("!important") {
+        (trimmed[..trimmed.len() - 10].trim(), true)
+    } else if let Some(bang) = trimmed.rfind('!') {
+        if trimmed[bang + 1..].trim().eq_ignore_ascii_case("important") {
+            (trimmed[..bang].trim(), true)
+        } else {
+            (trimmed, false)
+        }
+    } else {
+        (trimmed, false)
+    };
+    (!val.is_empty()).then(|| CssDecl {
+        prop,
+        value: val.to_owned(),
+        important,
+    })
+}
+
 fn parse_declarations(body: &str) -> Vec<CssDecl> {
     let mut decls = Vec::new();
     for raw in split_top_level(body, b';') {
-        let Some((key, val)) = raw.split_once(':') else {
-            continue;
-        };
-        let prop = key.trim();
-        if prop.is_empty() {
-            continue;
-        }
-        let prop = if prop.starts_with("--") {
-            prop.to_owned()
-        } else {
-            prop.to_ascii_lowercase()
-        };
-        let val = val
-            .trim()
-            .trim_end_matches("!important")
-            .trim_end_matches("! important")
-            .trim();
-        if !val.is_empty() {
-            decls.push(CssDecl {
-                prop,
-                value: val.to_owned(),
-            });
+        if let Some(decl) = parse_single_declaration(raw) {
+            decls.push(decl);
         }
     }
     decls
@@ -1158,19 +1406,39 @@ fn parse_selector(raw: &str) -> Option<Selector> {
 }
 
 fn compound_specificity(c: &CompoundSelector) -> (u16, u16, u16) {
-    let a = if c.id.is_some() { 1 } else { 0 };
+    let mut a = if c.id.is_some() { 1u16 } else { 0 };
     let mut b = (c.classes.len() + c.attrs.len()) as u16;
+    let mut c_tag = if c.tag.is_some() { 1u16 } else { 0 };
     for p in &c.pseudos {
         match p {
-            PseudoClass::Not(inner) => {
-                let s = compound_specificity(inner);
-                b = b.saturating_add(s.0 + s.1 + s.2);
+            PseudoClass::Not(list) | PseudoClass::Is(list) => {
+                if let Some(best) = list.iter().map(compound_specificity).max() {
+                    a = a.saturating_add(best.0);
+                    b = b.saturating_add(best.1);
+                    c_tag = c_tag.saturating_add(best.2);
+                }
             }
+            PseudoClass::Where(_) => {}
             _ => b = b.saturating_add(1),
         }
     }
-    let c_tag = if c.tag.is_some() { 1 } else { 0 };
     (a, b, c_tag)
+}
+
+fn compound_needs_lookahead(c: &CompoundSelector) -> bool {
+    c.pseudos.iter().any(|p| match p {
+        PseudoClass::LastChild | PseudoClass::OnlyChild | PseudoClass::Empty => true,
+        PseudoClass::Not(list) | PseudoClass::Is(list) | PseudoClass::Where(list) => {
+            list.iter().any(compound_needs_lookahead)
+        }
+        _ => false,
+    })
+}
+
+fn selector_needs_lookahead(sel: &Selector) -> bool {
+    sel.steps
+        .iter()
+        .any(|step| compound_needs_lookahead(&step.compound))
 }
 
 fn parse_compound_selector<'a>(
@@ -1276,29 +1544,53 @@ fn parse_compound_selector<'a>(
                     }
                     "not" | "is" | "where" => {
                         if let Some(inner) = arg {
-                            if name == "not" {
-                                if let Some((inner_sel, _, _, interactive)) =
-                                    parse_compound_selector(inner.trim())
+                            let mut branches = Vec::new();
+                            let mut had_interactive = false;
+                            for part in split_top_level(inner, b',') {
+                                let part = part.trim();
+                                if part.is_empty() {
+                                    continue;
+                                }
+                                if let Some((inner_sel, rem, _, interactive)) =
+                                    parse_compound_selector(part)
                                 {
-                                    if !interactive {
-                                        sel.pseudos.push(PseudoClass::Not(Box::new(inner_sel)));
+                                    if interactive {
+                                        had_interactive = true;
+                                    } else if rem.trim().is_empty() {
+                                        branches.push(inner_sel);
                                     }
                                 }
-                            } else if let Some((inner_sel, _, _, interactive)) =
-                                parse_compound_selector(inner.trim())
-                            {
-                                if !interactive {
-                                    if sel.tag.is_none() {
-                                        sel.tag = inner_sel.tag;
+                            }
+                            match name.as_str() {
+                                "not" => {
+                                    if !branches.is_empty() {
+                                        sel.pseudos.push(PseudoClass::Not(branches));
+                                    } else if !had_interactive {
+                                        sel.pseudos.push(PseudoClass::Never);
                                     }
-                                    sel.classes.extend(inner_sel.classes);
-                                    sel.attrs.extend(inner_sel.attrs);
+                                }
+                                "is" => {
+                                    if !branches.is_empty() {
+                                        sel.pseudos.push(PseudoClass::Is(branches));
+                                    } else {
+                                        sel.pseudos.push(PseudoClass::Never);
+                                    }
+                                }
+                                _ => {
+                                    if !branches.is_empty() {
+                                        sel.pseudos.push(PseudoClass::Where(branches));
+                                    } else {
+                                        sel.pseudos.push(PseudoClass::Never);
+                                    }
                                 }
                             }
                         }
                     }
-                    "lang" | "empty" => {}
-                    _ => {}
+                    "empty" => sel.pseudos.push(PseudoClass::Empty),
+                    "checked" => sel.pseudos.push(PseudoClass::Checked),
+                    "open" => sel.pseudos.push(PseudoClass::Open),
+                    "lang" | "any-link" | "link" => {}
+                    _ => sel.pseudos.push(PseudoClass::Never),
                 }
             }
             _ => return None,
@@ -1351,7 +1643,7 @@ fn read_css_ident(text: &str) -> (String, &str) {
 }
 
 fn parse_attr_selector(inner: &str) -> Option<AttrSelector> {
-    let ops = ["~=", "^=", "$=", "*=", "="];
+    let ops = ["~=", "|=", "^=", "$=", "*=", "="];
     for op_str in ops {
         if let Some((left, right)) = inner.split_once(op_str) {
             let name = left.trim().to_ascii_lowercase();
@@ -1365,6 +1657,7 @@ fn parse_attr_selector(inner: &str) -> Option<AttrSelector> {
             let op = match op_str {
                 "=" => AttrOp::Equals(val),
                 "~=" => AttrOp::ContainsWord(val),
+                "|=" => AttrOp::DashPrefix(val),
                 "^=" => AttrOp::Prefix(val),
                 "$=" => AttrOp::Suffix(val),
                 _ => AttrOp::Substring(val),
@@ -1404,6 +1697,7 @@ fn parse_nth(expr: &str) -> Option<(i32, i32)> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compound_matches(
     sel: &CompoundSelector,
     tag: &str,
@@ -1411,6 +1705,8 @@ fn compound_matches(
     classes: &[String],
     attrs: &[(String, String)],
     nth_child: usize,
+    is_last_child: bool,
+    is_empty: bool,
 ) -> bool {
     if let Some(req_tag) = &sel.tag {
         if !tag.eq_ignore_ascii_case(req_tag) {
@@ -1438,6 +1734,10 @@ fn compound_matches(
             AttrOp::Exists => true,
             AttrOp::Equals(target) => val == target,
             AttrOp::ContainsWord(word) => val.split_whitespace().any(|w| w == word),
+            AttrOp::DashPrefix(prefix) => {
+                val == prefix
+                    || (val.starts_with(prefix) && val[prefix.len()..].starts_with('-'))
+            }
             AttrOp::Prefix(p) => !p.is_empty() && val.starts_with(p),
             AttrOp::Suffix(s) => !s.is_empty() && val.ends_with(s),
             AttrOp::Substring(sub) => !sub.is_empty() && val.contains(sub),
@@ -1453,8 +1753,13 @@ fn compound_matches(
                     return false;
                 }
             }
-            PseudoClass::LastChild | PseudoClass::OnlyChild => {
-                if matches!(pseudo, PseudoClass::OnlyChild) && nth_child != 1 {
+            PseudoClass::LastChild => {
+                if !is_last_child {
+                    return false;
+                }
+            }
+            PseudoClass::OnlyChild => {
+                if nth_child != 1 || !is_last_child {
                     return false;
                 }
             }
@@ -1469,11 +1774,54 @@ fn compound_matches(
                     return false;
                 }
             }
-            PseudoClass::Not(inner) => {
-                if compound_matches(inner, tag, id, classes, attrs, nth_child) {
+            PseudoClass::Empty => {
+                if !is_empty {
                     return false;
                 }
             }
+            PseudoClass::Checked => {
+                if !has_attr(attrs, "checked") {
+                    return false;
+                }
+            }
+            PseudoClass::Open => {
+                if !has_attr(attrs, "open") {
+                    return false;
+                }
+            }
+            PseudoClass::Not(list) => {
+                if list.iter().any(|inner| {
+                    compound_matches(
+                        inner,
+                        tag,
+                        id,
+                        classes,
+                        attrs,
+                        nth_child,
+                        is_last_child,
+                        is_empty,
+                    )
+                }) {
+                    return false;
+                }
+            }
+            PseudoClass::Is(list) | PseudoClass::Where(list) => {
+                if !list.iter().any(|inner| {
+                    compound_matches(
+                        inner,
+                        tag,
+                        id,
+                        classes,
+                        attrs,
+                        nth_child,
+                        is_last_child,
+                        is_empty,
+                    )
+                }) {
+                    return false;
+                }
+            }
+            PseudoClass::Never => return false,
         }
     }
     true
@@ -1512,7 +1860,7 @@ fn implicit_root_matches(sel: &CompoundSelector, dark_mode: bool) -> bool {
 fn selector_matches_root_only(sel: &Selector, root: &ElementInfo, dark_mode: bool) -> bool {
     if sel.steps.len() == 1 {
         let c = &sel.steps[0].compound;
-        return compound_matches(c, &root.tag, None, &root.classes, &root.attrs, 1)
+        return compound_matches(c, &root.tag, None, &root.classes, &root.attrs, 1, true, false)
             || implicit_root_matches(c, dark_mode);
     }
     if sel.steps.len() == 2 {
@@ -1538,6 +1886,8 @@ fn selector_matches(
         &elem.classes,
         &elem.attrs,
         elem.nth_child,
+        elem.is_last_child,
+        elem.is_empty,
     ) {
         return false;
     }
@@ -1575,6 +1925,8 @@ fn match_chain(
                     &parent.info.classes,
                     &parent.info.attrs,
                     parent.info.nth_child,
+                    parent.info.is_last_child,
+                    parent.info.is_empty,
                 ) {
                     return match_chain(
                         steps,
@@ -1601,6 +1953,8 @@ fn match_chain(
                     &anc.info.classes,
                     &anc.info.attrs,
                     anc.info.nth_child,
+                    anc.info.is_last_child,
+                    anc.info.is_empty,
                 ) && match_chain(
                     steps,
                     step_idx + 1,
@@ -1622,6 +1976,8 @@ fn match_chain(
                     &prev.classes,
                     &prev.attrs,
                     1,
+                    false,
+                    false,
                 ) {
                     return match_chain(steps, step_idx + 1, ancestors, rest_sibs, dark_mode);
                 }
@@ -1638,6 +1994,8 @@ fn match_chain(
                     &prev.classes,
                     &prev.attrs,
                     1,
+                    false,
+                    false,
                 ) && match_chain(
                     steps,
                     step_idx + 1,
@@ -1704,6 +2062,7 @@ fn apply_css_decl(
         "display" => {
             css.display = match lower.as_str() {
                 "none" => Some(CssDisplay::None),
+                "contents" => Some(CssDisplay::Contents),
                 "inline" => Some(CssDisplay::Inline),
                 "inline-block" => Some(CssDisplay::InlineBlock),
                 "inline-flex" | "inline-grid" => Some(CssDisplay::InlineFlex),
@@ -1716,6 +2075,19 @@ fn apply_css_decl(
         }
         "flex-direction" => {
             css.flex_column = lower.starts_with("column");
+        }
+        "justify-content" | "align-items" => {
+            if lower == "center" {
+                css.flex_center = true;
+            }
+        }
+        "text-align" => {
+            css.text_align = match lower.as_str() {
+                "left" | "start" => Some(TextAlign::Left),
+                "center" => Some(TextAlign::Center),
+                "right" | "end" => Some(TextAlign::Right),
+                _ => css.text_align,
+            };
         }
         "visibility" => {
             if matches!(lower.as_str(), "hidden" | "collapse") {
@@ -1795,11 +2167,15 @@ fn apply_css_decl(
             }
         }
         "list-style" | "list-style-type" => {
-            if lower.contains("none") {
-                css.list_style_none = Some(true);
-            } else if !lower.is_empty() && !matches!(lower.as_str(), "inherit" | "initial") {
-                css.list_style_none = Some(false);
+            if let Some(kind) = parse_list_style(value) {
+                css.list_style = Some(kind);
             }
+        }
+        "counter-reset" => {
+            css.counter_reset = parse_counter_ops(value, 0);
+        }
+        "counter-increment" => {
+            css.counter_increment = parse_counter_ops(value, 1);
         }
         "border" => {
             let side = parse_border_side(value, current_color);
@@ -1815,8 +2191,8 @@ fn apply_css_decl(
         "border-top-width" | "border-top-style" => {
             if border_value_is_none(&lower) {
                 css.border_top = BorderSide::None;
-            } else if css.border_top == BorderSide::Unset {
-                css.border_top = BorderSide::Set(None);
+            } else if !matches!(css.border_top, BorderSide::Set(Some(_))) {
+                css.border_top = BorderSide::Set(css.border_color_fallback);
             }
         }
         "border-top-color" => {
@@ -1832,8 +2208,15 @@ fn apply_css_decl(
         "border-right-width" | "border-right-style" => {
             if border_value_is_none(&lower) {
                 css.border_right = BorderSide::None;
-            } else if css.border_right == BorderSide::Unset {
-                css.border_right = BorderSide::Set(None);
+            } else if !matches!(css.border_right, BorderSide::Set(Some(_))) {
+                css.border_right = BorderSide::Set(css.border_color_fallback);
+            }
+        }
+        "border-right-color" => {
+            if let Some((rgb, a)) = parse_color_alpha(value, current_color) {
+                if a > 0 && css.border_right != BorderSide::None {
+                    css.border_right = BorderSide::Set(Some(rgb));
+                }
             }
         }
         "border-bottom" | "border-block-end" => {
@@ -1842,8 +2225,8 @@ fn apply_css_decl(
         "border-bottom-width" | "border-bottom-style" => {
             if border_value_is_none(&lower) {
                 css.border_bottom = BorderSide::None;
-            } else if css.border_bottom == BorderSide::Unset {
-                css.border_bottom = BorderSide::Set(None);
+            } else if !matches!(css.border_bottom, BorderSide::Set(Some(_))) {
+                css.border_bottom = BorderSide::Set(css.border_color_fallback);
             }
         }
         "border-left" | "border-inline-start" => {
@@ -1852,8 +2235,8 @@ fn apply_css_decl(
         "border-left-width" | "border-left-style" => {
             if border_value_is_none(&lower) {
                 css.border_left = BorderSide::None;
-            } else if css.border_left == BorderSide::Unset {
-                css.border_left = BorderSide::Set(None);
+            } else if !matches!(css.border_left, BorderSide::Set(Some(_))) {
+                css.border_left = BorderSide::Set(css.border_color_fallback);
             }
         }
         "border-left-color" | "border-inline-start-color" => {
@@ -1866,6 +2249,7 @@ fn apply_css_decl(
         "border-color" => {
             if let Some((rgb, a)) = parse_color_alpha(value, current_color) {
                 if a > 0 {
+                    css.border_color_fallback = Some(rgb);
                     if let BorderSide::Set(ref mut c) = css.border_all {
                         *c = Some(rgb);
                     }
@@ -1873,6 +2257,9 @@ fn apply_css_decl(
                         *c = Some(rgb);
                     }
                     if let BorderSide::Set(ref mut c) = css.border_top {
+                        *c = Some(rgb);
+                    }
+                    if let BorderSide::Set(ref mut c) = css.border_right {
                         *c = Some(rgb);
                     }
                 }
@@ -1888,7 +2275,7 @@ fn apply_css_decl(
                 .any(|tok| parse_px_len(tok).is_some_and(|v| v > 0.5));
         }
         "content" => {
-            css.content_literal = parse_css_content_string(value);
+            css.content_tokens = parse_css_content_tokens(value);
         }
         _ => {}
     }
@@ -1959,24 +2346,181 @@ fn parse_background_color(value: &str, current_color: Option<[u8; 3]>) -> Option
     None
 }
 
-fn parse_css_content_string(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if matches!(trimmed.to_ascii_lowercase().as_str(), "none" | "normal") {
-        return None;
+fn unescape_css_string(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_owned();
     }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let mut hex = String::new();
+        while hex.len() < 6 {
+            if let Some(&c) = chars.peek() {
+                if c.is_ascii_hexdigit() {
+                    hex.push(c);
+                    chars.next();
+                    continue;
+                }
+            }
+            break;
+        }
+        if !hex.is_empty() {
+            if let Some(decoded) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                out.push(if decoded == '\u{00a0}' { ' ' } else { decoded });
+            }
+            if chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        } else if let Some(next) = chars.next() {
+            out.push(next);
+        }
+    }
+    out
+}
+
+fn parse_css_string_literal(value: &str) -> Option<String> {
+    let trimmed = value.trim();
     let quote = trimmed.chars().next().filter(|&c| c == '"' || c == '\'')?;
     if !trimmed.ends_with(quote) || trimmed.len() < 2 {
         return None;
     }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    if inner.is_empty()
-        || inner
-            .chars()
-            .all(|ch| ('\u{e000}'..='\u{f8ff}').contains(&ch) || ch.is_whitespace())
-    {
+    Some(unescape_css_string(&trimmed[1..trimmed.len() - 1]))
+}
+
+fn parse_list_style(value: &str) -> Option<ListStyleKind> {
+    let trimmed = value.trim();
+    if let Some(lit) = parse_css_string_literal(trimmed) {
+        return Some(if lit.is_empty() {
+            ListStyleKind::None
+        } else {
+            ListStyleKind::Literal(lit)
+        });
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.is_empty() || matches!(lower.as_str(), "inherit" | "initial" | "unset") {
         return None;
     }
-    Some(inner.to_owned())
+    if lower.split_whitespace().any(|tok| tok == "none") {
+        return Some(ListStyleKind::None);
+    }
+    for tok in trimmed.split_whitespace() {
+        let tok_lower = tok.to_ascii_lowercase();
+        if matches!(tok_lower.as_str(), "inside" | "outside") || tok_lower.starts_with("url(") {
+            continue;
+        }
+        if let Some(lit) = parse_css_string_literal(tok) {
+            return Some(if lit.is_empty() {
+                ListStyleKind::None
+            } else {
+                ListStyleKind::Literal(lit)
+            });
+        }
+        return Some(match tok_lower.as_str() {
+            "disc" | "circle" | "square" => ListStyleKind::Disc,
+            "decimal" | "decimal-leading-zero" => ListStyleKind::Decimal,
+            _ => ListStyleKind::Custom(tok_lower),
+        });
+    }
+    None
+}
+
+fn parse_counter_ops(value: &str, default_num: i32) -> Vec<(String, i32)> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower == "none" {
+        return Vec::new();
+    }
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let name = tokens[i].to_owned();
+        if let Some(next) = tokens.get(i + 1).and_then(|t| t.parse::<i32>().ok()) {
+            out.push((name, next));
+            i += 2;
+        } else {
+            out.push((name, default_num));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn parse_css_content_tokens(value: &str) -> Option<Vec<ContentToken>> {
+    let trimmed = value.trim();
+    if matches!(trimmed.to_ascii_lowercase().as_str(), "none" | "normal") {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut rest = trimmed;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
+            let bytes = rest.as_bytes();
+            let mut end = 1usize;
+            while end < bytes.len() {
+                if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                    end += 2;
+                    continue;
+                }
+                if bytes[end] == quote as u8 {
+                    break;
+                }
+                end += 1;
+            }
+            if end >= bytes.len() {
+                break;
+            }
+            let inner = unescape_css_string(&rest[1..end]);
+            if !inner.is_empty()
+                && !inner
+                    .chars()
+                    .all(|ch| ('\u{e000}'..='\u{f8ff}').contains(&ch))
+            {
+                tokens.push(ContentToken::Literal(inner));
+            }
+            rest = &rest[end + 1..];
+        } else if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case("counter(") {
+            let close = find_matching_paren(&rest[7..], 0);
+            let inside = &rest[8..7 + close.min(rest.len() - 7)];
+            let mut parts = inside.split(',').map(str::trim);
+            if let Some(name) = parts.next().filter(|s| !s.is_empty()) {
+                let style = parts
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_ascii_lowercase());
+                tokens.push(ContentToken::Counter {
+                    name: name.to_owned(),
+                    style,
+                });
+            }
+            rest = &rest[(7 + close + 1).min(rest.len())..];
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .unwrap_or(rest.len());
+            if end == 0 {
+                break;
+            }
+            rest = &rest[end..];
+        }
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    if tokens.iter().all(|tok| match tok {
+        ContentToken::Literal(s) => s.trim().is_empty(),
+        ContentToken::Counter { .. } => false,
+    }) {
+        return None;
+    }
+    Some(tokens)
 }
 
 fn parse_px_len(value: &str) -> Option<f32> {
@@ -2240,9 +2784,8 @@ fn parse_hsl_args(inner: &str) -> Option<([u8; 3], u8)> {
 
 #[derive(Clone, Debug)]
 struct ListState {
-    ordered: bool,
+    style: ListStyleKind,
     next: usize,
-    none: bool,
     inline_row: bool,
 }
 
@@ -2320,8 +2863,10 @@ struct ElementFrame {
     is_list_item: bool,
     pushed_container: bool,
     is_details_closed: bool,
+    seen_summary: bool,
     in_summary: bool,
     vars_len: usize,
+    counters_len: usize,
     prev_style: Style,
     prev_block_kind: BlockKind,
     span_group: bool,
@@ -2341,6 +2886,7 @@ struct Parser<'a> {
     style: Style,
     element_stack: Vec<ElementFrame>,
     var_scope: Vec<(String, String)>,
+    counters: Vec<(String, i32)>,
     span_groups: Vec<SpanGroup>,
     cloze_depth: usize,
     lists: Vec<ListState>,
@@ -2380,6 +2926,7 @@ impl<'a> Parser<'a> {
             style: Style::default(),
             element_stack: Vec::new(),
             var_scope: Vec::new(),
+            counters: Vec::new(),
             span_groups: Vec::new(),
             cloze_depth: 0,
             lists: Vec::new(),
@@ -2490,7 +3037,7 @@ fn parse_blocks_with_sheet(html: &str, sheet: &Stylesheet, dark_mode: bool) -> V
             };
             continue;
         }
-        parser.handle_tag(raw_tag);
+        parser.handle_tag(raw_tag, &html[start + end..]);
         position = start + end;
     }
     if position < html.len() {
@@ -2572,7 +3119,72 @@ fn is_default_block_tag(name: &str) -> bool {
 }
 
 impl<'a> Parser<'a> {
-    fn handle_tag(&mut self, raw: &str) {
+    fn is_currently_hidden(&self, incoming_tag: &str) -> bool {
+        self.element_stack.last().is_some_and(|frame| {
+            frame.hidden
+                || (frame.is_details_closed
+                    && !frame.in_summary
+                    && !(incoming_tag == "summary" && !frame.seen_summary))
+        })
+    }
+
+    fn format_counter_value(&self, value: i32, style: Option<&str>) -> String {
+        if let Some(style_name) = style {
+            if let Some(cs) = self.sheet.counter_styles.get(style_name) {
+                return cs.format(value);
+            }
+            if style_name.contains("circle") && (1..=20).contains(&value) {
+                if let Some(ch) = char::from_u32(0x2460 + (value as u32 - 1)) {
+                    return ch.to_string();
+                }
+            }
+        }
+        value.to_string()
+    }
+
+    fn format_list_marker(&self, style: &ListStyleKind, index: usize) -> String {
+        match style {
+            ListStyleKind::None => String::new(),
+            ListStyleKind::Disc => "• ".to_owned(),
+            ListStyleKind::Decimal => format!("{index}. "),
+            ListStyleKind::Literal(s) => s.clone(),
+            ListStyleKind::Custom(name) => {
+                if let Some(cs) = self.sheet.counter_styles.get(name) {
+                    cs.format(index as i32)
+                } else if name.contains("circle") && (1..=20).contains(&index) {
+                    if let Some(ch) = char::from_u32(0x2460 + (index as u32 - 1)) {
+                        format!("{ch} ")
+                    } else {
+                        format!("{index}. ")
+                    }
+                } else {
+                    format!("{index}. ")
+                }
+            }
+        }
+    }
+
+    fn format_content_tokens(&self, tokens: &[ContentToken]) -> String {
+        let mut out = String::new();
+        for tok in tokens {
+            match tok {
+                ContentToken::Literal(s) => out.push_str(s),
+                ContentToken::Counter { name, style } => {
+                    let val = self
+                        .counters
+                        .iter()
+                        .rev()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0);
+                    out.push_str(&self.format_counter_value(val, style.as_deref()));
+                }
+            }
+        }
+        out
+    }
+
+    fn handle_tag(&mut self, raw: &str, after_tag: &str) {
         let mut inner = raw.trim();
         if inner.starts_with('<') {
             inner = &inner[1..];
@@ -2725,6 +3337,13 @@ impl<'a> Parser<'a> {
         }
 
         if !closing && name == "ruby" {
+            let attributes = parse_attributes(raw_clean, name_end);
+            if self.is_currently_hidden("ruby") {
+                if !self_closing {
+                    self.push_hidden_frame("ruby", attributes, after_tag, self_closing);
+                }
+                return;
+            }
             self.ruby = Some(RubyState {
                 base: String::new(),
                 reading: String::new(),
@@ -2742,24 +3361,36 @@ impl<'a> Parser<'a> {
         }
 
         let attributes = parse_attributes(raw_clean, name_end);
-        self.open_element(&name, attributes, self_closing);
+        self.open_element(&name, attributes, self_closing, after_tag);
     }
 
-    fn open_element(&mut self, name: &str, attributes: Vec<(String, String)>, self_closing: bool) {
-        let parent_hidden = self.element_stack.last().is_some_and(|frame| {
-            frame.hidden || (frame.is_details_closed && name != "summary" && !frame.in_summary)
-        });
-        if parent_hidden {
+    fn open_element(
+        &mut self,
+        name: &str,
+        attributes: Vec<(String, String)>,
+        self_closing: bool,
+        after_tag: &str,
+    ) {
+        if self.is_currently_hidden(name) {
             if !self_closing {
-                self.push_hidden_frame(name, attributes);
+                self.push_hidden_frame(name, attributes, after_tag, self_closing);
+            } else {
+                let elem = self.build_element_info(name, &attributes, after_tag, true);
+                self.record_completed_sibling(&elem);
             }
             return;
         }
+        if name == "summary" {
+            if let Some(parent) = self.element_stack.last_mut() {
+                if parent.is_details_closed {
+                    parent.seen_summary = true;
+                }
+            }
+        }
 
         if name == "svg" {
-            let elem = self.build_element_info(name, &attributes);
-            let mut scope_mark = self.var_scope.len();
-            let _ = &mut scope_mark;
+            let elem = self.build_element_info(name, &attributes, after_tag, self_closing);
+            let scope_mark = self.var_scope.len();
             let (css, _, _) = self.sheet.compute(
                 &self.element_stack,
                 &elem,
@@ -2775,7 +3406,9 @@ impl<'a> Parser<'a> {
                 || has_attr(&attributes, "hidden")
             {
                 if !self_closing {
-                    self.push_hidden_frame(name, attributes);
+                    self.push_hidden_frame(name, attributes, after_tag, self_closing);
+                } else {
+                    self.record_completed_sibling(&elem);
                 }
                 return;
             }
@@ -2790,6 +3423,7 @@ impl<'a> Parser<'a> {
                     depth: 0,
                 });
             }
+            self.record_completed_sibling(&elem);
             return;
         }
 
@@ -2826,7 +3460,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let elem = self.build_element_info(name, &attributes);
+        let elem = self.build_element_info(name, &attributes, after_tag, self_closing);
         let vars_len = self.var_scope.len();
         let (css, before_css, after_css) = self.sheet.compute(
             &self.element_stack,
@@ -2851,7 +3485,9 @@ impl<'a> Parser<'a> {
         if css_hidden || (attr_hidden && css.display.is_none()) {
             self.var_scope.truncate(vars_len);
             if !self_closing {
-                self.push_hidden_frame(name, attributes);
+                self.push_hidden_frame_info(elem);
+            } else {
+                self.record_completed_sibling(&elem);
             }
             return;
         }
@@ -2861,6 +3497,9 @@ impl<'a> Parser<'a> {
             self.handle_table_tag(name, false, &attributes);
             if !self_closing {
                 self.push_passthrough_frame(elem);
+            } else {
+                self.handle_table_tag(name, true, &[]);
+                self.record_completed_sibling(&elem);
             }
             return;
         }
@@ -2871,18 +3510,22 @@ impl<'a> Parser<'a> {
             self.var_scope.truncate(vars_len);
             if !self_closing {
                 self.push_passthrough_frame(elem);
+            } else {
+                self.record_completed_sibling(&elem);
             }
             return;
         }
         if name == "br" {
             self.var_scope.truncate(vars_len);
             self.current.push(Inline::Break);
+            self.record_completed_sibling(&elem);
             return;
         }
         if name == "hr" {
             self.var_scope.truncate(vars_len);
             self.flush();
             self.push_block(Block::Rule);
+            self.record_completed_sibling(&elem);
             return;
         }
         if name == "input" {
@@ -2890,6 +3533,7 @@ impl<'a> Parser<'a> {
             if attribute(&attributes, "id").is_some_and(|id| id.eq_ignore_ascii_case("typeans")) {
                 self.current.push(Inline::TypeInput);
             }
+            self.record_completed_sibling(&elem);
             return;
         }
         if name == "video" {
@@ -2900,6 +3544,8 @@ impl<'a> Parser<'a> {
             if !self_closing {
                 self.in_video = true;
                 self.push_passthrough_frame(elem);
+            } else {
+                self.record_completed_sibling(&elem);
             }
             return;
         }
@@ -2910,6 +3556,7 @@ impl<'a> Parser<'a> {
                     self.push_media_tag(src, MediaKind::Video, &attributes);
                 }
             }
+            self.record_completed_sibling(&elem);
             return;
         }
         if name == "img" {
@@ -2937,6 +3584,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            self.record_completed_sibling(&elem);
             return;
         }
         if name == "pre" {
@@ -2944,8 +3592,22 @@ impl<'a> Parser<'a> {
             self.flush();
             if !self_closing {
                 self.pre = Some(String::new());
+            } else {
+                self.record_completed_sibling(&elem);
             }
             return;
+        }
+
+        let counters_len = self.counters.len();
+        for (cname, initial) in &css.counter_reset {
+            self.counters.push((cname.clone(), *initial));
+        }
+        for (cname, delta) in &css.counter_increment {
+            if let Some((_, val)) = self.counters.iter_mut().rev().find(|(k, _)| k == cname) {
+                *val = val.saturating_add(*delta);
+            } else {
+                self.counters.push((cname.clone(), *delta));
+            }
         }
 
         let prev_style = self.style.clone();
@@ -2962,37 +3624,53 @@ impl<'a> Parser<'a> {
 
         let is_block = css.pos_abs != Some(true)
             && match css.display {
-                Some(CssDisplay::Inline | CssDisplay::InlineBlock | CssDisplay::InlineFlex) => {
-                    false
-                }
+                Some(
+                    CssDisplay::Inline
+                    | CssDisplay::InlineBlock
+                    | CssDisplay::InlineFlex
+                    | CssDisplay::Contents,
+                ) => false,
                 Some(CssDisplay::Block | CssDisplay::Flex) => true,
                 Some(CssDisplay::None) => false,
                 None => is_default_block_tag(name) && !inline_flex_item,
             };
 
         let is_pitch_overlay_el = css.pos_abs == Some(true) && css_has_pitch_effect(&css);
-        let pseudo_pitch_before = before_css.as_ref().is_some_and(css_has_pitch_effect);
-        let pseudo_pitch_after = after_css.as_ref().is_some_and(css_has_pitch_effect);
-        let is_pitch_wrapper_el =
-            css.display == Some(CssDisplay::InlineBlock) && css.pos_abs == Some(false);
+        let is_pitch_wrapper_el = css.pos_abs == Some(false) && !is_block;
 
-        if is_pitch_overlay_el || pseudo_pitch_before {
-            let eff_css = if pseudo_pitch_before {
-                before_css.as_ref().unwrap_or(&css)
-            } else {
-                &css
-            };
-            self.apply_pitch_overlay_css(eff_css);
+        if is_pitch_overlay_el {
+            self.apply_pitch_overlay_css(&css);
         }
         if is_nasal_overlay(&attributes) {
             self.apply_nasal_overlay_css(&attributes, &css);
         }
 
         let mut element_style = self.style.clone();
+        if is_block {
+            element_style.pitch = PitchStyle::default();
+        }
         let mut delta = Style::default();
         apply_tag_style(name, &attributes, &mut delta);
         apply_computed_css_to_style(&css, &mut element_style, name, &self.style);
         element_style.apply(&delta);
+
+        for pseudo_css in [&before_css, &after_css].into_iter().flatten() {
+            if css_has_pitch_effect(pseudo_css) {
+                if let Some(pitch_color) = pitch_color_from_css(pseudo_css) {
+                    element_style.pitch.color = Some(pitch_color);
+                }
+                let has_bottom = matches!(pseudo_css.border_bottom, BorderSide::Set(_))
+                    || matches!(pseudo_css.border_all, BorderSide::Set(_));
+                if pseudo_css.overline == Some(true)
+                    || (!has_bottom && matches!(pseudo_css.border_top, BorderSide::Set(_)))
+                {
+                    element_style.pitch.high = true;
+                }
+                if !has_bottom && matches!(pseudo_css.border_right, BorderSide::Set(_)) {
+                    element_style.pitch.downstep = true;
+                }
+            }
+        }
 
         let box_style = extract_box_style(&css, name, &attributes, &elem);
         let is_quote = name == "blockquote" && box_style.is_none();
@@ -3000,31 +3678,45 @@ impl<'a> Parser<'a> {
         if is_block {
             self.flush();
             if is_list {
-                let list_none = css.list_style_none.unwrap_or(false)
-                    || attribute(&attributes, "style")
-                        .is_some_and(|s| s.to_ascii_lowercase().contains("list-style"));
-                let inline_row = (css.display == Some(CssDisplay::Flex) && !css.flex_column)
-                    && css.list_style_none == Some(true);
+                let default_style = if name == "ol" {
+                    ListStyleKind::Decimal
+                } else {
+                    ListStyleKind::Disc
+                };
+                let style = css.list_style.clone().unwrap_or(default_style);
+                let inline_row = css.display == Some(CssDisplay::Flex)
+                    && !css.flex_column
+                    && style == ListStyleKind::None;
+                let style = if inline_row {
+                    ListStyleKind::None
+                } else {
+                    style
+                };
                 self.lists.push(ListState {
-                    ordered: name == "ol",
+                    style,
                     next: 1,
-                    none: list_none || inline_row,
                     inline_row,
                 });
             } else if is_list_item {
-                if let Some(list) = self.lists.last_mut() {
-                    if list.none {
-                        self.current_marker = Some(String::new());
-                    } else if list.ordered {
-                        let m = format!("{}. ", list.next);
+                let item_style = css.list_style.clone();
+                let marker = if let Some(override_style) = item_style {
+                    let idx = if let Some(list) = self.lists.last_mut() {
+                        let n = list.next;
                         list.next += 1;
-                        self.current_marker = Some(m);
+                        n
                     } else {
-                        self.current_marker = Some("• ".to_owned());
-                    }
+                        1
+                    };
+                    self.format_list_marker(&override_style, idx)
+                } else if let Some(list) = self.lists.last_mut() {
+                    let n = list.next;
+                    list.next += 1;
+                    let list_style = list.style.clone();
+                    self.format_list_marker(&list_style, n)
                 } else {
-                    self.current_marker = Some("• ".to_owned());
-                }
+                    "• ".to_owned()
+                };
+                self.current_marker = Some(marker);
                 self.block_kind = BlockKind::ListItem;
             } else if name == "p" {
                 self.block_kind = BlockKind::Paragraph;
@@ -3065,10 +3757,14 @@ impl<'a> Parser<'a> {
         self.style = element_style.clone();
 
         if let Some(ref bcss) = before_css {
-            if let Some(lit) = &bcss.content_literal {
-                let mut bstyle = element_style.clone();
-                apply_computed_css_to_style(bcss, &mut bstyle, name, &element_style);
-                push_text_with_furigana(&mut self.current, lit, bstyle);
+            if let Some(tokens) = &bcss.content_tokens {
+                let lit = self.format_content_tokens(tokens);
+                if !lit.is_empty() {
+                    let mut bstyle = element_style.clone();
+                    bstyle.pitch = PitchStyle::default();
+                    apply_computed_css_to_style(bcss, &mut bstyle, name, &element_style);
+                    push_text_with_furigana(&mut self.current, &lit, bstyle);
+                }
             }
         }
 
@@ -3092,20 +3788,6 @@ impl<'a> Parser<'a> {
         let in_summary =
             name == "summary" || self.element_stack.last().is_some_and(|f| f.in_summary);
 
-        if pseudo_pitch_after && !css_has_pitch_effect(&css) {
-            if let Some(acss) = &after_css {
-                if let Some(pitch_color) = pitch_color_from_css(acss) {
-                    self.style.pitch.color = Some(pitch_color);
-                }
-                if acss.overline == Some(true) || matches!(acss.border_top, BorderSide::Set(_)) {
-                    self.style.pitch.high = true;
-                }
-                if matches!(acss.border_right, BorderSide::Set(_)) {
-                    self.style.pitch.downstep = true;
-                }
-            }
-        }
-
         let frame = ElementFrame {
             info: elem,
             hidden: false,
@@ -3114,8 +3796,10 @@ impl<'a> Parser<'a> {
             is_list_item,
             pushed_container,
             is_details_closed,
+            seen_summary: false,
             in_summary,
             vars_len,
+            counters_len,
             prev_style,
             prev_block_kind,
             span_group,
@@ -3148,13 +3832,34 @@ impl<'a> Parser<'a> {
         self.record_completed_sibling(&frame.info);
         if frame.hidden {
             self.var_scope.truncate(frame.vars_len);
+            self.counters.truncate(frame.counters_len);
             return;
         }
+        if matches!(frame.info.tag.as_str(), "table" | "tr" | "th" | "td") {
+            self.handle_table_tag(&frame.info.tag, true, &[]);
+            self.var_scope.truncate(frame.vars_len);
+            self.counters.truncate(frame.counters_len);
+            self.style = frame.prev_style;
+            self.block_kind = frame.prev_block_kind;
+            return;
+        }
+        if frame.info.tag == "video" {
+            self.in_video = false;
+        }
         if let Some(ref acss) = frame.after_pseudo {
-            if let Some(lit) = &acss.content_literal {
-                let mut astyle = frame.after_style.clone();
-                apply_computed_css_to_style(acss, &mut astyle, &frame.info.tag, &frame.after_style);
-                push_text_with_furigana(&mut self.current, lit, astyle);
+            if let Some(tokens) = &acss.content_tokens {
+                let lit = self.format_content_tokens(tokens);
+                if !lit.is_empty() {
+                    let mut astyle = frame.after_style.clone();
+                    astyle.pitch = PitchStyle::default();
+                    apply_computed_css_to_style(
+                        acss,
+                        &mut astyle,
+                        &frame.info.tag,
+                        &frame.after_style,
+                    );
+                    push_text_with_furigana(&mut self.current, &lit, astyle);
+                }
             }
         }
         if frame.span_group {
@@ -3164,6 +3869,9 @@ impl<'a> Parser<'a> {
             self.flush();
             if frame.is_list {
                 self.lists.pop();
+            }
+            if frame.is_list_item {
+                self.current_marker = None;
             }
         }
         if frame.pushed_container {
@@ -3184,6 +3892,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.var_scope.truncate(frame.vars_len);
+        self.counters.truncate(frame.counters_len);
         self.style = frame.prev_style;
         if frame.is_block {
             self.block_kind = self.active_block_kind();
@@ -3192,8 +3901,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn push_hidden_frame(&mut self, name: &str, attributes: Vec<(String, String)>) {
-        let elem = self.build_element_info(name, &attributes);
+    fn push_hidden_frame(
+        &mut self,
+        name: &str,
+        attributes: Vec<(String, String)>,
+        after_tag: &str,
+        self_closing: bool,
+    ) {
+        let elem = self.build_element_info(name, &attributes, after_tag, self_closing);
+        self.push_hidden_frame_info(elem);
+    }
+
+    fn push_hidden_frame_info(&mut self, elem: ElementInfo) {
         self.element_stack.push(ElementFrame {
             info: elem,
             hidden: true,
@@ -3202,8 +3921,10 @@ impl<'a> Parser<'a> {
             is_list_item: false,
             pushed_container: false,
             is_details_closed: false,
+            seen_summary: false,
             in_summary: false,
             vars_len: self.var_scope.len(),
+            counters_len: self.counters.len(),
             prev_style: self.style.clone(),
             prev_block_kind: self.block_kind,
             span_group: false,
@@ -3223,8 +3944,10 @@ impl<'a> Parser<'a> {
             is_list_item: false,
             pushed_container: false,
             is_details_closed: false,
+            seen_summary: false,
             in_summary: false,
             vars_len: self.var_scope.len(),
+            counters_len: self.counters.len(),
             prev_style: self.style.clone(),
             prev_block_kind: self.block_kind,
             span_group: false,
@@ -3235,13 +3958,27 @@ impl<'a> Parser<'a> {
         });
     }
 
-    fn build_element_info(&mut self, name: &str, attributes: &[(String, String)]) -> ElementInfo {
+    fn build_element_info(
+        &mut self,
+        name: &str,
+        attributes: &[(String, String)],
+        after_tag: &str,
+        self_closing: bool,
+    ) -> ElementInfo {
         let (nth_child, prev_siblings) = if let Some(parent) = self.element_stack.last_mut() {
             parent.child_count += 1;
             (parent.child_count, parent.prev_siblings.clone())
         } else {
             self.root_child_count += 1;
             (self.root_child_count, self.root_prev_siblings.clone())
+        };
+        let (is_empty, is_last_child) = if self.sheet.needs_lookahead {
+            (
+                peek_element_is_empty(after_tag, name, self_closing),
+                peek_element_is_last_child(after_tag, name, self_closing),
+            )
+        } else {
+            (self_closing, false)
         };
         let id = attribute(attributes, "id").map(str::to_owned);
         let classes = attribute(attributes, "class")
@@ -3253,6 +3990,8 @@ impl<'a> Parser<'a> {
             classes,
             attrs: attributes.to_vec(),
             nth_child,
+            is_last_child,
+            is_empty,
             prev_siblings,
         }
     }
@@ -3520,20 +4259,18 @@ impl<'a> Parser<'a> {
             Inline::Text { text, .. } => !text.is_empty(),
             _ => true,
         });
-        let whitespace_only = self.current_marker.is_none()
-            && self.current.iter().all(|inline| {
-                matches!(
-                    inline,
-                    Inline::Text { text, style }
-                        if text.trim().is_empty()
-                            && style.pill.is_none()
-                            && style.highlight.is_none()
-                            && !style.cloze_active
-                )
-            });
+        let whitespace_only = self.current.iter().all(|inline| {
+            matches!(
+                inline,
+                Inline::Text { text, style }
+                    if text.trim().is_empty()
+                        && style.pill.is_none()
+                        && style.highlight.is_none()
+                        && !style.cloze_active
+            )
+        });
         if self.current.is_empty() || whitespace_only {
             self.current.clear();
-            self.current_marker = None;
             self.block_kind = self.active_block_kind();
             return;
         }
@@ -3778,6 +4515,129 @@ fn css_has_pitch_effect(css: &ComputedCss) -> bool {
                 || matches!(css.border_right, BorderSide::Set(_))))
 }
 
+fn skip_html_ws_and_comments(mut rest: &str) -> &str {
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("<!--") {
+            rest = match after.find("-->") {
+                Some(idx) => &after[idx + 3..],
+                None => "",
+            };
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn peek_element_is_empty(after_tag: &str, tag: &str, self_closing: bool) -> bool {
+    if self_closing {
+        return true;
+    }
+    let rest = skip_html_ws_and_comments(after_tag);
+    if !rest.starts_with("</") {
+        return false;
+    }
+    let after_slash = rest[2..].trim_start();
+    after_slash.len() >= tag.len()
+        && after_slash[..tag.len()].eq_ignore_ascii_case(tag)
+        && after_slash[tag.len()..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '>' || ch.is_whitespace())
+}
+
+fn peek_element_is_last_child(after_tag: &str, tag: &str, self_closing: bool) -> bool {
+    let mut rest = after_tag;
+    if !self_closing {
+        let mut depth = 1usize;
+        while depth > 0 {
+            let Some(lt) = rest.find('<') else {
+                return true;
+            };
+            rest = &rest[lt..];
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = match after.find("-->") {
+                    Some(idx) => &after[idx + 3..],
+                    None => return true,
+                };
+                continue;
+            }
+            let Some(end) = tag_end(rest) else {
+                return true;
+            };
+            let raw = &rest[..end];
+            rest = &rest[end..];
+            let inner = raw
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim();
+            if inner.is_empty() || inner.starts_with('!') || inner.starts_with('?') {
+                continue;
+            }
+            let closing = inner.starts_with('/');
+            let body = if closing {
+                inner[1..].trim_start()
+            } else {
+                inner
+            };
+            let self_close = body.ends_with('/');
+            let clean = body.trim_end_matches('/').trim_end();
+            let ne = clean
+                .find(|ch: char| ch.is_whitespace())
+                .unwrap_or(clean.len());
+            let name = &clean[..ne];
+            if !closing
+                && !self_close
+                && (name.eq_ignore_ascii_case("script") || name.eq_ignore_ascii_case("style"))
+            {
+                let lower_rest = rest.to_ascii_lowercase();
+                let target = if name.eq_ignore_ascii_case("script") {
+                    "script"
+                } else {
+                    "style"
+                };
+                if let Some(close) = find_closing_rawtext(&lower_rest, target) {
+                    rest = &rest[close..];
+                    continue;
+                }
+                return true;
+            }
+            if name.eq_ignore_ascii_case(tag) {
+                if closing {
+                    depth -= 1;
+                } else if !self_close && !is_void_tag(&name.to_ascii_lowercase()) {
+                    depth += 1;
+                }
+            }
+        }
+    }
+    loop {
+        rest = skip_html_ws_and_comments(rest);
+        let Some(lt) = rest.find('<') else {
+            return true;
+        };
+        rest = &rest[lt..];
+        if let Some(after) = rest.strip_prefix("<!--") {
+            rest = match after.find("-->") {
+                Some(idx) => &after[idx + 3..],
+                None => return true,
+            };
+            continue;
+        }
+        if rest.starts_with("</") {
+            return true;
+        }
+        if rest[1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            return false;
+        }
+        rest = &rest[1..];
+    }
+}
+
 fn pitch_color_from_css(css: &ComputedCss) -> Option<[u8; 3]> {
     if let BorderSide::Set(Some(c)) = css.border_top {
         return Some(c);
@@ -3785,7 +4645,7 @@ fn pitch_color_from_css(css: &ComputedCss) -> Option<[u8; 3]> {
     if let BorderSide::Set(Some(c)) = css.border_right {
         return Some(c);
     }
-    css.color
+    css.border_color_fallback.or(css.color)
 }
 
 fn apply_computed_css_to_style(
@@ -3802,6 +4662,12 @@ fn apply_computed_css_to_style(
     }
     if let Some(underline) = css.underline {
         style.underline = underline;
+    }
+    if let Some(align) = css.text_align {
+        style.align = align;
+    } else if css.flex_center && matches!(css.display, Some(CssDisplay::Flex | CssDisplay::InlineFlex))
+    {
+        style.align = TextAlign::Center;
     }
     if let Some(color) = css.color {
         if css.color_alpha >= 16 {
@@ -3861,7 +4727,7 @@ fn apply_computed_css_to_style(
 
     if is_inline_el {
         let border_col = match css.border_all {
-            BorderSide::Set(c) => Some(c.unwrap_or([160, 160, 160])),
+            BorderSide::Set(c) => Some(c.or(css.border_color_fallback).unwrap_or([160, 160, 160])),
             _ => None,
         };
         if let Some((bg, alpha)) = css.bg {
@@ -3896,6 +4762,9 @@ fn extract_box_style(
     attributes: &[(String, String)],
     elem: &ElementInfo,
 ) -> Option<BoxStyle> {
+    if css.display == Some(CssDisplay::Contents) {
+        return None;
+    }
     if matches!(tag, "li" | "ul" | "ol" | "table" | "tr" | "td" | "th")
         && matches!(css.bg, None)
         && !matches!(css.border_left, BorderSide::Set(_))
@@ -3909,11 +4778,11 @@ fn extract_box_style(
         return None;
     }
     let border_left = match css.border_left {
-        BorderSide::Set(c) => Some(c.unwrap_or([180, 180, 180])),
+        BorderSide::Set(c) => Some(c.or(css.border_color_fallback).unwrap_or([180, 180, 180])),
         _ => None,
     };
     let border_all = match css.border_all {
-        BorderSide::Set(c) => Some(c.unwrap_or([120, 120, 120])),
+        BorderSide::Set(c) => Some(c.or(css.border_color_fallback).unwrap_or([120, 120, 120])),
         _ => None,
     };
     let bg = css.bg.filter(|(_, a)| {
@@ -3925,11 +4794,19 @@ fn extract_box_style(
                 || *a < 245)
     });
     if border_left.is_some() || border_all.is_some() || bg.is_some() {
+        let align = css.text_align.unwrap_or_else(|| {
+            if css.flex_center {
+                TextAlign::Center
+            } else {
+                TextAlign::Auto
+            }
+        });
         Some(BoxStyle {
             bg: bg.map(|(rgb, _)| rgb),
             bg_alpha: bg.map(|(_, a)| a).unwrap_or(0),
             border_left,
             border_all,
+            align,
         })
     } else {
         None
@@ -4000,9 +4877,10 @@ fn apply_tag_style(tag: &str, attributes: &[(String, String)], style: &mut Style
             style.cloze_active = true;
         }
     }
+    let inline_pitch_tag = !is_default_block_tag(tag);
     for (name, value) in attributes {
         match name.as_str() {
-            "class" => apply_pitch_classes(style, value),
+            "class" if inline_pitch_tag => apply_pitch_classes(style, value),
             "color" => {
                 if let Some(color) = parse_color(value) {
                     style.color = Some(color);
@@ -4013,16 +4891,23 @@ fn apply_tag_style(tag: &str, attributes: &[(String, String)], style: &mut Style
                     style.highlight = Some(color);
                 }
             }
-            "data-accent" | "data-pitch-accent" => {
+            "data-accent" | "data-pitch-accent" if inline_pitch_tag => {
                 if let Ok(accent) = value.trim().parse::<u8>() {
                     if accent <= 20 {
                         style.pitch.accent = Some(accent);
                     }
                 }
             }
-            "data-pitch" => apply_pitch_word(style, value),
+            "data-pitch" if inline_pitch_tag => apply_pitch_word(style, value),
             _ => {}
         }
+    }
+    if inline_pitch_tag
+        && style.pitch.high
+        && attribute(attributes, "data-pitch-next")
+            .is_some_and(|next| next.trim().eq_ignore_ascii_case("low"))
+    {
+        style.pitch.downstep = true;
     }
 }
 
@@ -6170,5 +7055,175 @@ mod tests {
             has_nested_note_callout,
             "missing amber note callout: {content:#?}"
         );
+    }
+
+    #[test]
+    fn table_closes_cleanly_and_details_hides_forms_and_nested_ruby() {
+        let html = r#"
+            <details>
+                <summary>forms</summary>
+                <table>
+                    <tr><th>*</th><th>③⑥</th></tr>
+                    <tr><th><ruby>親<rt>おや</rt></ruby></th><td>★</td></tr>
+                </table>
+            </details>
+            <table><tr><td>col0</td><td>col1</td></tr></table>
+            <p>After table</p>
+        "#;
+        let blocks = parse_html(html);
+        assert!(
+            blocks
+                .iter()
+                .filter(|b| matches!(b, Block::Table { .. }))
+                .count()
+                == 1,
+            "closed details table must be hidden and visible table must close: {blocks:#?}"
+        );
+        let (text, _) = collect_text_and_images(&blocks);
+        assert!(text.contains("forms"), "{text}");
+        assert!(!text.contains("おや"), "hidden details ruby leaked: {text}");
+        assert!(
+            text.contains("After table"),
+            "text after </table> must not be swallowed into table cell: {text}"
+        );
+    }
+
+    #[test]
+    fn css_important_nesting_pseudos_counters_and_pitch_match_structured_card() {
+        let css = r#"
+            @counter-style circled-num {
+                system: fixed;
+                symbols: ① ② ③ ④ ⑤ ⑥;
+                suffix: " ";
+            }
+            .card { text-align: center; }
+            .card.nightMode { --odaka: #4caf50; --tag-bracket: #e53935; }
+            .pitch-number:empty { display: none; }
+            .pitch-number {
+                background-color: #ffffff;
+                color: #111111;
+                border-radius: 6px;
+                padding: 1px 4px;
+                font-size: 0.75em;
+            }
+            .pronunciation-mora[data-pitch="high"]::before {
+                content: "";
+                position: absolute;
+                border-top: 2px solid currentColor;
+            }
+            .pronunciation-mora[data-pitch="high"][data-pitch-next="low"]::before {
+                border-right: 2px solid currentColor;
+            }
+            .dict-box {
+                text-align: left;
+                border-left: 2px solid #dcdcdc;
+                background: rgba(255,255,255,0.04);
+                padding: 6px;
+                & :is([data-sc-content="example-sentence"], [data-sc-content="forms"], [data-sc-content="part-of-speech-info"]) {
+                    display: none !important;
+                }
+                & ol.senses { list-style-type: circled-num; }
+                & [data-sc-content="glossary"] li { display: inline !important; }
+                & [data-sc-content="glossary"] li:not(:last-child)::after { content: " | " !important; }
+                & [data-sc-content="restriction"]::before { content: "\3014"; color: var(--tag-bracket); }
+                & [data-sc-content="restriction"]::after { content: "\3015"; color: var(--tag-bracket); }
+            }
+            input.extra-toggle:not(:checked) ~ .duplicate-dict { display: none; }
+        "#;
+        let html = r#"
+            <div class="header odaka" style="color: var(--odaka); text-align: center;">
+                <div><ruby>親<rt>おや</rt></ruby></div>
+                <div>
+                    <span class="pronunciation-mora" data-pitch="low" data-pitch-next="high">お</span><span class="pronunciation-mora" data-pitch="high" data-pitch-next="low">や</span>
+                    <span class="pitch-number">2</span>
+                </div>
+            </div>
+            <div class="dict-box">
+                <div>(priority form, ★, Jitendex.org)</div>
+                <ol class="senses">
+                    <li>
+                        <span data-sc-content="part-of-speech-info" style="display: inline;">noun</span>
+                        <span data-sc-content="restriction">親 only</span>
+                        <ul data-sc-content="glossary" style="display: block;">
+                            <li style="display: list-item;">parent</li>
+                            <li style="display: list-item;">parents</li>
+                            <li style="display: list-item;">mother and father</li>
+                        </ul>
+                        <div data-sc-content="example-sentence" style="display: block;">Hidden example</div>
+                    </li>
+                    <li>
+                        <ul data-sc-content="glossary">
+                            <li>dealer</li>
+                            <li>banker</li>
+                        </ul>
+                    </li>
+                </ol>
+                <div data-sc-content="forms" style="display: block;">
+                    <table><tr><th>祖</th><th>親</th></tr></table>
+                </div>
+            </div>
+            <input type="checkbox" class="extra-toggle">
+            <div class="duplicate-dict">Duplicate glossary copy</div>
+        "#;
+        let blocks = parse_html_with_css(html, css, true);
+        let (text, _) = collect_text_and_images(&blocks);
+        assert!(text.contains("親(おや)"), "{text}");
+        assert!(text.contains("おや"), "{text}");
+        assert!(text.contains("2"), "non-empty pitch-number must stay visible: {text}");
+        assert!(text.contains("〔親 only〕"), "{text}");
+        assert!(text.contains("parent | parents | mother and father"), "{text}");
+        assert!(!text.contains("mother and father |"), "last-child must not get trailing separator: {text}");
+        assert!(text.contains("dealer | banker"), "{text}");
+        assert!(!text.contains("Hidden example"), "{text}");
+        assert!(!text.contains("noun"), "{text}");
+        assert!(!text.contains("Duplicate glossary copy"), "{text}");
+
+        fn find_inlines<'a>(blocks: &'a [Block], out: &mut Vec<&'a Inline>) {
+            for b in blocks {
+                match b {
+                    Block::Paragraph(v) | Block::Section(v) | Block::ListItem { content: v, .. } => {
+                        out.extend(v.iter());
+                    }
+                    Block::Callout { content, .. } | Block::Quote(content) | Block::Hint { content, .. } => {
+                        find_inlines(content, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut inlines = Vec::new();
+        find_inlines(&blocks, &mut inlines);
+        assert!(inlines.iter().any(|i| matches!(
+            i,
+            Inline::Text { text, style }
+                if text == "や" && style.pitch.high && style.pitch.downstep && style.color == Some([76, 175, 80])
+        )));
+        assert!(inlines.iter().any(|i| matches!(
+            i,
+            Inline::Ruby { base, style, .. }
+                if base == "親" && !style.pitch.downstep && style.color == Some([76, 175, 80])
+        )));
+        assert!(inlines.iter().any(|i| matches!(
+            i,
+            Inline::Text { text, style } if text == "2" && style.pill.is_some()
+        )));
+        assert!(inlines.iter().any(|i| matches!(
+            i,
+            Inline::Text { text, style } if text == "〔" && style.color == Some([229, 57, 53])
+        )));
+
+        let mut markers = Vec::new();
+        fn find_markers(blocks: &[Block], out: &mut Vec<String>) {
+            for b in blocks {
+                match b {
+                    Block::ListItem { marker, .. } => out.push(marker.clone()),
+                    Block::Callout { content, .. } | Block::Quote(content) => find_markers(content, out),
+                    _ => {}
+                }
+            }
+        }
+        find_markers(&blocks, &mut markers);
+        assert!(markers.iter().any(|m| m.contains('①')), "{markers:?}");
+        assert!(markers.iter().any(|m| m.contains('②')), "{markers:?}");
     }
 }
